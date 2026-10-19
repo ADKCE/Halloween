@@ -1,0 +1,6 @@
+{
+  "name": "Vampir-Party: Kostüm-Event & Admin-Zentrale",
+  "description": "Interaktives Party-Event-Spiel: Rollenverteilung (Menschen, Vampire, Sonderrollen), Kostümgalerie, Biss- & Verdachtssystem, Scoreboard und Admin-Steuerung.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
