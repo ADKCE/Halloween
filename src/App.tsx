@@ -55,6 +55,23 @@ export default function App() {
       werewolfCount: 4,
       ghostCount: 4,
       hunterCount: 10,
+      gracePeriodMinutes: 15,
+      vampireCooldownMinutes: 6,
+      ghostCooldownMinutes: 6,
+      werewolfCooldownMinutes: 2,
+      hunterHitCooldownMinutes: 15,
+      hunterMissPenaltyMinutes: 30,
+      killConfirmationTimeoutMinutes: 5,
+      fullMoonMinIntervalMinutes: 20,
+      fullMoonMaxIntervalMinutes: 40,
+      fullMoonDurationMinutes: 5,
+      pointsPhotoTask: 10,
+      pointsSpecialTask: 20,
+      pointsTaggedCoPlayer: 2,
+      pointsEvilKill: 15,
+      pointsExorcismSuccess: 25,
+      specialTaskIntervalMinMinutes: 10,
+      specialTaskIntervalMaxMinutes: 20,
     },
     adminCode: '1031',
   });
@@ -87,7 +104,6 @@ export default function App() {
       if (registeredPlayerId) {
         const found = data.players.find((p) => p.id === registeredPlayerId);
         if (!found) {
-          // Player was wiped or removed by admin
           localStorage.removeItem(LOCAL_STORAGE_PLAYER_ID);
           setRegisteredPlayerId(null);
         }
@@ -103,10 +119,7 @@ export default function App() {
   useEffect(() => {
     fetchGameState();
 
-    // 1. Supabase Realtime Subscription
     const unsubscribeRealtime = gameApi.subscribeToRealtime(fetchGameState);
-
-    // 2. 3-Second Fallback Polling (ensures freshness even if realtime is paused/backgrounded)
     const interval = setInterval(fetchGameState, 3000);
 
     return () => {
@@ -127,14 +140,16 @@ export default function App() {
       localStorage.setItem(LOCAL_STORAGE_PLAYER_ID, newPlayer.id);
       setRegisteredPlayerId(newPlayer.id);
       await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Registrierung fehlgeschlagen.');
     } finally {
       setIsRegistering(false);
     }
   };
 
-  // Handle Player Logout from device
+  // Logout on this device
   const handleLogoutDevice = () => {
-    if (window.confirm('Möchtest du dieses Handy wirklich abmelden?')) {
+    if (confirm('Möchtest du dich auf diesem Gerät wirklich abmelden? Dein Spielerprofil bleibt in der Datenbank erhalten.')) {
       localStorage.removeItem(LOCAL_STORAGE_PLAYER_ID);
       setRegisteredPlayerId(null);
     }
@@ -177,6 +192,15 @@ export default function App() {
     }
   };
 
+  const handleAdminEndGame = async () => {
+    try {
+      await gameApi.endGame(adminCode);
+      await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Fehler beim Beenden des Spiels');
+    }
+  };
+
   const handleAdminRestart = async (keepPlayers: boolean) => {
     try {
       await gameApi.restartGame(adminCode, keepPlayers);
@@ -215,23 +239,49 @@ export default function App() {
     }
   };
 
-  // Player Actions: Kill, Tasks, Photos
-  const handleRecordKill = async (victimId: string) => {
-    if (!registeredPlayerId) return;
-    await gameApi.recordKill(registeredPlayerId, victimId);
-    await fetchGameState();
+  const handleTriggerFullMoon = async (durationMinutes = 5) => {
+    try {
+      await gameApi.triggerManualFullMoon(adminCode, durationMinutes);
+      await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Fehler beim Auslösen des Vollmonds');
+    }
   };
 
-  const handleCompleteTask = async (taskId: string, photoFileOrBlob?: Blob | File | string) => {
-    if (!registeredPlayerId) return;
-    await gameApi.completeTask(registeredPlayerId, taskId, photoFileOrBlob);
-    await fetchGameState();
+  const handleStopFullMoon = async () => {
+    try {
+      await gameApi.stopFullMoon(adminCode);
+      await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Fehler beim Beenden des Vollmonds');
+    }
   };
 
-  const handleUploadPhoto = async (file: File, caption: string) => {
-    if (!registeredPlayerId) return;
-    await gameApi.uploadPartyPhoto(registeredPlayerId, file, caption);
-    await fetchGameState();
+  const handleAdminConfirmKill = async (killId: string) => {
+    try {
+      await gameApi.confirmKill(killId);
+      await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Bestätigung fehlgeschlagen');
+    }
+  };
+
+  const handleAdminUndoKill = async (killId: string) => {
+    try {
+      await gameApi.adminUndoKill(adminCode, killId);
+      await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Fehler beim Rückgängigmachen');
+    }
+  };
+
+  const handleAdminDeletePhoto = async (photoId: string) => {
+    try {
+      await gameApi.deletePhoto(adminCode, photoId);
+      await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Fehler beim Löschen des Fotos');
+    }
   };
 
   // Resolve current active player object
@@ -281,7 +331,7 @@ export default function App() {
           </div>
         )}
 
-        {/* INITIAL LOADING STATE (Prevents flash of login screen on page reload) */}
+        {/* INITIAL LOADING STATE */}
         {isInitializing && registeredPlayerId ? (
           <div className="min-h-screen flex flex-col items-center justify-center p-6 text-center space-y-4">
             <div className="w-16 h-16 rounded-3xl bg-[#ff6b00]/15 border border-[#ff6b00]/30 flex items-center justify-center text-[#ff6b00] animate-pulse">
@@ -309,16 +359,14 @@ export default function App() {
                 <PlayerArea
                   player={currentPlayer}
                   players={players}
-                  gameStatus={gameState.status}
+                  gameState={gameState}
                   totalJoinedCount={totalJoinedCount}
                   kills={kills}
                   tasks={tasks}
                   taskCompletions={taskCompletions}
                   photos={photos}
                   onLogoutDevice={handleLogoutDevice}
-                  onRecordKill={handleRecordKill}
-                  onCompleteTask={handleCompleteTask}
-                  onUploadPhoto={handleUploadPhoto}
+                  onRefreshState={fetchGameState}
                 />
               ) : (
                 <AdminArea
@@ -326,11 +374,19 @@ export default function App() {
                   players={players}
                   settings={gameState.settings}
                   adminCode={adminCode}
+                  kills={kills}
+                  photos={photos}
                   onStartGame={handleAdminStartGame}
                   onAbortGame={handleAdminAbortGame}
+                  onEndGame={handleAdminEndGame}
                   onRestartGame={handleAdminRestart}
                   onPlayerAction={handleAdminPlayerAction}
                   onUpdateSettings={handleAdminUpdateSettings}
+                  onTriggerFullMoon={handleTriggerFullMoon}
+                  onStopFullMoon={handleStopFullMoon}
+                  onConfirmKill={handleAdminConfirmKill}
+                  onUndoKill={handleAdminUndoKill}
+                  onDeletePhoto={handleAdminDeletePhoto}
                 />
               )}
             </main>

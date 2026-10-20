@@ -1,4 +1,4 @@
-import { Player, ServerStateResponse, GameSettings } from '../types/game';
+import { Player, ServerStateResponse, GameSettings, SpecialTaskAssignment, RoleType } from '../types/game';
 import { supabaseService, SupabaseConfigStatus } from './supabase';
 
 class GameApiClient {
@@ -30,6 +30,10 @@ class GameApiClient {
     return supabaseService.abortGame(adminCode);
   }
 
+  async endGame(adminCode: string): Promise<void> {
+    return supabaseService.endGame(adminCode);
+  }
+
   async restartGame(adminCode: string, keepPlayers: boolean): Promise<void> {
     return supabaseService.restartGame(adminCode, keepPlayers);
   }
@@ -46,16 +50,74 @@ class GameApiClient {
     return supabaseService.updateSettings(adminCode, newSettings);
   }
 
-  async recordKill(killerId: string, victimId: string): Promise<void> {
-    return supabaseService.recordKill(killerId, victimId);
+  async triggerManualFullMoon(adminCode: string, durationMinutes = 5): Promise<void> {
+    return supabaseService.triggerManualFullMoon(adminCode, durationMinutes);
   }
 
-  async completeTask(playerId: string, taskId: string, photoBlobOrUrl?: Blob | File | string): Promise<void> {
-    return supabaseService.completeTask(playerId, taskId, photoBlobOrUrl);
+  async stopFullMoon(adminCode: string): Promise<void> {
+    return supabaseService.stopFullMoon(adminCode);
   }
 
-  async uploadPartyPhoto(playerId: string, photoFile: Blob | File, caption?: string): Promise<string> {
-    return supabaseService.uploadPartyPhoto(playerId, photoFile, caption);
+  async reportKill(params: {
+    killerId: string;
+    victimId: string;
+    ghostSoloConfirmed?: boolean;
+  }): Promise<{ message: string; cooldownUntil: string }> {
+    return supabaseService.reportKill(params);
+  }
+
+  async exorcise(hunterId: string, targetId: string): Promise<{
+    hit: boolean;
+    victimName: string;
+    victimRole: RoleType;
+    message: string;
+    cooldownMinutes: number;
+  }> {
+    return supabaseService.exorcise(hunterId, targetId);
+  }
+
+  async confirmKill(killId: string): Promise<void> {
+    return supabaseService.confirmKill(killId, false);
+  }
+
+  async adminUndoKill(adminCode: string, killId: string): Promise<void> {
+    return supabaseService.adminUndoKill(adminCode, killId);
+  }
+
+  async completePhotoTask(params: {
+    playerId: string;
+    taskId: string;
+    taskTitle: string;
+    photoBlobOrUrl: Blob | File | string;
+    taggedPlayerIds: string[];
+  }): Promise<{ pointsAwarded: number; bonusPointsTotal: number }> {
+    return supabaseService.completePhotoTask(params);
+  }
+
+  async getPendingSpecialTask(playerId: string): Promise<SpecialTaskAssignment | null> {
+    return supabaseService.getPendingSpecialTask(playerId);
+  }
+
+  async completeSpecialTask(params: {
+    specialTaskId: string;
+    playerId: string;
+    userAnswer?: number;
+    scannedQrCode?: string;
+    photoBlobOrUrl?: Blob | File | string;
+  }): Promise<{ success: boolean; rewardPlayerName: string; rewardRole: RoleType; message: string }> {
+    return supabaseService.completeSpecialTask(params);
+  }
+
+  async deletePhoto(adminCode: string, photoId: string): Promise<void> {
+    return supabaseService.deletePhoto(adminCode, photoId);
+  }
+
+  public isFullMoonActive(gameState: any): boolean {
+    return supabaseService.isFullMoonActive(gameState);
+  }
+
+  public getNextFullMoon(gameState: any): { startsInMinutes: number; durationMinutes: number } | null {
+    return supabaseService.getNextFullMoon(gameState);
   }
 
   public subscribeToRealtime(callback: () => void): () => void {

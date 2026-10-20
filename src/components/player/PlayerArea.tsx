@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Sparkles,
   Users,
@@ -11,18 +11,20 @@ import {
   Lock,
   HeartPulse,
   LogOut,
-  UserCheck,
   Trophy,
   Camera,
-  Image as ImageIcon,
   CheckCircle2,
   AlertCircle,
-  Plus,
+  Clock,
   Flame,
   Search,
   Filter,
-  Loader2,
-  Award
+  Award,
+  Zap,
+  Info,
+  Layers,
+  ChevronRight,
+  ShieldAlert
 } from 'lucide-react';
 import {
   Player,
@@ -31,1006 +33,943 @@ import {
   KillRecord,
   PartyTask,
   TaskCompletion,
-  PartyPhoto
+  PartyPhoto,
+  SpecialTaskAssignment,
+  GameState,
+  FullMoonEvent
 } from '../../types/game';
-import { compressImageToMax1200px } from '../../utils/imageCompressor';
+import { DEFAULT_PHOTO_TASKS } from '../../utils/gameDataPool';
+import { KillModal } from './KillModal';
+import { PhotoTaskModal } from './PhotoTaskModal';
+import { SpecialTaskCard } from './SpecialTaskCard';
+import { FullMoonBanner } from './FullMoonBanner';
+import { KillNotificationModal } from './KillNotificationModal';
+import { GameEndView } from './GameEndView';
+import { gameApi } from '../../utils/api';
 
 interface PlayerAreaProps {
   player: Player;
   players: Player[];
-  gameStatus: GameStatus;
+  gameState: GameState;
   totalJoinedCount: number;
   kills: KillRecord[];
   tasks: PartyTask[];
   taskCompletions: TaskCompletion[];
   photos: PartyPhoto[];
   onLogoutDevice: () => void;
-  onRecordKill: (victimId: string) => Promise<void>;
-  onCompleteTask: (taskId: string, photoBlobOrUrl?: Blob | File | string) => Promise<void>;
-  onUploadPhoto: (file: File, caption: string) => Promise<void>;
+  onRefreshState: () => Promise<void>;
 }
 
 export const PlayerArea: React.FC<PlayerAreaProps> = ({
   player,
   players,
-  gameStatus,
+  gameState,
   totalJoinedCount,
   kills,
   tasks,
   taskCompletions,
   photos,
   onLogoutDevice,
-  onRecordKill,
-  onCompleteTask,
-  onUploadPhoto,
+  onRefreshState,
 }) => {
-  // Sub-tabs: 'my-game' | 'players' | 'ranking' | 'tasks' | 'gallery'
-  const [subTab, setSubTab] = useState<'my-game' | 'players' | 'ranking' | 'tasks' | 'gallery'>('my-game');
-  const [roleRevealed, setRoleRevealed] = useState(false);
+  // Main Navigation Tabs: 1. "actions" (Aktionen) | 2. "tasks" (Aufgaben) | 3. "ranking" (Ranking) | 4. "profile" (Profil & Regeln)
+  const [activeTab, setActiveTab] = useState<'actions' | 'tasks' | 'ranking' | 'profile'>('actions');
 
-  // Kill Modal State
+  // Secret Role reveal toggle
+  const [isRoleSecretRevealed, setIsRoleSecretRevealed] = useState(false);
+
+  // Modals
   const [isKillModalOpen, setIsKillModalOpen] = useState(false);
-  const [selectedVictimId, setSelectedVictimId] = useState('');
-  const [isSubmittingKill, setIsSubmittingKill] = useState(false);
-  const [killError, setKillError] = useState('');
-  const [killSuccess, setKillSuccess] = useState('');
+  const [activeTaskModal, setActiveTaskModal] = useState<{ id: string; title: string; desc: string } | null>(null);
 
-  // Task Completion Modal State
-  const [selectedTaskForUpload, setSelectedTaskForUpload] = useState<PartyTask | null>(null);
-  const [taskPhotoFile, setTaskPhotoFile] = useState<File | null>(null);
-  const [taskPhotoPreview, setTaskPhotoPreview] = useState<string>('');
-  const [isSubmittingTask, setIsSubmittingTask] = useState(false);
+  // Special task for humans
+  const [pendingSpecialTask, setPendingSpecialTask] = useState<SpecialTaskAssignment | null>(null);
 
-  // Gallery Upload Modal State
-  const [isGalleryModalOpen, setIsGalleryModalOpen] = useState(false);
-  const [galleryPhotoFile, setGalleryPhotoFile] = useState<File | null>(null);
-  const [galleryPhotoPreview, setGalleryPhotoPreview] = useState<string>('');
-  const [galleryCaption, setGalleryCaption] = useState('');
-  const [isUploadingGallery, setIsUploadingGallery] = useState(false);
+  // Cooldown countdown state
+  const [cooldownRemainingSeconds, setCooldownRemainingSeconds] = useState<number>(0);
+  const [gracePeriodSeconds, setGracePeriodSeconds] = useState<number>(0);
 
-  // Player search filter
-  const [playerSearch, setPlayerSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'alle' | 'lebendig' | 'tot'>('alle');
+  // Filter/Search in Ranking
+  const [rankingFilter, setRankingFilter] = useState<'all' | 'dead'>('all');
+  const [playerSearchTerm, setPlayerSearchTerm] = useState('');
+
+  // Check if player has pending kill on themselves
+  const pendingKillOnSelf = useMemo(() => {
+    return kills.find((k) => k.victimId === player.id && !k.confirmed);
+  }, [kills, player.id]);
+
+  // Check if full moon is active
+  const isFullMoon = useMemo(() => {
+    return gameApi.isFullMoonActive(gameState);
+  }, [gameState]);
+
+  const nextFullMoonInfo = useMemo(() => {
+    return gameApi.getNextFullMoon(gameState);
+  }, [gameState]);
+
+  // Check Grace Period (Schonfrist: 15 min nach startedAt)
+  useEffect(() => {
+    const checkGraceAndCooldown = () => {
+      // 1. Schonfrist
+      if (gameState.status === 'Läuft' && gameState.startedAt) {
+        const graceMinutes = gameState.settings.gracePeriodMinutes || 15;
+        const startMs = new Date(gameState.startedAt).getTime();
+        const endGraceMs = startMs + graceMinutes * 60 * 1000;
+        const now = Date.now();
+        const diffGrace = Math.max(0, Math.floor((endGraceMs - now) / 1000));
+        setGracePeriodSeconds(diffGrace);
+      } else {
+        setGracePeriodSeconds(0);
+      }
+
+      // 2. Player cooldown
+      const dbPlayer = players.find((p) => p.id === player.id);
+      const cooldownUntil = (dbPlayer as any)?.cooldown_until || (player as any)?.cooldown_until;
+      if (cooldownUntil) {
+        const cdEndMs = new Date(cooldownUntil).getTime();
+        const diffCd = Math.max(0, Math.floor((cdEndMs - Date.now()) / 1000));
+        setCooldownRemainingSeconds(diffCd);
+      } else {
+        setCooldownRemainingSeconds(0);
+      }
+    };
+
+    checkGraceAndCooldown();
+    const interval = setInterval(checkGraceAndCooldown, 1000);
+    return () => clearInterval(interval);
+  }, [gameState, player, players]);
+
+  // Load pending special task for living humans
+  useEffect(() => {
+    if (gameState.status === 'Läuft' && player.role === 'Mensch' && player.status === 'lebendig') {
+      gameApi.getPendingSpecialTask(player.id).then((st) => {
+        setPendingSpecialTask(st);
+      });
+    }
+  }, [gameState.status, player.role, player.status, player.id]);
 
   const isDead = player.status === 'tot';
-  const isKillerRole = ['Vampir', 'Werwolf', 'Geist'].includes(player.role);
   const isHunter = player.role === 'Geisterjäger';
+  const isKiller = ['Vampir', 'Werwolf', 'Geist'].includes(player.role);
+  const isWerewolf = player.role === 'Werwolf';
 
-  // Active players list
-  const activePlayers = useMemo(
-    () => players.filter((p) => p.status !== 'entfernt'),
-    [players]
+  // Alive players excluding self
+  const potentialVictims = useMemo(() => {
+    return players.filter((p) => p.id !== player.id && p.status === 'lebendig');
+  }, [players, player.id]);
+
+  // Hunters teammate list (Geisterjäger sehen sich gegenseitig)
+  const fellowHunters = useMemo(() => {
+    if (!isHunter) return [];
+    return players.filter((p) => p.role === 'Geisterjäger' && p.id !== player.id && p.status !== 'entfernt');
+  }, [players, isHunter, player.id]);
+
+  // Top rankings
+  const activePlayers = useMemo(() => players.filter((p) => p.status !== 'entfernt'), [players]);
+  const overallRanking = useMemo(
+    () => [...activePlayers].sort((a, b) => (b.points || 0) - (a.points || 0)),
+    [activePlayers]
   );
-
-  // Alive players excluding self (candidates for kill/attack)
-  const potentialVictims = useMemo(
-    () => activePlayers.filter((p) => p.id !== player.id && p.status === 'lebendig'),
-    [activePlayers, player.id]
+  const deadRanking = useMemo(
+    () => activePlayers.filter((p) => p.status === 'tot').sort((a, b) => (b.points || 0) - (a.points || 0)),
+    [activePlayers]
   );
+  const myRank = overallRanking.findIndex((p) => p.id === player.id) + 1;
 
-  // Filtered player list for "Spieler" tab
-  const filteredPlayers = useMemo(() => {
-    return activePlayers.filter((p) => {
-      const matchSearch =
-        !playerSearch.trim() ||
-        p.name.toLowerCase().includes(playerSearch.toLowerCase()) ||
-        p.costumeName.toLowerCase().includes(playerSearch.toLowerCase());
-      const matchStatus = statusFilter === 'alle' || p.status === statusFilter;
-      return matchSearch && matchStatus;
+  // Active 2 photo tasks for the player (derived deterministically or rotating)
+  const myActivePhotoTasks = useMemo(() => {
+    // Generate 2 rotating tasks from pool
+    const completedCount = player.tasksCompletedCount || 0;
+    const pool = DEFAULT_PHOTO_TASKS;
+    const task1 = pool[completedCount % pool.length];
+    const task2 = pool[(completedCount + 1) % pool.length];
+
+    // Pick a random other player for specific templates
+    const otherPlayers = players.filter((p) => p.id !== player.id && p.status !== 'entfernt');
+    const randomTarget = otherPlayers.length > 0 ? otherPlayers[completedCount % otherPlayers.length] : null;
+
+    const formatDesc = (t: typeof task1) => {
+      let txt = t.text;
+      if (randomTarget) {
+        txt = txt
+          .replace('{playerName}', randomTarget.name)
+          .replace('{costumeName}', randomTarget.costumeName || 'Kostüm');
+      } else {
+        txt = txt
+          .replace('{playerName}', 'einem Mitspieler')
+          .replace('{costumeName}', 'einem Grusel-Kostüm');
+      }
+      return txt;
+    };
+
+    return [
+      {
+        id: `${task1.id}_${completedCount}`,
+        title: task1.type === 'specific_player' ? `Foto mit ${randomTarget?.name || 'Gast'}` : 'Foto-Challenge #1',
+        description: formatDesc(task1),
+        points: gameState.settings.pointsPhotoTask || 10,
+        rawTemplate: task1,
+        targetPlayer: randomTarget,
+      },
+      {
+        id: `${task2.id}_${completedCount + 1}`,
+        title: task2.type === 'specific_costume' ? `Kostüm-Foto` : 'Foto-Challenge #2',
+        description: formatDesc(task2),
+        points: gameState.settings.pointsPhotoTask || 10,
+        rawTemplate: task2,
+        targetPlayer: randomTarget,
+      },
+    ];
+  }, [player.tasksCompletedCount, player.id, players, gameState.settings.pointsPhotoTask]);
+
+  // Handlers
+  const handleConfirmKillOnSelf = async () => {
+    if (!pendingKillOnSelf) return;
+    await gameApi.confirmKill(pendingKillOnSelf.id);
+    await onRefreshState();
+  };
+
+  const handleReportKill = async (victimId: string, ghostSoloConfirmed?: boolean) => {
+    const res = await gameApi.reportKill({
+      killerId: player.id,
+      victimId,
+      ghostSoloConfirmed,
     });
-  }, [activePlayers, playerSearch, statusFilter]);
-
-  // Ranking sorted by points descending
-  const rankingList = useMemo(() => {
-    return [...activePlayers].sort((a, b) => (b.points || 0) - (a.points || 0));
-  }, [activePlayers]);
-
-  // Player's completed tasks
-  const myCompletedTaskIds = useMemo(() => {
-    return new Set(taskCompletions.filter((c) => c.playerId === player.id).map((c) => c.taskId));
-  }, [taskCompletions, player.id]);
-
-  // --- HANDLERS ---
-  const handleExecuteKill = async () => {
-    if (!selectedVictimId) return;
-    setIsSubmittingKill(true);
-    setKillError('');
-    try {
-      await onRecordKill(selectedVictimId);
-      setKillSuccess('Biss erfolgreich protokolliert! +50 Punkte.');
-      setTimeout(() => {
-        setIsKillModalOpen(false);
-        setSelectedVictimId('');
-        setKillSuccess('');
-      }, 1500);
-    } catch (err: any) {
-      setKillError(err?.message || 'Biss konnte nicht ausgeführt werden');
-    } finally {
-      setIsSubmittingKill(false);
-    }
+    await onRefreshState();
+    return res;
   };
 
-  const handleTaskPhotoSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setTaskPhotoFile(file);
-    try {
-      const compressed = await compressImageToMax1200px(file);
-      setTaskPhotoPreview(compressed.dataUrl);
-    } catch {
-      setTaskPhotoPreview(URL.createObjectURL(file));
-    }
+  const handleExorcise = async (targetId: string) => {
+    const res = await gameApi.exorcise(player.id, targetId);
+    await onRefreshState();
+    return res;
   };
 
-  const handleSubmitTask = async () => {
-    if (!selectedTaskForUpload) return;
-    setIsSubmittingTask(true);
-    try {
-      await onCompleteTask(selectedTaskForUpload.id, taskPhotoFile || undefined);
-      setSelectedTaskForUpload(null);
-      setTaskPhotoFile(null);
-      setTaskPhotoPreview('');
-    } catch (err: any) {
-      alert(err?.message || 'Aufgabe konnte nicht abgeschlossen werden');
-    } finally {
-      setIsSubmittingTask(false);
-    }
+  const handleCompletePhotoTask = async (
+    photoBlobOrUrl: Blob | File | string,
+    taggedPlayerIds: string[]
+  ) => {
+    if (!activeTaskModal) return;
+    await gameApi.completePhotoTask({
+      playerId: player.id,
+      taskId: activeTaskModal.id,
+      taskTitle: activeTaskModal.title,
+      photoBlobOrUrl,
+      taggedPlayerIds,
+    });
+    setActiveTaskModal(null);
+    await onRefreshState();
   };
 
-  const handleGalleryPhotoSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setGalleryPhotoFile(file);
-    try {
-      const compressed = await compressImageToMax1200px(file);
-      setGalleryPhotoPreview(compressed.dataUrl);
-    } catch {
-      setGalleryPhotoPreview(URL.createObjectURL(file));
-    }
+  const handleCompleteSpecialTask = async (userAnswer?: number, scannedQrCode?: string) => {
+    if (!pendingSpecialTask) throw new Error('Keine Spezialaufgabe aktiv');
+    const res = await gameApi.completeSpecialTask({
+      specialTaskId: pendingSpecialTask.id,
+      playerId: player.id,
+      userAnswer,
+      scannedQrCode,
+    });
+    await onRefreshState();
+    return res;
   };
 
-  const handleSubmitGalleryPhoto = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!galleryPhotoFile) return;
-    setIsUploadingGallery(true);
-    try {
-      await onUploadPhoto(galleryPhotoFile, galleryCaption);
-      setIsGalleryModalOpen(false);
-      setGalleryPhotoFile(null);
-      setGalleryPhotoPreview('');
-      setGalleryCaption('');
-    } catch (err: any) {
-      alert(err?.message || 'Foto konnte nicht hochgeladen werden');
-    } finally {
-      setIsUploadingGallery(false);
-    }
-  };
+  // IF GAME IS OVER (Beendet), SHOW END VIEW
+  if (gameState.status === 'Beendet') {
+    return (
+      <GameEndView
+        gameState={gameState}
+        players={players}
+        kills={kills}
+        photos={photos}
+      />
+    );
+  }
 
-  const getStatusBadge = () => {
-    switch (gameStatus) {
-      case 'Lobby':
-        return (
-          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#ff6b00]/15 border border-[#ff6b00]/30 text-[#ff6b00] text-xs font-bold uppercase tracking-wider">
-            <span className="w-2 h-2 rounded-full bg-[#ff6b00] animate-pulse" />
-            Lobby
+  // IF STILL IN LOBBY, SHOW LOBBY VIEW
+  if (gameState.status === 'Lobby') {
+    return (
+      <div className="space-y-5 animate-in fade-in pb-16">
+        <div className="text-center p-6 rounded-3xl bg-gradient-to-b from-orange-950/40 via-zinc-950 to-zinc-950 border border-orange-500/30 space-y-2">
+          <div className="w-14 h-14 mx-auto rounded-2xl bg-[#ff6b00]/15 border border-[#ff6b00]/40 flex items-center justify-center text-[#ff6b00] animate-pulse">
+            <Sparkles className="w-7 h-7" />
+          </div>
+          <span className="inline-block px-3 py-0.5 rounded-full bg-[#ff6b00]/15 text-[#ff6b00] text-xs font-bold uppercase tracking-wider">
+            Party-Lobby
           </span>
-        );
-      case 'Läuft':
-        return (
-          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-rose-500/20 border border-rose-500/40 text-rose-300 text-xs font-bold uppercase tracking-wider shadow-sm shadow-rose-950">
-            <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping" />
-            Spiel Läuft
-          </span>
-        );
-      case 'Beendet':
-        return (
-          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-purple-500/20 border border-purple-500/40 text-purple-300 text-xs font-bold uppercase tracking-wider">
-            <Lock className="w-3.5 h-3.5" />
-            Beendet
-          </span>
-        );
-    }
-  };
+          <h2 className="text-2xl font-serif font-black text-white">Warten auf Spielstart...</h2>
+          <p className="text-xs text-zinc-400 max-w-xs mx-auto leading-relaxed">
+            Der Spielleiter startet das Spiel gleich. Mache dich bereit und lerne deine Mitgäste kennen!
+          </p>
+        </div>
 
-  const getRoleIcon = (role: RoleType) => {
-    switch (role) {
-      case 'Vampir':
-        return <Skull className="w-8 h-8 text-rose-500" />;
-      case 'Werwolf':
-        return <Moon className="w-8 h-8 text-yellow-400" />;
-      case 'Geist':
-        return <Ghost className="w-8 h-8 text-purple-400" />;
-      case 'Geisterjäger':
-        return <Shield className="w-8 h-8 text-cyan-400" />;
-      case 'Mensch':
-        return <Users className="w-8 h-8 text-emerald-400" />;
-      default:
-        return <Sparkles className="w-8 h-8 text-[#ff6b00]" />;
-    }
-  };
-
-  return (
-    <div className="space-y-4 max-w-md mx-auto pb-10">
-      {/* Top Bar: Status, Players Count, Logout */}
-      <div className="flex items-center justify-between p-3.5 rounded-2xl bg-zinc-950/90 border border-zinc-800 shadow-lg">
-        <div className="flex items-center gap-2">{getStatusBadge()}</div>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-zinc-300 bg-zinc-900 px-3 py-1 rounded-xl border border-zinc-800">
-            <Users className="w-3.5 h-3.5 text-[#ff6b00]" />
-            <span>{totalJoinedCount} Gäste</span>
+        {/* Own Player Badge */}
+        <div className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <img
+              src={player.photoUrl || '/placeholder.png'}
+              alt={player.name}
+              className="w-12 h-12 rounded-2xl object-cover border-2 border-[#ff6b00]"
+            />
+            <div>
+              <span className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider block">
+                Du bist angemeldet als
+              </span>
+              <span className="font-bold text-white text-base leading-tight block">{player.name}</span>
+              <span className="text-xs text-[#ff6b00] font-medium">{player.costumeName}</span>
+            </div>
           </div>
           <button
             onClick={onLogoutDevice}
-            className="p-1.5 rounded-xl text-zinc-400 hover:text-rose-400 hover:bg-zinc-900 transition cursor-pointer"
-            title="Gerät abmelden"
+            className="p-2 rounded-xl bg-zinc-800 text-zinc-400 hover:text-white cursor-pointer transition"
+            title="Auf diesem Gerät abmelden"
           >
             <LogOut className="w-4 h-4" />
           </button>
         </div>
-      </div>
 
-      {/* Sub-Navigation Bar for Player Views (Lobby, Spielerliste, Ranking, Aufgaben, Galerie) */}
-      <div className="flex items-center gap-1 p-1 rounded-2xl bg-zinc-900/90 border border-zinc-800 overflow-x-auto no-scrollbar">
-        <button
-          onClick={() => setSubTab('my-game')}
-          className={`flex-1 py-2 px-2.5 rounded-xl text-xs font-bold transition whitespace-nowrap cursor-pointer ${
-            subTab === 'my-game'
-              ? 'bg-[#ff6b00] text-black shadow-md shadow-[#ff6b00]/20'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          {gameStatus === 'Lobby' ? 'Lobby' : 'Mein Spiel'}
-        </button>
-        <button
-          onClick={() => setSubTab('players')}
-          className={`flex-1 py-2 px-2.5 rounded-xl text-xs font-bold transition whitespace-nowrap cursor-pointer ${
-            subTab === 'players'
-              ? 'bg-[#ff6b00] text-black shadow-md shadow-[#ff6b00]/20'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          Spieler ({activePlayers.length})
-        </button>
-        <button
-          onClick={() => setSubTab('ranking')}
-          className={`flex-1 py-2 px-2.5 rounded-xl text-xs font-bold transition whitespace-nowrap cursor-pointer ${
-            subTab === 'ranking'
-              ? 'bg-[#ff6b00] text-black shadow-md shadow-[#ff6b00]/20'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          Ranking
-        </button>
-        <button
-          onClick={() => setSubTab('tasks')}
-          className={`flex-1 py-2 px-2.5 rounded-xl text-xs font-bold transition whitespace-nowrap cursor-pointer ${
-            subTab === 'tasks'
-              ? 'bg-[#ff6b00] text-black shadow-md shadow-[#ff6b00]/20'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          Aufgaben
-        </button>
-        <button
-          onClick={() => setSubTab('gallery')}
-          className={`flex-1 py-2 px-2.5 rounded-xl text-xs font-bold transition whitespace-nowrap cursor-pointer ${
-            subTab === 'gallery'
-              ? 'bg-[#ff6b00] text-black shadow-md shadow-[#ff6b00]/20'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          Galerie ({photos.length})
-        </button>
-      </div>
-
-      {/* VIEW 1: MEIN SPIEL & LOBBY */}
-      {subTab === 'my-game' && (
-        <div className="space-y-4">
-          {/* Eigenes Profil Banner */}
-          <div className="p-4 rounded-3xl bg-linear-to-b from-zinc-900 via-zinc-900/90 to-zinc-950 border border-zinc-800 shadow-xl relative overflow-hidden">
-            <div className="flex items-center gap-3.5">
-              <div className="relative shrink-0">
-                <img
-                  src={player.photoUrl}
-                  alt={player.name}
-                  className={`w-18 h-18 rounded-2xl object-cover border-2 shadow-lg ${
-                    isDead ? 'border-zinc-700 grayscale' : 'border-[#ff6b00]/60'
-                  }`}
-                />
-                {isDead && (
-                  <div className="absolute inset-0 bg-black/60 rounded-2xl flex items-center justify-center text-red-500">
-                    <Skull className="w-7 h-7" />
-                  </div>
-                )}
-              </div>
-
-              <div className="truncate flex-1">
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  <h2 className="font-serif font-black text-lg text-white tracking-wide truncate">
-                    {player.name}
-                  </h2>
-                  <span className="text-[10px] font-bold px-1.5 py-0.2 rounded-full bg-[#ff6b00]/20 text-[#ff6b00] border border-[#ff6b00]/30">
-                    Du
-                  </span>
-                </div>
-                <p className="text-xs text-[#ff6b00] font-semibold mt-0.5 truncate flex items-center gap-1">
-                  <Sparkles className="w-3 h-3 shrink-0" />
-                  {player.costumeName}
-                </p>
-
-                <div className="mt-2 flex items-center gap-2 flex-wrap">
-                  <span
-                    className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border ${
-                      player.status === 'lebendig'
-                        ? 'bg-emerald-950 text-emerald-300 border-emerald-500/40'
-                        : player.status === 'tot'
-                        ? 'bg-red-950 text-red-400 border-red-500/40'
-                        : 'bg-zinc-800 text-zinc-400 border-zinc-700'
-                    }`}
-                  >
-                    {player.status}
-                  </span>
-                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-purple-950/80 text-purple-300 border border-purple-500/40">
-                    {player.points || 0} Punkte
-                  </span>
-                  {player.killsCount ? (
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-950/80 text-rose-300 border border-rose-500/40">
-                      {player.killsCount} Kills
-                    </span>
-                  ) : null}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* LOBBY MODUS */}
-          {gameStatus === 'Lobby' && (
-            <div className="p-6 rounded-3xl bg-linear-to-b from-purple-950/40 via-zinc-900 to-zinc-950 border-2 border-purple-500/30 text-center space-y-3 shadow-xl">
-              <div className="w-14 h-14 rounded-full bg-[#ff6b00]/10 border border-[#ff6b00]/30 text-[#ff6b00] flex items-center justify-center mx-auto animate-pulse">
-                <Sparkles className="w-7 h-7" />
-              </div>
-              <div>
-                <h3 className="font-serif font-black text-xl text-white">Das Spiel startet bald</h3>
-                <p className="text-xs text-zinc-400 mt-1.5 leading-relaxed max-w-xs mx-auto">
-                  Willkommen in der Party-Lobby! Der Spielleiter weist die Rollen zu. Sobald die Runde gestartet wird,
-                  siehst du hier deine geheime Rolle und Aktionen.
-                </p>
-              </div>
-              <div className="pt-1 flex items-center justify-center gap-2 text-xs font-bold text-zinc-300 bg-zinc-950/60 p-2.5 rounded-2xl border border-zinc-800">
-                <Users className="w-4 h-4 text-[#ff6b00]" />
-                <span>{activePlayers.length} Gäste im selben Spiel versammelt</span>
-              </div>
-            </div>
-          )}
-
-          {/* LAUFENDES SPIEL: ROLLE & AKTIONEN */}
-          {gameStatus !== 'Lobby' && (
-            <>
-              {/* Geheime Rolle */}
-              <div className="p-5 rounded-3xl bg-zinc-900/95 border-2 border-zinc-800 shadow-2xl space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">
-                    Deine Geheime Rolle
-                  </span>
-                  <span className="text-[10px] text-zinc-500">{roleRevealed ? 'Sichtbar' : 'Verdeckt'}</span>
-                </div>
-
-                {!roleRevealed ? (
-                  <div className="p-6 rounded-2xl bg-linear-to-b from-purple-950/60 to-zinc-950 border border-purple-500/40 text-center space-y-3">
-                    <div className="w-12 h-12 rounded-2xl bg-zinc-900 border border-purple-500/30 flex items-center justify-center mx-auto text-purple-300">
-                      <Lock className="w-6 h-6" />
-                    </div>
-                    <div>
-                      <h4 className="font-serif font-bold text-base text-white">Rolle geheim verdeckt</h4>
-                      <p className="text-[11px] text-zinc-400 mt-0.5">
-                        Tippe auf den Button, um deine Rolle diskret anzusehen.
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setRoleRevealed(true)}
-                      className="w-full py-3 px-4 rounded-xl bg-linear-to-r from-purple-700 to-rose-600 hover:from-purple-600 hover:to-rose-500 text-white font-serif font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 shadow-lg cursor-pointer active:scale-98 transition"
-                    >
-                      <Eye className="w-4 h-4" />
-                      Rolle aufdecken
-                    </button>
-                  </div>
-                ) : (
-                  <div className="p-6 rounded-2xl bg-linear-to-b from-zinc-950 via-zinc-900 to-zinc-950 border-2 border-rose-500/50 text-center space-y-3 animate-in fade-in zoom-in-95">
-                    <div className="w-16 h-16 rounded-2xl bg-zinc-900 border border-rose-500/40 flex items-center justify-center mx-auto shadow-md">
-                      {getRoleIcon(player.role)}
-                    </div>
-                    <div>
-                      <h3 className="font-serif font-black text-2xl text-white tracking-wide">{player.role}</h3>
-                      <span
-                        className={`inline-block mt-1 text-xs font-bold px-3 py-0.5 rounded-full border ${
-                          player.team === 'Böse'
-                            ? 'bg-rose-950/80 text-rose-300 border-rose-500/40'
-                            : 'bg-cyan-950/80 text-cyan-300 border-cyan-500/40'
-                        }`}
-                      >
-                        Team: {player.team}
-                      </span>
-                    </div>
-
-                    <p className="text-xs text-zinc-300 max-w-xs mx-auto pt-1 leading-relaxed">
-                      {player.role === 'Vampir' && 'Du gehörst zur Nacht. Töte im Geheimen durch sanfte Berührung und Flüstern.'}
-                      {player.role === 'Werwolf' && 'Du bist ein Werwolf. Halte dich bereit für die Vollmond-Jagd.'}
-                      {player.role === 'Geist' && 'Du wandelst als Geist. Schlage nur zu, wenn du mit dem Opfer allein bist.'}
-                      {player.role === 'Geisterjäger' && 'Du bist der Schutz der Sterblichen. Finde die bösen Kreaturen.'}
-                      {player.role === 'Mensch' && 'Du bist ein sterblicher Gast. Löse Aufgaben und überlebe die Nacht!'}
-                    </p>
-
-                    <button
-                      type="button"
-                      onClick={() => setRoleRevealed(false)}
-                      className="w-full py-2 px-4 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer mt-2"
-                    >
-                      <EyeOff className="w-4 h-4" />
-                      Rolle wieder verbergen
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* AKTIONEN: BISS / KILL AUSFÜHREN (Für Vampire, Werwölfe, Geister) */}
-              {isKillerRole && !isDead && (
-                <div className="p-5 rounded-3xl bg-linear-to-b from-rose-950/40 via-zinc-900 to-zinc-950 border border-rose-500/40 shadow-xl space-y-3">
-                  <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
-                    <h3 className="font-serif font-bold text-base text-white flex items-center gap-2">
-                      <Flame className="w-4 h-4 text-rose-500" />
-                      Nacht-Aktion ({player.role})
-                    </h3>
-                    <span className="text-[10px] font-bold text-rose-400 bg-rose-950/60 px-2 py-0.5 rounded-full border border-rose-500/30">
-                      Aktiv
-                    </span>
-                  </div>
-
-                  <p className="text-xs text-zinc-300 leading-relaxed">
-                    Hast du ein Opfer berührt und ihm die geheime Botschaft zugeflüstert? Protokolliere hier deinen Kill,
-                    um dem Opfer den Tod zuzuweisen und dir +50 Punkte zu sichern.
-                  </p>
-
-                  <button
-                    onClick={() => setIsKillModalOpen(true)}
-                    className="w-full py-3.5 px-4 rounded-2xl bg-linear-to-r from-rose-600 to-red-700 hover:from-rose-500 hover:to-red-600 text-white font-serif font-black text-xs uppercase tracking-wider shadow-lg shadow-rose-950 flex items-center justify-center gap-2 cursor-pointer active:scale-98 transition"
-                  >
-                    <Skull className="w-4 h-4" />
-                    Biss / Kill protokollieren
-                  </button>
-                </div>
-              )}
-            </>
-          )}
-
-          {/* LETZTE KILLS IM SPIEL */}
-          {kills.length > 0 && (
-            <div className="p-4 rounded-3xl bg-zinc-900/90 border border-zinc-800 shadow-xl space-y-3">
-              <h4 className="font-serif font-bold text-sm text-white flex items-center gap-2 pb-2 border-b border-zinc-800">
-                <Skull className="w-4 h-4 text-rose-400" />
-                Letzte Vorfälle ({kills.length})
-              </h4>
-              <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                {kills.map((k) => (
-                  <div
-                    key={k.id}
-                    className="flex items-center justify-between p-2.5 rounded-2xl bg-zinc-950 border border-zinc-800/80 text-xs"
-                  >
-                    <div className="flex items-center gap-2 truncate">
-                      <span className="w-2 h-2 rounded-full bg-rose-500 shrink-0" />
-                      <span className="text-zinc-400 truncate">
-                        <strong className="text-white">{k.victimName}</strong> wurde eliminiert
-                      </span>
-                    </div>
-                    <span className="text-[10px] text-zinc-500 shrink-0 ml-2">
-                      {new Date(k.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* VIEW 2: SPIELERLISTE (Search & Filters) */}
-      {subTab === 'players' && (
+        {/* Lobby Players List */}
         <div className="space-y-3">
-          <div className="p-4 rounded-3xl bg-zinc-900/90 border border-zinc-800 shadow-xl space-y-3">
-            <div className="flex items-center justify-between pb-1">
-              <h3 className="font-serif font-bold text-base text-white flex items-center gap-2">
-                <UserCheck className="w-4 h-4 text-[#ff6b00]" />
-                Alle Party-Gäste ({filteredPlayers.length})
-              </h3>
-              <span className="text-[10px] text-zinc-500">Live aus Supabase</span>
-            </div>
-
-            {/* Search Input */}
-            <div className="relative">
-              <Search className="w-4 h-4 absolute left-3 top-3 text-zinc-500" />
-              <input
-                type="text"
-                placeholder="Name oder Kostüm suchen..."
-                value={playerSearch}
-                onChange={(e) => setPlayerSearch(e.target.value)}
-                className="w-full pl-9 pr-4 py-2.5 rounded-xl bg-zinc-950 border border-zinc-800 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-[#ff6b00]"
-              />
-            </div>
-
-            {/* Filter Tabs */}
-            <div className="flex gap-2">
-              {(['alle', 'lebendig', 'tot'] as const).map((filter) => (
-                <button
-                  key={filter}
-                  onClick={() => setStatusFilter(filter)}
-                  className={`flex-1 py-1.5 rounded-xl text-[11px] font-semibold capitalize border transition cursor-pointer ${
-                    statusFilter === filter
-                      ? 'bg-[#ff6b00]/20 border-[#ff6b00] text-[#ff6b00]'
-                      : 'bg-zinc-950 border-zinc-800 text-zinc-400'
-                  }`}
-                >
-                  {filter}
-                </button>
-              ))}
-            </div>
-
-            {/* Player Cards Grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-[460px] overflow-y-auto pr-1">
-              {filteredPlayers.map((guest) => {
-                const isCurrent = guest.id === player.id;
-                const isGuestDead = guest.status === 'tot';
-                return (
-                  <div
-                    key={guest.id}
-                    className={`flex items-center gap-3 p-3 rounded-2xl border transition ${
-                      isCurrent
-                        ? 'bg-[#ff6b00]/10 border-[#ff6b00]/50'
-                        : isGuestDead
-                        ? 'bg-red-950/20 border-red-900/40 opacity-75'
-                        : 'bg-zinc-950/80 border-zinc-800/80'
-                    }`}
-                  >
-                    <div className="relative shrink-0">
-                      <img
-                        src={guest.photoUrl}
-                        alt={guest.name}
-                        className={`w-12 h-12 rounded-xl object-cover border ${
-                          isGuestDead ? 'border-red-500/50 grayscale' : 'border-zinc-700'
-                        }`}
-                      />
-                      {isGuestDead && (
-                        <div className="absolute inset-0 bg-black/60 rounded-xl flex items-center justify-center text-red-500">
-                          <Skull className="w-5 h-5" />
-                        </div>
-                      )}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-1.5">
-                        <p className="text-xs font-bold text-white truncate">{guest.name}</p>
-                        {isCurrent && (
-                          <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-[#ff6b00] text-black">
-                            Du
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-[11px] text-[#ff6b00] truncate font-medium">{guest.costumeName}</p>
-                      <div className="flex items-center gap-2 mt-0.5">
-                        <span
-                          className={`text-[9px] font-bold uppercase ${
-                            guest.status === 'lebendig'
-                              ? 'text-emerald-400'
-                              : guest.status === 'tot'
-                              ? 'text-red-400'
-                              : 'text-zinc-500'
-                          }`}
-                        >
-                          {guest.status}
-                        </span>
-                        <span className="text-[9px] text-zinc-400">· {guest.points || 0} Pkt.</span>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* VIEW 3: RANKING / BESTENLISTE */}
-      {subTab === 'ranking' && (
-        <div className="p-4 rounded-3xl bg-zinc-900/90 border border-zinc-800 shadow-xl space-y-3">
-          <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
-            <h3 className="font-serif font-bold text-base text-white flex items-center gap-2">
-              <Trophy className="w-4 h-4 text-amber-400" />
-              Party-Bestenliste
+          <div className="flex items-center justify-between px-1">
+            <h3 className="font-bold text-white text-sm flex items-center gap-2">
+              <Users className="w-4 h-4 text-[#ff6b00]" />
+              In der Lobby ({totalJoinedCount})
             </h3>
-            <span className="text-[10px] text-zinc-500">Punkte & Überleben</span>
+            <span className="text-xs text-zinc-500 font-mono">Live via Supabase</span>
           </div>
 
-          <div className="space-y-2 max-h-[500px] overflow-y-auto pr-1">
-            {rankingList.map((ranked, index) => {
-              const isCurrent = ranked.id === player.id;
-              const isFirst = index === 0;
-              const isSecond = index === 1;
-              const isThird = index === 2;
-
-              return (
-                <div
-                  key={ranked.id}
-                  className={`flex items-center gap-3 p-3 rounded-2xl border transition ${
-                    isCurrent
-                      ? 'bg-[#ff6b00]/15 border-[#ff6b00]'
-                      : isFirst
-                      ? 'bg-amber-950/30 border-amber-500/40'
-                      : 'bg-zinc-950/80 border-zinc-800/80'
-                  }`}
-                >
-                  <div className="w-6 text-center font-serif font-black text-sm">
-                    {isFirst ? (
-                      <span className="text-amber-400">🥇</span>
-                    ) : isSecond ? (
-                      <span className="text-zinc-300">🥈</span>
-                    ) : isThird ? (
-                      <span className="text-amber-600">🥉</span>
-                    ) : (
-                      <span className="text-zinc-500 text-xs">#{index + 1}</span>
-                    )}
-                  </div>
-
-                  <img
-                    src={ranked.photoUrl}
-                    alt={ranked.name}
-                    className="w-10 h-10 rounded-xl object-cover border border-zinc-700 shrink-0"
-                  />
-
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs font-bold text-white truncate flex items-center gap-1.5">
-                      {ranked.name}
-                      {isCurrent && (
-                        <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-[#ff6b00] text-black">
-                          Du
-                        </span>
-                      )}
-                    </p>
-                    <p className="text-[10px] text-[#ff6b00] truncate">{ranked.costumeName}</p>
-                  </div>
-
-                  <div className="text-right shrink-0">
-                    <span className="font-serif font-black text-sm text-white block">
-                      {ranked.points || 0}
-                    </span>
-                    <span className="text-[9px] text-zinc-400 uppercase font-semibold">Punkte</span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* VIEW 4: AUFGABEN (TASKS) */}
-      {subTab === 'tasks' && (
-        <div className="space-y-3">
-          <div className="p-4 rounded-3xl bg-zinc-900/90 border border-zinc-800 shadow-xl space-y-3">
-            <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
-              <div>
-                <h3 className="font-serif font-bold text-base text-white flex items-center gap-2">
-                  <Award className="w-4 h-4 text-purple-400" />
-                  Halloween Party-Aufgaben
-                </h3>
-                <p className="text-[11px] text-zinc-400 mt-0.5">
-                  Löse Challenges, lade Beweisfotos hoch und sammle Punkte!
-                </p>
-              </div>
-            </div>
-
-            <div className="space-y-2.5 max-h-[500px] overflow-y-auto pr-1">
-              {tasks.length === 0 ? (
-                <p className="text-xs text-zinc-500 text-center py-6">Keine Aufgaben hinterlegt.</p>
-              ) : (
-                tasks.map((t) => {
-                  const isDone = myCompletedTaskIds.has(t.id);
-                  return (
-                    <div
-                      key={t.id}
-                      className={`p-3.5 rounded-2xl border transition space-y-2 ${
-                        isDone
-                          ? 'bg-emerald-950/20 border-emerald-500/40 opacity-80'
-                          : 'bg-zinc-950 border-zinc-800'
-                      }`}
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <h4 className="text-xs font-bold text-white flex items-center gap-1.5">
-                            {isDone && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />}
-                            {t.title}
-                          </h4>
-                          <p className="text-[11px] text-zinc-400 mt-0.5 leading-relaxed">{t.description}</p>
-                        </div>
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-purple-950 text-purple-300 border border-purple-500/40 shrink-0">
-                          +{t.points} Pkt.
-                        </span>
-                      </div>
-
-                      <div className="pt-1 flex items-center justify-between">
-                        {isDone ? (
-                          <span className="text-[11px] font-bold text-emerald-400 flex items-center gap-1">
-                            ✓ Abgeschlossen
-                          </span>
-                        ) : (
-                          <button
-                            onClick={() => setSelectedTaskForUpload(t)}
-                            className="py-1.5 px-3 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-[11px] flex items-center gap-1.5 cursor-pointer transition active:scale-95"
-                          >
-                            <Camera className="w-3.5 h-3.5" />
-                            Foto-Beweis hochladen
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* VIEW 5: GALERIE (PHOTOS) */}
-      {subTab === 'gallery' && (
-        <div className="space-y-3">
-          <div className="p-4 rounded-3xl bg-zinc-900/90 border border-zinc-800 shadow-xl space-y-3">
-            <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
-              <div>
-                <h3 className="font-serif font-bold text-base text-white flex items-center gap-2">
-                  <ImageIcon className="w-4 h-4 text-[#ff6b00]" />
-                  Party-Galerie ({photos.length})
-                </h3>
-                <p className="text-[11px] text-zinc-400">Live-Fotos aller Party-Gäste</p>
-              </div>
-              <button
-                onClick={() => setIsGalleryModalOpen(true)}
-                className="py-1.5 px-3 rounded-xl bg-[#ff6b00] hover:bg-[#e05e00] text-black font-bold text-xs flex items-center gap-1.5 shadow-md shadow-[#ff6b00]/20 cursor-pointer active:scale-95 transition"
+          <div className="grid grid-cols-2 gap-2 max-h-[360px] overflow-y-auto pr-1">
+            {activePlayers.map((p) => (
+              <div
+                key={p.id}
+                className="p-2.5 rounded-2xl bg-zinc-900/80 border border-zinc-800/80 flex items-center gap-2.5"
               >
-                <Plus className="w-3.5 h-3.5" />
-                Foto teilen
-              </button>
+                <img
+                  src={p.photoUrl || '/placeholder.png'}
+                  alt={p.name}
+                  className="w-10 h-10 rounded-xl object-cover border border-zinc-700 shrink-0"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-bold text-white truncate">{p.name}</div>
+                  <div className="text-[10px] text-zinc-400 truncate">{p.costumeName}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // --- GAME IS RUNNING ('Läuft') ---
+  return (
+    <div className="space-y-4 animate-in fade-in pb-16">
+      {/* 1. FULL MOON BANNER */}
+      <FullMoonBanner
+        activeFullMoon={gameState.activeFullMoon || null}
+        isWerewolf={isWerewolf}
+        onMoonEnd={onRefreshState}
+      />
+
+      {/* 2. PENDING KILL FULL-SCREEN NOTIFICATION */}
+      {pendingKillOnSelf && (
+        <KillNotificationModal
+          pendingKill={pendingKillOnSelf}
+          onConfirm={handleConfirmKillOnSelf}
+        />
+      )}
+
+      {/* 3. DEAD PLAYER BANNER */}
+      {isDead && (
+        <div className="p-4 rounded-3xl bg-gradient-to-r from-purple-950 to-zinc-950 border-2 border-purple-600/80 shadow-xl space-y-1 text-center">
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-purple-500/20 text-purple-300 text-xs font-black uppercase tracking-wider">
+            <Skull className="w-4 h-4" />
+            Totenreich
+          </div>
+          <h3 className="text-xl font-serif font-black text-white">Du bist tot!</h3>
+          <p className="text-xs text-zinc-300 max-w-xs mx-auto">
+            Du darfst deine Rolle verraten. Bleibe im Spiel als Zuschauer und sammle Punkte für das Totenreich-Ranking!
+          </p>
+        </div>
+      )}
+
+      {/* 4. SCHONFRIST (GRACE PERIOD) WARNING BANNER */}
+      {gracePeriodSeconds > 0 && !isDead && (
+        <div className="p-3 rounded-2xl bg-amber-950/60 border border-amber-500/50 text-amber-200 text-xs flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Shield className="w-4 h-4 text-amber-400 shrink-0" />
+            <div>
+              <span className="font-bold text-amber-300 block">Schonfrist aktiv!</span>
+              <span className="text-[11px] text-amber-200/80">In den ersten 15 Min. darf niemand getötet werden.</span>
+            </div>
+          </div>
+          <div className="font-mono font-bold text-amber-300 text-sm shrink-0">
+            {Math.floor(gracePeriodSeconds / 60)}:{(gracePeriodSeconds % 60).toString().padStart(2, '0')}
+          </div>
+        </div>
+      )}
+
+      {/* 5. NAVIGATION TABS (untere Tab-Leiste nach Spielstart) */}
+      <div className="grid grid-cols-4 gap-1 p-1 rounded-2xl bg-zinc-900 border border-zinc-800 text-[11px] font-bold">
+        <button
+          onClick={() => setActiveTab('actions')}
+          className={`py-2 rounded-xl transition cursor-pointer flex flex-col items-center gap-0.5 ${
+            activeTab === 'actions'
+              ? 'bg-[#ff6b00] text-zinc-950 font-black shadow'
+              : 'text-zinc-400 hover:text-zinc-200'
+          }`}
+        >
+          <Zap className="w-4 h-4" />
+          <span>Aktionen</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('tasks')}
+          className={`py-2 rounded-xl transition cursor-pointer flex flex-col items-center gap-0.5 ${
+            activeTab === 'tasks'
+              ? 'bg-[#ff6b00] text-zinc-950 font-black shadow'
+              : 'text-zinc-400 hover:text-zinc-200'
+          }`}
+        >
+          <Camera className="w-4 h-4" />
+          <span>Aufgaben</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('ranking')}
+          className={`py-2 rounded-xl transition cursor-pointer flex flex-col items-center gap-0.5 ${
+            activeTab === 'ranking'
+              ? 'bg-[#ff6b00] text-zinc-950 font-black shadow'
+              : 'text-zinc-400 hover:text-zinc-200'
+          }`}
+        >
+          <Trophy className="w-4 h-4" />
+          <span>Ranking</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('profile')}
+          className={`py-2 rounded-xl transition cursor-pointer flex flex-col items-center gap-0.5 ${
+            activeTab === 'profile'
+              ? 'bg-[#ff6b00] text-zinc-950 font-black shadow'
+              : 'text-zinc-400 hover:text-zinc-200'
+          }`}
+        >
+          <Users className="w-4 h-4" />
+          <span>Profil</span>
+        </button>
+      </div>
+
+      {/* ======================================================== */}
+      {/* TAB 1: AKTIONEN (Fähigkeiten der eigenen Rolle)            */}
+      {/* ======================================================== */}
+      {activeTab === 'actions' && (
+        <div className="space-y-4">
+          {/* Quick Role Status Header */}
+          <div className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div
+                className={`w-12 h-12 rounded-2xl flex items-center justify-center text-white ${
+                  player.role === 'Vampir'
+                    ? 'bg-rose-950 border border-rose-600'
+                    : player.role === 'Werwolf'
+                    ? 'bg-amber-950 border border-amber-600'
+                    : player.role === 'Geist'
+                    ? 'bg-purple-950 border border-purple-600'
+                    : player.role === 'Geisterjäger'
+                    ? 'bg-blue-950 border border-blue-600'
+                    : 'bg-zinc-800 border border-zinc-600'
+                }`}
+              >
+                {player.role === 'Vampir' && <Skull className="w-6 h-6 text-rose-500" />}
+                {player.role === 'Werwolf' && <Moon className="w-6 h-6 text-amber-400" />}
+                {player.role === 'Geist' && <Ghost className="w-6 h-6 text-purple-400" />}
+                {player.role === 'Geisterjäger' && <ShieldAlert className="w-6 h-6 text-blue-400" />}
+                {player.role === 'Mensch' && <Users className="w-6 h-6 text-emerald-400" />}
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider block">
+                  Deine Rolle
+                </span>
+                <span className="font-serif font-black text-xl text-white block">
+                  {player.role}
+                </span>
+                <span className="text-xs text-zinc-400">Team {player.team}</span>
+              </div>
             </div>
 
-            {photos.length === 0 ? (
-              <p className="text-xs text-zinc-500 text-center py-8">
-                Noch keine Fotos hochgeladen. Sei der Erste!
-              </p>
-            ) : (
-              <div className="grid grid-cols-2 gap-2.5 max-h-[500px] overflow-y-auto pr-1">
-                {photos.map((photo) => (
+            <div className="text-right">
+              <span className="text-xs font-mono font-bold text-[#ff6b00] block">{player.points} Pkt</span>
+              <span
+                className={`text-[10px] font-bold ${
+                  player.status === 'lebendig' ? 'text-emerald-400' : 'text-rose-400'
+                }`}
+              >
+                {player.status.toUpperCase()}
+              </span>
+            </div>
+          </div>
+
+          {/* HUNTER SPECIAL: FELLOW HUNTERS LIST */}
+          {isHunter && fellowHunters.length > 0 && (
+            <div className="p-3.5 rounded-2xl bg-blue-950/40 border border-blue-500/40 space-y-2">
+              <span className="text-xs font-bold text-blue-300 flex items-center gap-1.5">
+                <Shield className="w-3.5 h-3.5" />
+                Deine Geisterjäger-Kollegen:
+              </span>
+              <div className="flex flex-wrap gap-2">
+                {fellowHunters.map((fh) => (
                   <div
-                    key={photo.id}
-                    className="group relative aspect-4/3 rounded-2xl overflow-hidden bg-black border border-zinc-800 shadow-md"
+                    key={fh.id}
+                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-blue-900/60 border border-blue-600/40 text-xs text-blue-200"
                   >
                     <img
-                      src={photo.photoUrl}
-                      alt={photo.caption || 'Partyfoto'}
-                      className="w-full h-full object-cover transition group-hover:scale-105 duration-300"
-                      loading="lazy"
+                      src={fh.photoUrl || '/placeholder.png'}
+                      alt={fh.name}
+                      className="w-4 h-4 rounded-full object-cover"
                     />
-                    <div className="absolute inset-0 bg-linear-to-t from-black/80 via-transparent to-transparent flex flex-col justify-end p-2">
-                      <p className="text-[10px] text-white font-bold truncate">
-                        {photo.photographerName || 'Gast'}
-                      </p>
-                      {photo.caption && (
-                        <p className="text-[9px] text-zinc-300 truncate">{photo.caption}</p>
-                      )}
-                    </div>
+                    <span className="font-bold">{fh.name}</span>
+                    <span className="text-[10px] text-blue-300/80">({fh.costumeName})</span>
                   </div>
                 ))}
               </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* MODAL 1: BISS / KILL AUSFÜHREN */}
-      {isKillModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md">
-          <div className="w-full max-w-xs bg-zinc-900 border-2 border-rose-500/50 rounded-3xl p-5 shadow-2xl space-y-4 animate-in fade-in zoom-in-95">
-            <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
-              <div className="flex items-center gap-2 text-rose-400 font-serif font-bold text-sm">
-                <Skull className="w-4 h-4" />
-                Opfer auswählen
-              </div>
-              <button
-                onClick={() => setIsKillModalOpen(false)}
-                className="p-1 text-zinc-400 hover:text-white"
-              >
-                ✕
-              </button>
             </div>
+          )}
 
-            {killError && (
-              <div className="p-2.5 rounded-xl bg-rose-950/70 border border-rose-500/40 text-[11px] text-rose-300 flex items-center gap-1.5">
-                <AlertCircle className="w-4 h-4 shrink-0" />
-                <span>{killError}</span>
+          {/* ACTION BUTTON & COOLDOWN LOGIC */}
+          <div className="p-5 rounded-3xl bg-zinc-900/90 border border-zinc-800 space-y-4">
+            <h4 className="font-serif font-bold text-white text-base">Fähigkeiten im Spiel</h4>
+
+            {isDead ? (
+              <div className="p-4 rounded-2xl bg-zinc-950 border border-zinc-800 text-center space-y-2">
+                <Skull className="w-8 h-8 mx-auto text-zinc-600" />
+                <p className="text-xs text-zinc-400">
+                  Als Toter kannst du keine Kills oder Angriffe mehr durchführen.
+                  Löse Foto-Aufgaben, um im Totenreich Punkte zu sammeln!
+                </p>
               </div>
-            )}
+            ) : isKiller ? (
+              /* VAMPIR, WERWOLF, GEIST */
+              <div className="space-y-3">
+                <div className="text-xs text-zinc-300 space-y-1 leading-relaxed">
+                  {player.role === 'Vampir' && (
+                    <p>
+                      🧛 <strong>Vampir:</strong> Töte ein Opfer durch kurzes Berühren an Schulter/Arm und
+                      Flüstern: <em>"Du wurdest von einem Vampir getötet."</em> (Cooldown: 6 Min).
+                    </p>
+                  )}
+                  {player.role === 'Werwolf' && (
+                    <p>
+                      🐺 <strong>Werwolf:</strong> Du kannst <strong>ausschließlich bei Vollmond</strong> töten!
+                      Während des Vollmonds gilt ein verkürzter Cooldown von nur 2 Minuten.
+                    </p>
+                  )}
+                  {player.role === 'Geist' && (
+                    <p>
+                      👻 <strong>Geist:</strong> Du kannst nur zuschlagen, wenn du mit dem Opfer <strong>allein</strong> im
+                      Raum bist (Pflicht-Bestätigung). Cooldown: 6 Minuten.
+                    </p>
+                  )}
+                </div>
 
-            {killSuccess && (
-              <div className="p-2.5 rounded-xl bg-emerald-950/70 border border-emerald-500/40 text-[11px] text-emerald-300 flex items-center gap-1.5">
-                <CheckCircle2 className="w-4 h-4 shrink-0" />
-                <span>{killSuccess}</span>
+                {/* Cooldown Display */}
+                {cooldownRemainingSeconds > 0 && (
+                  <div className="p-3 rounded-2xl bg-rose-950/50 border border-rose-500/50 text-rose-300 text-xs flex items-center justify-between">
+                    <span className="flex items-center gap-1.5 font-bold">
+                      <Clock className="w-4 h-4 animate-spin" />
+                      Cooldown läuft:
+                    </span>
+                    <span className="font-mono font-black text-sm">
+                      {Math.floor(cooldownRemainingSeconds / 60)}:{(cooldownRemainingSeconds % 60).toString().padStart(2, '0')}
+                    </span>
+                  </div>
+                )}
+
+                {/* Werewolf Moon Lockout */}
+                {isWerewolf && !isFullMoon && (
+                  <div className="p-3 rounded-2xl bg-indigo-950/60 border border-indigo-500/40 text-indigo-300 text-xs space-y-1">
+                    <div className="flex items-center gap-1.5 font-bold">
+                      <Moon className="w-4 h-4" />
+                      Kein Vollmond aktiv
+                    </div>
+                    <p className="text-[11px] text-zinc-400">
+                      {nextFullMoonInfo
+                        ? `Nächster Vollmond in ca. ${nextFullMoonInfo.startsInMinutes} Minuten.`
+                        : 'Warte, bis der Vollmond aufgeht!'}
+                    </p>
+                  </div>
+                )}
+
+                <button
+                  onClick={() => setIsKillModalOpen(true)}
+                  disabled={cooldownRemainingSeconds > 0 || (isWerewolf && !isFullMoon) || gracePeriodSeconds > 0}
+                  className="w-full py-4 rounded-2xl bg-gradient-to-r from-rose-600 to-red-700 hover:from-rose-500 hover:to-red-600 text-white font-black text-sm shadow-xl shadow-rose-950/80 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 disabled:opacity-50"
+                >
+                  <Skull className="w-5 h-5" />
+                  Kill melden ({player.role})
+                </button>
               </div>
-            )}
+            ) : isHunter ? (
+              /* GEISTERJÄGER */
+              <div className="space-y-3">
+                <div className="text-xs text-zinc-300 space-y-1 leading-relaxed">
+                  <p>
+                    🏹 <strong>Exorzismus:</strong> Wähle eine Person aus.
+                    Ist sie böse (Vampir, Werwolf oder Geist), stirbt sie sofort (+25 Pkt, Cooldown 15 Min).
+                    Ist sie gut (Mensch), bleibt sie am Leben und du bist für 30 Minuten gesperrt!
+                  </p>
+                </div>
 
-            <p className="text-xs text-zinc-300">
-              Wähle den Party-Gast, den du soeben berührt und gebissen hast:
-            </p>
+                {cooldownRemainingSeconds > 0 && (
+                  <div className="p-3 rounded-2xl bg-blue-950/50 border border-blue-500/50 text-blue-300 text-xs flex items-center justify-between">
+                    <span className="flex items-center gap-1.5 font-bold">
+                      <Clock className="w-4 h-4" />
+                      Exorzismus-Sperre:
+                    </span>
+                    <span className="font-mono font-black text-sm">
+                      {Math.floor(cooldownRemainingSeconds / 60)}:{(cooldownRemainingSeconds % 60).toString().padStart(2, '0')}
+                    </span>
+                  </div>
+                )}
 
-            <select
-              value={selectedVictimId}
-              onChange={(e) => setSelectedVictimId(e.target.value)}
-              className="w-full px-3 py-2.5 rounded-xl bg-zinc-950 border border-zinc-700 text-white text-xs focus:outline-none focus:border-rose-500"
-            >
-              <option value="">-- Gast auswählen --</option>
-              {potentialVictims.map((v) => (
-                <option key={v.id} value={v.id}>
-                  {v.name} ({v.costumeName})
-                </option>
-              ))}
-            </select>
-
-            <div className="flex gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setIsKillModalOpen(false)}
-                className="flex-1 py-2.5 rounded-xl bg-zinc-800 text-xs font-semibold text-zinc-400"
-              >
-                Abbrechen
-              </button>
-              <button
-                type="button"
-                onClick={handleExecuteKill}
-                disabled={!selectedVictimId || isSubmittingKill}
-                className="flex-1 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white font-bold text-xs uppercase cursor-pointer"
-              >
-                {isSubmittingKill ? 'Protokolliere...' : 'Kill bestätigen'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* MODAL 2: AUFGABEN FOTO-BEWEIS */}
-      {selectedTaskForUpload && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md">
-          <div className="w-full max-w-xs bg-zinc-900 border-2 border-purple-500/50 rounded-3xl p-5 shadow-2xl space-y-4 animate-in fade-in zoom-in-95">
-            <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
-              <div className="font-serif font-bold text-sm text-purple-300">
-                {selectedTaskForUpload.title}
-              </div>
-              <button
-                onClick={() => setSelectedTaskForUpload(null)}
-                className="p-1 text-zinc-400 hover:text-white"
-              >
-                ✕
-              </button>
-            </div>
-
-            <p className="text-xs text-zinc-300">{selectedTaskForUpload.description}</p>
-
-            {taskPhotoPreview ? (
-              <div className="relative aspect-4/3 rounded-2xl overflow-hidden border border-purple-500">
-                <img src={taskPhotoPreview} alt="Beweis" className="w-full h-full object-cover" />
+                <button
+                  onClick={() => setIsKillModalOpen(true)}
+                  disabled={cooldownRemainingSeconds > 0 || gracePeriodSeconds > 0}
+                  className="w-full py-4 rounded-2xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-black text-sm shadow-xl shadow-blue-950/80 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 disabled:opacity-50"
+                >
+                  <ShieldAlert className="w-5 h-5" />
+                  Exorzieren
+                </button>
               </div>
             ) : (
-              <label className="flex flex-col items-center justify-center p-6 rounded-2xl bg-zinc-950 border-2 border-dashed border-zinc-800 hover:border-purple-500 cursor-pointer text-zinc-400">
-                <Camera className="w-8 h-8 text-purple-400 mb-2" />
-                <span className="text-xs font-bold text-white">Foto aufnehmen</span>
-                <span className="text-[10px] text-zinc-500">Wird komprimiert hochgeladen</span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  onChange={handleTaskPhotoSelect}
-                  className="hidden"
-                />
-              </label>
+              /* MENSCH */
+              <div className="space-y-3 text-xs text-zinc-300 leading-relaxed">
+                <p>
+                  🧍 <strong>Deine Rolle als Mensch:</strong> Du kannst niemanden töten.
+                  Deine Aufgabe ist es zu überleben, Party-Aufgaben zu lösen und den Geisterjägern zu helfen,
+                  die Kreaturen der Nacht zu entlarven!
+                </p>
+                <div className="p-3 rounded-2xl bg-emerald-950/40 border border-emerald-500/40 text-emerald-300 text-xs">
+                  ✨ <strong>Spezialaufgaben:</strong> Alle 10–20 Minuten erhältst du vielleicht eine
+                  Spezialaufgabe (Quiz, QR-Code oder Foto). Damit erfährst du die geheime Rolle eines Mitspielers!
+                </div>
+              </div>
             )}
-
-            <div className="flex gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectedTaskForUpload(null);
-                  setTaskPhotoPreview('');
-                  setTaskPhotoFile(null);
-                }}
-                className="flex-1 py-2.5 rounded-xl bg-zinc-800 text-xs font-semibold text-zinc-400"
-              >
-                Abbrechen
-              </button>
-              <button
-                type="button"
-                onClick={handleSubmitTask}
-                disabled={isSubmittingTask}
-                className="flex-1 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs uppercase cursor-pointer"
-              >
-                {isSubmittingTask ? 'Speichert...' : 'Erledigt!'}
-              </button>
-            </div>
           </div>
         </div>
       )}
 
-      {/* MODAL 3: NEUES GALERIE-FOTO */}
-      {isGalleryModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md">
-          <form
-            onSubmit={handleSubmitGalleryPhoto}
-            className="w-full max-w-xs bg-zinc-900 border-2 border-[#ff6b00]/50 rounded-3xl p-5 shadow-2xl space-y-4 animate-in fade-in zoom-in-95"
-          >
-            <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
-              <div className="font-serif font-bold text-sm text-[#ff6b00] flex items-center gap-2">
-                <Camera className="w-4 h-4" />
-                Foto zur Galerie hinzufügen
-              </div>
-              <button
-                type="button"
-                onClick={() => setIsGalleryModalOpen(false)}
-                className="p-1 text-zinc-400 hover:text-white"
-              >
-                ✕
-              </button>
+      {/* ======================================================== */}
+      {/* TAB 2: AUFGABEN (Foto- & Spezialaufgaben für ALLE)        */}
+      {/* ======================================================== */}
+      {activeTab === 'tasks' && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="font-bold text-white text-sm">Offene Aufgaben</h3>
+              <p className="text-[11px] text-zinc-400">
+                Gilt für alle Spieler (auch Böse & Tote für Punkte)
+              </p>
             </div>
+            <span className="text-xs font-mono font-bold text-[#ff6b00]">
+              {player.tasksCompletedCount || 0} gelöst
+            </span>
+          </div>
 
-            {galleryPhotoPreview ? (
-              <div className="relative aspect-4/3 rounded-2xl overflow-hidden border border-[#ff6b00]">
-                <img src={galleryPhotoPreview} alt="Vorschau" className="w-full h-full object-cover" />
-              </div>
-            ) : (
-              <label className="flex flex-col items-center justify-center p-6 rounded-2xl bg-zinc-950 border-2 border-dashed border-zinc-800 hover:border-[#ff6b00] cursor-pointer text-zinc-400">
-                <Camera className="w-8 h-8 text-[#ff6b00] mb-2" />
-                <span className="text-xs font-bold text-white">Party-Schnappschuss wählen</span>
-                <span className="text-[10px] text-zinc-500">Komprimierung auf max. 1200px</span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={handleGalleryPhotoSelect}
-                  className="hidden"
-                />
-              </label>
-            )}
-
-            <input
-              type="text"
-              placeholder="Bildunterschrift (optional)..."
-              value={galleryCaption}
-              onChange={(e) => setGalleryCaption(e.target.value)}
-              className="w-full px-3 py-2 rounded-xl bg-zinc-950 border border-zinc-800 text-xs text-white placeholder-zinc-500"
+          {/* SPECIAL TASK FOR HUMANS IF PENDING */}
+          {player.role === 'Mensch' && pendingSpecialTask && (
+            <SpecialTaskCard
+              specialTask={pendingSpecialTask}
+              onComplete={handleCompleteSpecialTask}
             />
+          )}
 
-            <div className="flex gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setIsGalleryModalOpen(false);
-                  setGalleryPhotoPreview('');
-                  setGalleryPhotoFile(null);
-                }}
-                className="flex-1 py-2.5 rounded-xl bg-zinc-800 text-xs font-semibold text-zinc-400"
+          {/* 2 OFFENE FOTO-AUFGABEN */}
+          <div className="space-y-3">
+            {myActivePhotoTasks.map((t, idx) => (
+              <div
+                key={t.id}
+                className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3 hover:border-zinc-700 transition"
               >
-                Abbrechen
-              </button>
-              <button
-                type="submit"
-                disabled={!galleryPhotoFile || isUploadingGallery}
-                className="flex-1 py-2.5 rounded-xl bg-[#ff6b00] hover:bg-[#e05e00] disabled:bg-zinc-800 disabled:text-zinc-600 text-black font-bold text-xs uppercase cursor-pointer"
+                <div className="flex items-center justify-between">
+                  <span className="px-2.5 py-0.5 rounded-full bg-[#ff6b00]/15 text-[#ff6b00] text-[10px] font-bold uppercase tracking-wider">
+                    Foto-Aufgabe {idx + 1}
+                  </span>
+                  <span className="text-xs font-mono font-bold text-[#ff6b00]">
+                    +{t.points} Pkt (+2 je Mitspieler)
+                  </span>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-white text-sm">{t.title}</h4>
+                  <p className="text-xs text-zinc-300 mt-0.5 leading-relaxed">{t.description}</p>
+                </div>
+
+                {t.targetPlayer && (
+                  <div className="flex items-center gap-2 p-2 rounded-2xl bg-zinc-950 border border-zinc-800">
+                    <img
+                      src={t.targetPlayer.photoUrl || '/placeholder.png'}
+                      alt={t.targetPlayer.name}
+                      className="w-8 h-8 rounded-xl object-cover border border-zinc-700"
+                    />
+                    <div>
+                      <span className="text-[10px] text-zinc-400 block">Gesuchtes Kostüm:</span>
+                      <span className="text-xs font-bold text-white">
+                        {t.targetPlayer.name} als "{t.targetPlayer.costumeName}"
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                <button
+                  onClick={() =>
+                    setActiveTaskModal({
+                      id: t.id,
+                      title: t.title,
+                      desc: t.description,
+                    })
+                  }
+                  className="w-full py-2.5 rounded-2xl bg-gradient-to-r from-[#ff6b00] to-orange-600 hover:from-[#ff7c1f] hover:to-orange-500 text-zinc-950 font-black text-xs shadow-md shadow-orange-950 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95"
+                >
+                  <Camera className="w-4 h-4" />
+                  Foto aufnehmen & lösen
+                </button>
+              </div>
+            ))}
+          </div>
+
+          {/* PARTY GALERIE TEASER */}
+          <div className="space-y-2 pt-2">
+            <h4 className="font-bold text-white text-xs">Neueste Party-Schnappschüsse ({photos.length})</h4>
+            <div className="grid grid-cols-3 gap-2">
+              {photos.slice(0, 6).map((ph) => (
+                <div
+                  key={ph.id}
+                  className="aspect-square rounded-2xl overflow-hidden border border-zinc-800 bg-zinc-900 relative group"
+                >
+                  <img src={ph.photoUrl} alt="Party Foto" className="w-full h-full object-cover" />
+                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition p-1.5 flex flex-col justify-end text-[9px] text-zinc-200">
+                    <span className="font-bold truncate">{ph.photographerName}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================== */}
+      {/* TAB 3: RANKING (Punkte-Ranking & Spielstand)              */}
+      {/* ======================================================== */}
+      {activeTab === 'ranking' && (
+        <div className="space-y-4">
+          {/* My Rank Summary */}
+          <div className="p-4 rounded-3xl bg-gradient-to-r from-amber-950/40 via-zinc-900 to-zinc-900 border border-amber-500/30 flex items-center justify-between">
+            <div>
+              <span className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider block">
+                Dein Platz im Ranking
+              </span>
+              <span className="font-serif font-black text-2xl text-amber-400">
+                #{myRank > 0 ? myRank : '-'}
+              </span>
+            </div>
+            <div className="text-right">
+              <span className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider block">
+                Punkte
+              </span>
+              <span className="font-mono font-black text-2xl text-white">
+                {player.points}
+              </span>
+            </div>
+          </div>
+
+          {/* Ranking Sub-Filter: All or Totenreich */}
+          <div className="flex rounded-2xl bg-zinc-900 p-1 border border-zinc-800 text-xs font-bold">
+            <button
+              onClick={() => setRankingFilter('all')}
+              className={`flex-1 py-1.5 rounded-xl transition cursor-pointer ${
+                rankingFilter === 'all'
+                  ? 'bg-[#ff6b00] text-zinc-950 font-black'
+                  : 'text-zinc-400 hover:text-white'
+              }`}
+            >
+              Top 20 Gesamt
+            </button>
+            <button
+              onClick={() => setRankingFilter('dead')}
+              className={`flex-1 py-1.5 rounded-xl transition cursor-pointer ${
+                rankingFilter === 'dead'
+                  ? 'bg-purple-600 text-white font-black'
+                  : 'text-zinc-400 hover:text-white'
+              }`}
+            >
+              Totenreich-Ranking
+            </button>
+          </div>
+
+          {/* Player list (Top 20, roles hidden!) */}
+          <div className="space-y-1.5 max-h-[460px] overflow-y-auto pr-1">
+            {(rankingFilter === 'all' ? overallRanking.slice(0, 20) : deadRanking).map((p, idx) => (
+              <div
+                key={p.id}
+                className={`flex items-center justify-between p-2.5 rounded-2xl border transition ${
+                  p.id === player.id
+                    ? 'bg-[#ff6b00]/15 border-[#ff6b00]/50'
+                    : 'bg-zinc-900/80 border-zinc-800'
+                }`}
               >
-                {isUploadingGallery ? 'Lade hoch...' : 'Hochladen'}
+                <div className="flex items-center gap-2.5">
+                  <span
+                    className={`font-mono font-black text-xs w-5 text-center ${
+                      idx === 0
+                        ? 'text-amber-400'
+                        : idx === 1
+                        ? 'text-zinc-300'
+                        : idx === 2
+                        ? 'text-amber-600'
+                        : 'text-zinc-500'
+                    }`}
+                  >
+                    #{idx + 1}
+                  </span>
+                  <img
+                    src={p.photoUrl || '/placeholder.png'}
+                    alt={p.name}
+                    className="w-9 h-9 rounded-full object-cover border border-zinc-700"
+                  />
+                  <div>
+                    <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                      {p.name}
+                      {p.id === player.id && (
+                        <span className="text-[10px] text-[#ff6b00] font-black">(Du)</span>
+                      )}
+                    </div>
+                    <div className="text-[10px] text-zinc-400">{p.costumeName}</div>
+                  </div>
+                </div>
+
+                <div className="text-right">
+                  <span className="font-mono font-bold text-xs text-[#ff6b00]">{p.points} Pkt</span>
+                  <span
+                    className={`block text-[9px] font-bold ${
+                      p.status === 'lebendig' ? 'text-emerald-400' : 'text-purple-400'
+                    }`}
+                  >
+                    {p.status}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================== */}
+      {/* TAB 4: PROFIL & REGELN (Profil, Rollenkarte, Regeln)     */}
+      {/* ======================================================== */}
+      {activeTab === 'profile' && (
+        <div className="space-y-4">
+          {/* Secret Role Card */}
+          <div className="p-5 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-zinc-400 uppercase tracking-wider">
+                Geheime Rollenkarte
+              </span>
+              <button
+                onClick={() => setIsRoleSecretRevealed(!isRoleSecretRevealed)}
+                className="text-xs text-[#ff6b00] font-bold flex items-center gap-1 cursor-pointer"
+              >
+                {isRoleSecretRevealed ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                {isRoleSecretRevealed ? 'Verstecken' : 'Aufdecken'}
               </button>
             </div>
-          </form>
+
+            {isRoleSecretRevealed ? (
+              <div className="p-4 rounded-2xl bg-zinc-950 border border-zinc-700 text-center space-y-2 animate-in zoom-in-95">
+                <span className="text-2xl font-serif font-black text-white block">
+                  {player.role}
+                </span>
+                <span className="inline-block px-3 py-0.5 rounded-full bg-zinc-800 text-zinc-300 text-xs font-bold">
+                  Team {player.team}
+                </span>
+                <p className="text-xs text-zinc-400 max-w-xs mx-auto">
+                  {player.role === 'Vampir' && 'Du bist ein Vampir. Töte im Geheimen und entkomme den Geisterjägern.'}
+                  {player.role === 'Werwolf' && 'Du bist ein Werwolf. Töte rasend schnell während des Vollmonds.'}
+                  {player.role === 'Geist' && 'Du bist ein Geist. Schlage nur zu, wenn du mit dem Opfer allein bist.'}
+                  {player.role === 'Geisterjäger' && 'Du bist ein Geisterjäger. Exorziere die Bösen, verschone Menschen.'}
+                  {player.role === 'Mensch' && 'Du bist ein Mensch. Löse Aufgaben, überlebe und hilf dem Guten Team!'}
+                </p>
+              </div>
+            ) : (
+              <div
+                onClick={() => setIsRoleSecretRevealed(true)}
+                className="p-6 rounded-2xl bg-zinc-950 border border-dashed border-zinc-700 text-center cursor-pointer hover:border-[#ff6b00] transition"
+              >
+                <Lock className="w-6 h-6 mx-auto text-zinc-600 mb-1" />
+                <span className="text-xs font-bold text-zinc-400">
+                  Tippe hier, um deine geheime Rolle anzusehen
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* RULES SUMMARY */}
+          <div className="p-5 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3 text-xs text-zinc-300">
+            <h4 className="font-serif font-bold text-white text-base">Spielregeln</h4>
+
+            <div className="space-y-2">
+              <div>
+                <span className="font-bold text-white block">1. Berühren & Flüstern:</span>
+                Zum Töten das Opfer kurz an Arm/Schulter berühren und ins Ohr flüstern:{" "}
+                <span className="italic text-rose-400">"Du wurdest von einem [Rolle] getötet."</span> Danach in der App melden.
+              </div>
+
+              <div>
+                <span className="font-bold text-white block">2. Siegbedingungen:</span>
+                • <strong>GUT gewinnt:</strong> Wenn alle Bösen tot sind.<br />
+                • <strong>BÖSE gewinnt:</strong> Wenn alle Geisterjäger tot sind oder &gt;75% des guten Teams tot sind.<br />
+                • Bei Zeitende gewinnt das Team mit prozentual mehr Überlebenden.
+              </div>
+
+              <div>
+                <span className="font-bold text-white block">3. Punkteverteilung:</span>
+                Foto-Aufgabe: 10 Pkt • Markierter Gast: 2 Pkt • Spezialaufgabe: 20 Pkt • Böser Kill: 15 Pkt • Exorzismus: 25 Pkt.
+              </div>
+            </div>
+          </div>
+
+          {/* Logout */}
+          <button
+            onClick={onLogoutDevice}
+            className="w-full py-3 rounded-2xl bg-zinc-900 border border-zinc-800 text-zinc-400 hover:text-white font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition"
+          >
+            <LogOut className="w-4 h-4" />
+            Auf diesem Gerät abmelden
+          </button>
         </div>
+      )}
+
+      {/* KILL MODAL POPUP */}
+      <KillModal
+        isOpen={isKillModalOpen}
+        onClose={() => setIsKillModalOpen(false)}
+        killer={player}
+        potentialVictims={potentialVictims}
+        isFullMoonActive={isFullMoon}
+        onReportKill={handleReportKill}
+        onExorcise={handleExorcise}
+      />
+
+      {/* PHOTO TASK MODAL POPUP */}
+      {activeTaskModal && (
+        <PhotoTaskModal
+          isOpen={Boolean(activeTaskModal)}
+          onClose={() => setActiveTaskModal(null)}
+          taskTitle={activeTaskModal.title}
+          taskDescription={activeTaskModal.desc}
+          players={players}
+          currentPlayerId={player.id}
+          onComplete={handleCompletePhotoTask}
+        />
       )}
     </div>
   );

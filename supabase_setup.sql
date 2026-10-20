@@ -1,7 +1,7 @@
 -- ====================================================================
--- HALLOWEEN PARTY-SPIEL - SUPABASE SETUP SCRIPT
--- Vollständiges Schema, RLS-Policies, Storage-Bucket & Realtime
--- Im Supabase Dashboard unter "SQL Editor" einfügen und auf "Run" klicken
+-- HALLOWEEN PARTY-SPIEL - VOLLSTÄNDIGES SUPABASE SCHEMA & UPGRADE
+-- Alle Spielregeln, Rollen, Cooldowns, Vollmond, Kills & Aufgaben
+-- Im Supabase SQL Editor ausführen
 -- ====================================================================
 
 -- 1. EXTENSIONS
@@ -19,11 +19,34 @@ create table if not exists public.game_state (
     "vampireCount": 6,
     "werewolfCount": 4,
     "ghostCount": 4,
-    "hunterCount": 10
+    "hunterCount": 10,
+    "gracePeriodMinutes": 15,
+    "vampireCooldownMinutes": 6,
+    "ghostCooldownMinutes": 6,
+    "werewolfCooldownMinutes": 2,
+    "hunterHitCooldownMinutes": 15,
+    "hunterMissPenaltyMinutes": 30,
+    "killConfirmationTimeoutMinutes": 5,
+    "fullMoonMinIntervalMinutes": 20,
+    "fullMoonMaxIntervalMinutes": 40,
+    "fullMoonDurationMinutes": 5,
+    "pointsPhotoTask": 10,
+    "pointsSpecialTask": 20,
+    "pointsTaggedCoPlayer": 2,
+    "pointsEvilKill": 15,
+    "pointsExorcismSuccess": 25,
+    "specialTaskIntervalMinMinutes": 10,
+    "specialTaskIntervalMaxMinutes": 20
   }'::jsonb,
   full_moon_times jsonb not null default '[]'::jsonb,
+  active_full_moon jsonb default null,
+  winner_team text,
   updated_at timestamptz not null default timezone('utc'::text, now())
 );
+
+-- Upgrade existing game_state if columns do not exist
+alter table public.game_state add column if not exists active_full_moon jsonb default null;
+alter table public.game_state add column if not exists winner_team text;
 
 -- Initialzeile 'main' anlegen, falls noch nicht vorhanden
 insert into public.game_state (id, status, admin_code)
@@ -41,25 +64,56 @@ create table if not exists public.players (
   status text not null default 'lebendig' check (status in ('lebendig', 'tot', 'entfernt', 'pausiert')),
   points integer not null default 0,
   kills_count integer not null default 0,
+  tasks_completed_count integer not null default 0,
+  last_kill_at timestamptz,
+  cooldown_until timestamptz,
+  active_tasks jsonb not null default '[]'::jsonb,
   created_at timestamptz not null default timezone('utc'::text, now())
 );
 
--- Index für schnelle Sortierung nach Punkten und Beitrittszeit
+alter table public.players add column if not exists tasks_completed_count integer not null default 0;
+alter table public.players add column if not exists last_kill_at timestamptz;
+alter table public.players add column if not exists cooldown_until timestamptz;
+alter table public.players add column if not exists active_tasks jsonb not null default '[]'::jsonb;
+
 create index if not exists idx_players_points on public.players (points desc);
 create index if not exists idx_players_created_at on public.players (created_at asc);
 
--- 4. TABELLE: kills (Protokoll der Bisse und Exorzismen)
+-- 4. TABELLE: kills (Protokoll aller Kills & Exorzismen)
 create table if not exists public.kills (
   id uuid primary key default gen_random_uuid(),
   killer_id text not null references public.players(id) on delete cascade,
   victim_id text not null references public.players(id) on delete cascade,
   killer_name text not null,
   victim_name text not null,
-  confirmed boolean not null default true,
+  killer_role text,
+  victim_role text,
+  killer_team text,
+  victim_team text,
+  reason text not null default 'kill',
+  exorcism_hit boolean default null,
+  ghost_solo_confirmed boolean default false,
+  confirmed boolean not null default false,
+  confirmed_at timestamptz,
+  auto_confirmed boolean not null default false,
   created_at timestamptz not null default timezone('utc'::text, now())
 );
 
--- 5. TABELLE: tasks (Halloween-Party-Aufgaben)
+alter table public.kills add column if not exists killer_role text;
+alter table public.kills add column if not exists victim_role text;
+alter table public.kills add column if not exists killer_team text;
+alter table public.kills add column if not exists victim_team text;
+alter table public.kills add column if not exists reason text not null default 'kill';
+alter table public.kills add column if not exists exorcism_hit boolean default null;
+alter table public.kills add column if not exists ghost_solo_confirmed boolean default false;
+alter table public.kills add column if not exists confirmed_at timestamptz;
+alter table public.kills add column if not exists auto_confirmed boolean not null default false;
+
+create index if not exists idx_kills_created_at on public.kills (created_at desc);
+create index if not exists idx_kills_victim_id on public.kills (victim_id);
+create index if not exists idx_kills_killer_id on public.kills (killer_id);
+
+-- 5. TABELLE: tasks (Pool der Party-Aufgaben)
 create table if not exists public.tasks (
   id text primary key,
   title text not null,
@@ -69,27 +123,44 @@ create table if not exists public.tasks (
   created_at timestamptz not null default timezone('utc'::text, now())
 );
 
--- Standard-Party-Aufgaben befüllen
-insert into public.tasks (id, title, description, points, category)
-values
-  ('task_dance', 'Zombie-Tanz', 'Tanze 30 Sekunden wie ein Zombie auf der Tanzfläche.', 15, 'party'),
-  ('task_garlic', 'Knoblauch-Selfie', 'Finde Knoblauch oder eine Knoblauch-Deko und mache ein Foto damit.', 20, 'party'),
-  ('task_drink', 'Blutrote Erfrischung', 'Stoße mit einem blutroten Party-Getränk an und lade ein Foto hoch.', 10, 'party'),
-  ('task_hunter', 'Jäger-Bündnis', 'Mache ein geheimes Foto mit einem Geisterjäger oder Verdächtigen.', 25, 'party'),
-  ('task_costume', 'Kostüm-Duell', 'Mache ein Selfie mit dem gruseligsten Kostüm des Abends.', 20, 'party')
-on conflict (id) do nothing;
+-- 6. TABELLE: special_tasks (Zufällige Spezialaufgaben für lebende Menschen)
+create table if not exists public.special_tasks (
+  id uuid primary key default gen_random_uuid(),
+  player_id text not null references public.players(id) on delete cascade,
+  type text not null check (type in ('qr_code', 'quiz', 'photo_motif')),
+  title text not null,
+  description text not null,
+  points integer not null default 20,
+  qr_code_expected text,
+  quiz_data jsonb,
+  motif_description text,
+  reward_player_id text,
+  reward_player_name text,
+  reward_role text,
+  completed_at timestamptz,
+  created_at timestamptz not null default timezone('utc'::text, now())
+);
 
--- 6. TABELLE: task_completions (Erledigte Aufgaben der Spieler)
+create index if not exists idx_special_tasks_player on public.special_tasks (player_id);
+
+-- 7. TABELLE: task_completions (Erledigte Aufgaben mit Tagging)
 create table if not exists public.task_completions (
   id uuid primary key default gen_random_uuid(),
-  task_id text not null references public.tasks(id) on delete cascade,
+  task_id text not null,
   player_id text not null references public.players(id) on delete cascade,
   player_name text not null,
   photo_url text,
+  tagged_player_ids jsonb default '[]'::jsonb,
+  tagged_player_names jsonb default '[]'::jsonb,
+  points_awarded integer not null default 10,
   completed_at timestamptz not null default timezone('utc'::text, now())
 );
 
--- 7. TABELLE: photos (Party-Galerie & Aufgabenfotos)
+alter table public.task_completions add column if not exists tagged_player_ids jsonb default '[]'::jsonb;
+alter table public.task_completions add column if not exists tagged_player_names jsonb default '[]'::jsonb;
+alter table public.task_completions add column if not exists points_awarded integer not null default 10;
+
+-- 8. TABELLE: photos (Party-Galerie mit getaggten Mitspielern)
 create table if not exists public.photos (
   id uuid primary key default gen_random_uuid(),
   photo_url text not null,
@@ -97,12 +168,14 @@ create table if not exists public.photos (
   caption text,
   player_id text references public.players(id) on delete set null,
   photographer_name text not null default 'Gast',
+  tagged_player_names jsonb default '[]'::jsonb,
   created_at timestamptz not null default timezone('utc'::text, now())
 );
 
+alter table public.photos add column if not exists tagged_player_names jsonb default '[]'::jsonb;
 create index if not exists idx_photos_created_at on public.photos (created_at desc);
 
--- 8. POSTGRES FUNKTION: check_admin_code (Serverseitige Admin-Prüfung)
+-- 9. POSTGRES FUNKTION: check_admin_code
 create or replace function public.check_admin_code(input_code text)
 returns boolean
 language plpgsql
@@ -119,26 +192,20 @@ begin
 end;
 $$;
 
--- 9. STORAGE BUCKET: photos (Für komprimierte Kostüm- & Eventfotos)
+-- 10. STORAGE BUCKET: photos
 do $$
 begin
   insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
   values ('photos', 'photos', true, 10485760, array['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
   on conflict (id) do update set public = true;
-exception when others then
-  -- Falls Ausführung im SQL Editor eingeschränkte Rechte auf storage.buckets hat
-  null;
+exception when others then null;
 end;
 $$;
 
--- Storage-Zugriffsregeln für anon (Öffentlicher Upload und Lesezugriff)
 do $$
 begin
   drop policy if exists "Photos Public Read" on storage.objects;
-  create policy "Photos Public Read"
-  on storage.objects for select
-  to public
-  using (bucket_id = 'photos');
+  create policy "Photos Public Read" on storage.objects for select to public using (bucket_id = 'photos');
 exception when others then null;
 end;
 $$;
@@ -146,10 +213,7 @@ $$;
 do $$
 begin
   drop policy if exists "Photos Public Upload" on storage.objects;
-  create policy "Photos Public Upload"
-  on storage.objects for insert
-  to public
-  with check (bucket_id = 'photos');
+  create policy "Photos Public Upload" on storage.objects for insert to public with check (bucket_id = 'photos');
 exception when others then null;
 end;
 $$;
@@ -157,137 +221,76 @@ $$;
 do $$
 begin
   drop policy if exists "Photos Public Update" on storage.objects;
-  create policy "Photos Public Update"
-  on storage.objects for update
-  to public
-  using (bucket_id = 'photos');
+  create policy "Photos Public Update" on storage.objects for update to public using (bucket_id = 'photos');
 exception when others then null;
 end;
 $$;
 
--- 10. ROW LEVEL SECURITY (RLS) AKTIVIEREN & ANON-POLICIES
+do $$
+begin
+  drop policy if exists "Photos Public Delete" on storage.objects;
+  create policy "Photos Public Delete" on storage.objects for delete to public using (bucket_id = 'photos');
+exception when others then null;
+end;
+$$;
+
+-- 11. ROW LEVEL SECURITY (RLS) & ANON POLICIES
 alter table public.game_state enable row level security;
 alter table public.players enable row level security;
 alter table public.kills enable row level security;
 alter table public.tasks enable row level security;
+alter table public.special_tasks enable row level security;
 alter table public.task_completions enable row level security;
 alter table public.photos enable row level security;
 
--- Policies für game_state
-drop policy if exists "Allow public read game_state" on public.game_state;
-create policy "Allow public read game_state" on public.game_state
-  for select to public using (true);
+-- game_state
+drop policy if exists "Allow public all game_state" on public.game_state;
+create policy "Allow public all game_state" on public.game_state for all to public using (true) with check (true);
 
-drop policy if exists "Allow public update game_state" on public.game_state;
-create policy "Allow public update game_state" on public.game_state
-  for update to public using (true);
+-- players
+drop policy if exists "Allow public all players" on public.players;
+create policy "Allow public all players" on public.players for all to public using (true) with check (true);
 
-drop policy if exists "Allow public insert game_state" on public.game_state;
-create policy "Allow public insert game_state" on public.game_state
-  for insert to public with check (true);
+-- kills
+drop policy if exists "Allow public all kills" on public.kills;
+create policy "Allow public all kills" on public.kills for all to public using (true) with check (true);
 
--- Policies für players
-drop policy if exists "Allow public read players" on public.players;
-create policy "Allow public read players" on public.players
-  for select to public using (true);
-
-drop policy if exists "Allow public insert players" on public.players;
-create policy "Allow public insert players" on public.players
-  for insert to public with check (true);
-
-drop policy if exists "Allow public update players" on public.players;
-create policy "Allow public update players" on public.players
-  for update to public using (true);
-
-drop policy if exists "Allow public delete players" on public.players;
-create policy "Allow public delete players" on public.players
-  for delete to public using (true);
-
--- Policies für kills
-drop policy if exists "Allow public read kills" on public.kills;
-create policy "Allow public read kills" on public.kills
-  for select to public using (true);
-
-drop policy if exists "Allow public insert kills" on public.kills;
-create policy "Allow public insert kills" on public.kills
-  for insert to public with check (true);
-
-drop policy if exists "Allow public delete kills" on public.kills;
-create policy "Allow public delete kills" on public.kills
-  for delete to public using (true);
-
--- Policies für tasks
-drop policy if exists "Allow public read tasks" on public.tasks;
-create policy "Allow public read tasks" on public.tasks
-  for select to public using (true);
-
+-- tasks
 drop policy if exists "Allow public all tasks" on public.tasks;
-create policy "Allow public all tasks" on public.tasks
-  for all to public using (true);
+create policy "Allow public all tasks" on public.tasks for all to public using (true) with check (true);
 
--- Policies für task_completions
-drop policy if exists "Allow public read task_completions" on public.task_completions;
-create policy "Allow public read task_completions" on public.task_completions
-  for select to public using (true);
+-- special_tasks
+drop policy if exists "Allow public all special_tasks" on public.special_tasks;
+create policy "Allow public all special_tasks" on public.special_tasks for all to public using (true) with check (true);
 
-drop policy if exists "Allow public insert task_completions" on public.task_completions;
-create policy "Allow public insert task_completions" on public.task_completions
-  for insert to public with check (true);
+-- task_completions
+drop policy if exists "Allow public all task_completions" on public.task_completions;
+create policy "Allow public all task_completions" on public.task_completions for all to public using (true) with check (true);
 
-drop policy if exists "Allow public delete task_completions" on public.task_completions;
-create policy "Allow public delete task_completions" on public.task_completions
-  for delete to public using (true);
+-- photos
+drop policy if exists "Allow public all photos" on public.photos;
+create policy "Allow public all photos" on public.photos for all to public using (true) with check (true);
 
--- Policies für photos
-drop policy if exists "Allow public read photos" on public.photos;
-create policy "Allow public read photos" on public.photos
-  for select to public using (true);
-
-drop policy if exists "Allow public insert photos" on public.photos;
-create policy "Allow public insert photos" on public.photos
-  for insert to public with check (true);
-
-drop policy if exists "Allow public delete photos" on public.photos;
-create policy "Allow public delete photos" on public.photos
-  for delete to public using (true);
-
--- 11. SUPABASE REALTIME AKTIVIEREN
--- Schaltet Live-Updates für alle Tabellen frei
+-- 12. REALTIME ELEVATION
 do $$
 begin
-  if not exists (
-    select 1 from pg_publication_tables 
-    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'players'
-  ) then
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'players') then
     alter publication supabase_realtime add table public.players;
   end if;
-
-  if not exists (
-    select 1 from pg_publication_tables 
-    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'game_state'
-  ) then
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'game_state') then
     alter publication supabase_realtime add table public.game_state;
   end if;
-
-  if not exists (
-    select 1 from pg_publication_tables 
-    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'kills'
-  ) then
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'kills') then
     alter publication supabase_realtime add table public.kills;
   end if;
-
-  if not exists (
-    select 1 from pg_publication_tables 
-    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'photos'
-  ) then
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'photos') then
     alter publication supabase_realtime add table public.photos;
   end if;
-
-  if not exists (
-    select 1 from pg_publication_tables 
-    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'task_completions'
-  ) then
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'task_completions') then
     alter publication supabase_realtime add table public.task_completions;
+  end if;
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'special_tasks') then
+    alter publication supabase_realtime add table public.special_tasks;
   end if;
 end;
 $$;
