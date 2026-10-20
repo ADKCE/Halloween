@@ -322,6 +322,8 @@ class SupabaseService {
           points: p.points || 0,
           killsCount: p.kills_count || 0,
           tasksCompletedCount: p.tasks_completed_count || 0,
+          cooldownUntil: p.cooldown_until || undefined,
+          lastKillAt: p.last_kill_at || undefined,
           joinedAt: p.created_at,
         };
       });
@@ -485,6 +487,34 @@ class SupabaseService {
     }
   }
 
+  // --- RESILIENT PLAYER UPDATE HELPER ---
+  // If optional columns (cooldown_until, kills_count, tasks_completed_count) don't exist in the database table yet,
+  // gracefully fall back to updating only the core columns (points, status, role, team).
+  public async safeUpdatePlayer(
+    playerId: string,
+    payload: Record<string, any>,
+    fallbackKeys: string[] = ['points', 'status', 'role', 'team']
+  ): Promise<void> {
+    const client = this.getClient();
+    if (!client) return;
+
+    try {
+      const { error } = await client.from('players').update(payload).eq('id', playerId);
+      if (error) {
+        console.warn('safeUpdatePlayer: extended update failed, using fallback:', error.message);
+        const fallbackPayload: Record<string, any> = {};
+        for (const k of fallbackKeys) {
+          if (k in payload) fallbackPayload[k] = payload[k];
+        }
+        if (Object.keys(fallbackPayload).length > 0) {
+          await client.from('players').update(fallbackPayload).eq('id', playerId);
+        }
+      }
+    } catch (err) {
+      console.warn('safeUpdatePlayer exception:', err);
+    }
+  }
+
   // --- REGISTER PLAYER ---
   public async registerPlayer(playerData: {
     name: string;
@@ -506,10 +536,7 @@ class SupabaseService {
       }
     }
 
-    const { data: stateData } = await client.from('game_state').select('status').eq('id', 'main').single();
-    const isGameAlreadyRunning = stateData?.status === 'Läuft';
-
-    // If registered after game started, joins as Mensch (Gut)
+    // Only insert core columns that are guaranteed to exist in standard schema
     const newRecord = {
       id,
       name: playerData.name.trim(),
@@ -519,25 +546,40 @@ class SupabaseService {
       team: 'Gut',
       status: 'lebendig',
       points: 0,
-      kills_count: 0,
-      tasks_completed_count: 0,
       created_at: new Date().toISOString(),
     };
 
-    const { data, error } = await client.from('players').insert([newRecord]).select().single();
-    if (error) throw new Error(`Registrierung fehlgeschlagen: ${error.message}`);
+    let data: any = null;
+    const { data: insertedData, error } = await client
+      .from('players')
+      .insert([newRecord])
+      .select('id, name, costume_name, photo_url, role, team, status, points, created_at')
+      .single();
+
+    if (error) {
+      // Fallback: simple insert without select in case PostgREST schema cache has issues with returning select
+      const retry = await client.from('players').insert([newRecord]);
+      if (retry.error) {
+        throw new Error(`Registrierung fehlgeschlagen: ${retry.error.message}`);
+      }
+      data = newRecord;
+    } else {
+      data = insertedData;
+    }
 
     return {
       id: data.id,
       name: data.name,
       costumeName: data.costume_name,
       photoUrl: data.photo_url,
-      role: data.role as RoleType,
-      team: data.team as TeamType,
-      status: data.status,
-      points: data.points,
-      killsCount: data.kills_count,
-      tasksCompletedCount: data.tasks_completed_count,
+      role: (data.role || 'Mensch') as RoleType,
+      team: (data.team || 'Gut') as TeamType,
+      status: data.status || 'lebendig',
+      points: data.points || 0,
+      killsCount: data.kills_count || 0,
+      tasksCompletedCount: data.tasks_completed_count || 0,
+      cooldownUntil: data.cooldown_until || undefined,
+      lastKillAt: data.last_kill_at || undefined,
       joinedAt: data.created_at,
     };
   }
@@ -608,17 +650,19 @@ class SupabaseService {
     }
 
     for (const a of assignments) {
-      await client
-        .from('players')
-        .update({
+      await this.safeUpdatePlayer(
+        a.id,
+        {
           role: a.role,
           team: a.team,
           status: 'lebendig',
-          cooldown_until: null,
           points: 0,
+          cooldown_until: null,
           kills_count: 0,
-        })
-        .eq('id', a.id);
+          tasks_completed_count: 0,
+        },
+        ['role', 'team', 'status', 'points']
+      );
     }
 
     // Schedule initial full moon events (every 20 to 40 min, duration 5 min)
@@ -717,19 +761,31 @@ class SupabaseService {
       await client.from('photos').delete().neq('photo_url', '__never__');
       await client.from('players').delete().neq('id', '__never__');
     } else {
-      await client
-        .from('players')
-        .update({
-          role: 'Mensch',
-          team: 'Gut',
-          status: 'lebendig',
-          points: 0,
-          kills_count: 0,
-          tasks_completed_count: 0,
-          last_kill_at: null,
-          cooldown_until: null,
-        })
-        .neq('id', '__never__');
+      try {
+        await client
+          .from('players')
+          .update({
+            role: 'Mensch',
+            team: 'Gut',
+            status: 'lebendig',
+            points: 0,
+            kills_count: 0,
+            tasks_completed_count: 0,
+            last_kill_at: null,
+            cooldown_until: null,
+          })
+          .neq('id', '__never__');
+      } catch {
+        await client
+          .from('players')
+          .update({
+            role: 'Mensch',
+            team: 'Gut',
+            status: 'lebendig',
+            points: 0,
+          })
+          .neq('id', '__never__');
+      }
 
       await client.from('kills').delete().neq('killer_id', '__never__');
       await client.from('task_completions').delete().neq('player_id', '__never__');
@@ -915,13 +971,18 @@ class SupabaseService {
     const cooldownUntil = new Date(Date.now() + cooldownMinutes * 60 * 1000).toISOString();
 
     // 1. Killer Cooldown starts immediately
-    await client
-      .from('players')
-      .update({
+    try {
+      sessionStorage.setItem(`cd_${killer.id}`, cooldownUntil);
+    } catch {}
+
+    await this.safeUpdatePlayer(
+      killer.id,
+      {
         last_kill_at: new Date().toISOString(),
         cooldown_until: cooldownUntil,
-      })
-      .eq('id', killer.id);
+      },
+      []
+    );
 
     // 2. Insert Kill Record (pending confirmation by victim)
     await client.from('kills').insert([
@@ -996,15 +1057,19 @@ class SupabaseService {
 
       const hunterPoints = (hunter.points || 0) + (settings.pointsExorcismSuccess || 25);
       const cooldownUntil = new Date(Date.now() + cooldownMinutes * 60 * 1000).toISOString();
+      try {
+        sessionStorage.setItem(`cd_${hunter.id}`, cooldownUntil);
+      } catch {}
 
-      await client
-        .from('players')
-        .update({
+      await this.safeUpdatePlayer(
+        hunter.id,
+        {
           points: hunterPoints,
           kills_count: (hunter.kills_count || 0) + 1,
           cooldown_until: cooldownUntil,
-        })
-        .eq('id', hunter.id);
+        },
+        ['points']
+      );
 
       await client.from('kills').insert([
         {
@@ -1028,13 +1093,17 @@ class SupabaseService {
       // Fehlschuss! Ziel bleibt am Leben, Jäger ist 30 Min gesperrt
       cooldownMinutes = settings.hunterMissPenaltyMinutes || 30;
       const cooldownUntil = new Date(Date.now() + cooldownMinutes * 60 * 1000).toISOString();
+      try {
+        sessionStorage.setItem(`cd_${hunter.id}`, cooldownUntil);
+      } catch {}
 
-      await client
-        .from('players')
-        .update({
+      await this.safeUpdatePlayer(
+        hunter.id,
+        {
           cooldown_until: cooldownUntil,
-        })
-        .eq('id', hunter.id);
+        },
+        []
+      );
 
       await client.from('kills').insert([
         {
@@ -1083,13 +1152,14 @@ class SupabaseService {
     // 2. Award killer points (+15 Pkt für bösen Kill)
     const { data: killer } = await client.from('players').select('points, kills_count').eq('id', kill.killer_id).single();
     if (killer) {
-      await client
-        .from('players')
-        .update({
+      await this.safeUpdatePlayer(
+        kill.killer_id,
+        {
           points: (killer.points || 0) + (settings.pointsEvilKill || 15),
           kills_count: (killer.kills_count || 0) + 1,
-        })
-        .eq('id', kill.killer_id);
+        },
+        ['points']
+      );
     }
 
     // 3. Mark kill confirmed
@@ -1119,13 +1189,14 @@ class SupabaseService {
     // Deduct killer points
     const { data: killer } = await client.from('players').select('points, kills_count').eq('id', kill.killer_id).single();
     if (killer) {
-      await client
-        .from('players')
-        .update({
+      await this.safeUpdatePlayer(
+        kill.killer_id,
+        {
           points: Math.max(0, (killer.points || 0) - 15),
           kills_count: Math.max(0, (killer.kills_count || 0) - 1),
-        })
-        .eq('id', kill.killer_id);
+        },
+        ['points']
+      );
     }
 
     // Delete kill record
@@ -1187,13 +1258,14 @@ class SupabaseService {
     ]);
 
     // 2. Award main player points
-    await client
-      .from('players')
-      .update({
+    await this.safeUpdatePlayer(
+      player.id,
+      {
         points: (player.points || 0) + taskPoints,
         tasks_completed_count: (player.tasks_completed_count || 0) + 1,
-      })
-      .eq('id', player.id);
+      },
+      ['points']
+    );
 
     // 3. Add to party photo gallery
     if (uploadedPhotoUrl) {

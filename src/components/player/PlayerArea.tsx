@@ -124,9 +124,14 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
 
       // 2. Player cooldown
       const dbPlayer = players.find((p) => p.id === player.id);
-      const cooldownUntil = (dbPlayer as any)?.cooldown_until || (player as any)?.cooldown_until;
-      if (cooldownUntil) {
-        const cdEndMs = new Date(cooldownUntil).getTime();
+      let cdTimestamp = dbPlayer?.cooldownUntil || (dbPlayer as any)?.cooldown_until || player.cooldownUntil;
+      if (!cdTimestamp) {
+        try {
+          cdTimestamp = sessionStorage.getItem(`cd_${player.id}`) || null;
+        } catch {}
+      }
+      if (cdTimestamp) {
+        const cdEndMs = new Date(cdTimestamp).getTime();
         const diffCd = Math.max(0, Math.floor((cdEndMs - Date.now()) / 1000));
         setCooldownRemainingSeconds(diffCd);
       } else {

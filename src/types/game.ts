@@ -16,8 +16,10 @@ export interface Player {
   status: PlayerStatus;
   points: number;
   killsCount?: number;
-  joinedAt: string;
   tasksCompletedCount?: number;
+  cooldownUntil?: string;
+  lastKillAt?: string;
+  joinedAt: string;
 }
 
 export interface GameSettings {

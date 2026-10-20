@@ -71,10 +71,14 @@ create table if not exists public.players (
   created_at timestamptz not null default timezone('utc'::text, now())
 );
 
+alter table public.players add column if not exists kills_count integer not null default 0;
 alter table public.players add column if not exists tasks_completed_count integer not null default 0;
 alter table public.players add column if not exists last_kill_at timestamptz;
 alter table public.players add column if not exists cooldown_until timestamptz;
 alter table public.players add column if not exists active_tasks jsonb not null default '[]'::jsonb;
+
+-- Schema-Cache von Supabase PostgREST sofort aktualisieren
+notify pgrst, 'reload schema';
 
 create index if not exists idx_players_points on public.players (points desc);
 create index if not exists idx_players_created_at on public.players (created_at asc);
