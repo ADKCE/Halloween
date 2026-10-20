@@ -120,28 +120,50 @@ end;
 $$;
 
 -- 9. STORAGE BUCKET: photos (Für komprimierte Kostüm- & Eventfotos)
-insert into storage.buckets (id, name, public)
-values ('photos', 'photos', true)
-on conflict (id) do update set public = true;
+do $$
+begin
+  insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+  values ('photos', 'photos', true, 10485760, array['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+  on conflict (id) do update set public = true;
+exception when others then
+  -- Falls Ausführung im SQL Editor eingeschränkte Rechte auf storage.buckets hat
+  null;
+end;
+$$;
 
 -- Storage-Zugriffsregeln für anon (Öffentlicher Upload und Lesezugriff)
-drop policy if exists "Photos Public Read" on storage.objects;
-create policy "Photos Public Read"
-on storage.objects for select
-to public
-using (bucket_id = 'photos');
+do $$
+begin
+  drop policy if exists "Photos Public Read" on storage.objects;
+  create policy "Photos Public Read"
+  on storage.objects for select
+  to public
+  using (bucket_id = 'photos');
+exception when others then null;
+end;
+$$;
 
-drop policy if exists "Photos Public Upload" on storage.objects;
-create policy "Photos Public Upload"
-on storage.objects for insert
-to public
-with check (bucket_id = 'photos');
+do $$
+begin
+  drop policy if exists "Photos Public Upload" on storage.objects;
+  create policy "Photos Public Upload"
+  on storage.objects for insert
+  to public
+  with check (bucket_id = 'photos');
+exception when others then null;
+end;
+$$;
 
-drop policy if exists "Photos Public Update" on storage.objects;
-create policy "Photos Public Update"
-on storage.objects for update
-to public
-using (bucket_id = 'photos');
+do $$
+begin
+  drop policy if exists "Photos Public Update" on storage.objects;
+  create policy "Photos Public Update"
+  on storage.objects for update
+  to public
+  using (bucket_id = 'photos');
+exception when others then null;
+end;
+$$;
 
 -- 10. ROW LEVEL SECURITY (RLS) AKTIVIEREN & ANON-POLICIES
 alter table public.game_state enable row level security;

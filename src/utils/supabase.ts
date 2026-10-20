@@ -13,6 +13,42 @@ import {
 } from '../types/game';
 import { compressImage } from './imageCompressor';
 
+export function sanitizeSupabaseUrl(rawUrl: string): string {
+  if (!rawUrl) return '';
+  let url = rawUrl.trim();
+  // Strip trailing slashes
+  url = url.replace(/\/+$/, '');
+  // If user pasted the PostgREST endpoint (e.g. https://<ref>.supabase.co/rest/v1 or /rest/v1/)
+  url = url.replace(/\/rest\/v1\/?$/, '');
+  // If user pasted auth or storage endpoint
+  url = url.replace(/\/(auth|storage|graphql)\/v1\/?$/, '');
+  url = url.replace(/\/+$/, '');
+  if (url && !url.startsWith('http://') && !url.startsWith('https://')) {
+    url = 'https://' + url;
+  }
+  return url;
+}
+
+export function dataUrlToBlob(dataUrl: string): Blob {
+  try {
+    const parts = dataUrl.split(';base64,');
+    if (parts.length < 2) {
+      return new Blob([dataUrl], { type: 'image/jpeg' });
+    }
+    const contentType = parts[0].split(':')[1] || 'image/jpeg';
+    const raw = window.atob(parts[1]);
+    const rawLength = raw.length;
+    const uInt8Array = new Uint8Array(rawLength);
+    for (let i = 0; i < rawLength; ++i) {
+      uInt8Array[i] = raw.charCodeAt(i);
+    }
+    return new Blob([uInt8Array], { type: contentType });
+  } catch (err) {
+    console.warn('Error converting dataUrlToBlob:', err);
+    return new Blob([], { type: 'image/jpeg' });
+  }
+}
+
 const STORAGE_URL_KEY = 'halloween_supabase_url';
 const STORAGE_ANON_KEY = 'halloween_supabase_anon_key';
 
@@ -40,7 +76,8 @@ class SupabaseService {
   }
 
   public getCredentials(): { url: string; key: string; source: 'env' | 'localStorage' | 'none' } {
-    const envUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
+    const rawEnvUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
+    const envUrl = sanitizeSupabaseUrl(rawEnvUrl);
     const envKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
 
     if (envUrl && envKey && !envUrl.includes('xxxxxxxxxxxxxxxxxxxx')) {
@@ -48,7 +85,8 @@ class SupabaseService {
     }
 
     if (typeof window !== 'undefined') {
-      const localUrl = (localStorage.getItem(STORAGE_URL_KEY) || '').trim();
+      const rawLocalUrl = (localStorage.getItem(STORAGE_URL_KEY) || '').trim();
+      const localUrl = sanitizeSupabaseUrl(rawLocalUrl);
       const localKey = (localStorage.getItem(STORAGE_ANON_KEY) || '').trim();
       if (localUrl && localKey) {
         return { url: localUrl, key: localKey, source: 'localStorage' };
@@ -60,9 +98,11 @@ class SupabaseService {
 
   public saveLocalCredentials(url: string, key: string) {
     if (typeof window === 'undefined') return;
-    if (url.trim() && key.trim()) {
-      localStorage.setItem(STORAGE_URL_KEY, url.trim());
-      localStorage.setItem(STORAGE_ANON_KEY, key.trim());
+    const cleanUrl = sanitizeSupabaseUrl(url);
+    const cleanKey = key.trim();
+    if (cleanUrl && cleanKey) {
+      localStorage.setItem(STORAGE_URL_KEY, cleanUrl);
+      localStorage.setItem(STORAGE_ANON_KEY, cleanKey);
     } else {
       localStorage.removeItem(STORAGE_URL_KEY);
       localStorage.removeItem(STORAGE_ANON_KEY);
@@ -128,15 +168,14 @@ class SupabaseService {
 
     // 1. Convert string / base64 or compress if needed
     let uploadBlob: Blob;
+    let fallbackDataUrl = '';
+
     if (typeof blobOrFile === 'string') {
       if (blobOrFile.startsWith('data:')) {
-        const compressed = await compressImage(
-          await (await fetch(blobOrFile)).blob(),
-          prefix === 'costume' ? 800 : 1200
-        );
-        uploadBlob = compressed.blob;
+        fallbackDataUrl = blobOrFile;
+        uploadBlob = dataUrlToBlob(blobOrFile);
       } else {
-        // already a hosted URL
+        // already a hosted URL (e.g. https://...)
         return blobOrFile;
       }
     } else {
@@ -145,33 +184,50 @@ class SupabaseService {
         prefix === 'costume' ? 800 : 1200
       );
       uploadBlob = compressed.blob;
+      fallbackDataUrl = compressed.dataUrl;
     }
 
     if (!client) {
+      if (fallbackDataUrl) return fallbackDataUrl;
       throw new Error('Supabase ist noch nicht konfiguriert (VITE_SUPABASE_URL fehlt)');
     }
 
+    // Flat filename without nested directory slashes for maximal storage compatibility
     const fileExt = 'jpg';
-    const fileName = `${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}.${fileExt}`;
-    const filePath = `uploads/${fileName}`;
+    const safeRandom = Math.random().toString(36).substring(2, 9);
+    const fileName = `${prefix}_${Date.now()}_${safeRandom}.${fileExt}`;
 
-    const { error: uploadError } = await client.storage
-      .from('photos')
-      .upload(filePath, uploadBlob, {
-        contentType: 'image/jpeg',
-        upsert: true,
-      });
+    try {
+      const { data: uploadData, error: uploadError } = await client.storage
+        .from('photos')
+        .upload(fileName, uploadBlob, {
+          contentType: 'image/jpeg',
+          upsert: true,
+        });
 
-    if (uploadError) {
-      this.lastError = `Storage-Upload fehlgeschlagen: ${uploadError.message}`;
-      throw new Error(`Foto-Upload fehlgeschlagen: ${uploadError.message}. Stelle sicher, dass der Bucket 'photos' im Supabase SQL Editor angelegt wurde.`);
+      if (uploadError) {
+        console.warn('Supabase storage upload error:', uploadError.message);
+        this.lastError = `Storage-Upload: ${uploadError.message}`;
+        // Fallback to client-compressed image dataUrl so player flow is never blocked
+        if (fallbackDataUrl) {
+          return fallbackDataUrl;
+        }
+        throw new Error(`Foto-Upload: ${uploadError.message}. Stelle sicher, dass der Bucket 'photos' im Supabase Dashboard angelegt und öffentlich (Public) ist.`);
+      }
+
+      const { data: publicData } = client.storage
+        .from('photos')
+        .getPublicUrl(uploadData?.path || fileName);
+
+      return publicData.publicUrl;
+    } catch (err: any) {
+      console.warn('Foto-Upload Ausnahme abgefangen:', err);
+      if (fallbackDataUrl) {
+        this.lastError = `Storage-Hinweis: Foto komprimiert im Datensatz gesichert (${err?.message || 'Bucket photos prüfen'})`;
+        return fallbackDataUrl;
+      }
+      throw err;
     }
-
-    const { data: publicData } = client.storage
-      .from('photos')
-      .getPublicUrl(filePath);
-
-    return publicData.publicUrl;
   }
 
   // --- GAME STATE & PLAYERS ---
@@ -348,9 +404,8 @@ class SupabaseService {
       try {
         uploadedPhotoUrl = await this.uploadPhoto(playerData.photoUrl, 'costume');
       } catch (err: any) {
-        // If storage bucket isn't setup yet, we warn the user
-        console.warn('Storage upload error, using direct photo:', err);
-        throw err;
+        console.warn('Storage upload error, using direct compressed photo:', err);
+        uploadedPhotoUrl = playerData.photoUrl;
       }
     }
 
