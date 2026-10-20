@@ -66,7 +66,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   const [werewolfCount, setWerewolfCount] = useState(settings.werewolfCount);
   const [ghostCount, setGhostCount] = useState(settings.ghostCount);
   const [hunterCount, setHunterCount] = useState(settings.hunterCount);
-  const [backendUrl, setBackendUrl] = useState(() => gameApi.getBackendUrlOverride());
+  const [supabaseStatus] = useState(() => gameApi.getStatus());
   const [settingsNotice, setSettingsNotice] = useState('');
 
   // QR Code data URL
@@ -132,7 +132,6 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    gameApi.setBackendUrlOverride(backendUrl);
     await onUpdateSettings({
       adminCode: newAdminCode.trim() || '1031',
       vampireCount: Number(vampireCount),
@@ -140,7 +139,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
       ghostCount: Number(ghostCount),
       hunterCount: Number(hunterCount),
     });
-    setSettingsNotice('Einstellungen gespeichert!');
+    setSettingsNotice('Einstellungen in Supabase gespeichert!');
     setTimeout(() => setSettingsNotice(''), 3000);
   };
 
@@ -563,20 +562,27 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
               Der Rest der Gäste wird automatisch Menschen. Bei abweichender Spielerzahl berechnet das System die Zuteilung proportional.
             </p>
 
-            <div className="pt-2 border-t border-zinc-800 space-y-1">
+            <div className="pt-2 border-t border-zinc-800 space-y-1.5">
               <label className="block text-[11px] font-bold text-zinc-400">
-                Zentrale Server-URL (optional):
+                Datenbank-Backend:
               </label>
-              <input
-                type="text"
-                placeholder="Standard: Selber Server (leer = aktuelle Server-Adresse)"
-                value={backendUrl}
-                onChange={(e) => setBackendUrl(e.target.value)}
-                className="w-full px-3 py-2 rounded-xl bg-zinc-950 border border-zinc-700 text-xs text-white placeholder-zinc-600 font-mono"
-              />
-              <span className="text-[10px] text-zinc-500 block">
-                Alle Handys verbinden sich automatisch mit dieser zentralen Datenbank (GameState "main").
-              </span>
+              <div className="p-3 rounded-xl bg-zinc-950 border border-zinc-800 space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-zinc-400">Status:</span>
+                  <span className="text-emerald-400 font-bold">
+                    {supabaseStatus.isConfigured ? 'Supabase verbunden' : 'Konfiguration erforderlich'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-zinc-400">URL:</span>
+                  <span className="text-zinc-300 font-mono text-[11px] truncate max-w-[200px]" title={supabaseStatus.supabaseUrl}>
+                    {supabaseStatus.supabaseUrl || 'VITE_SUPABASE_URL'}
+                  </span>
+                </div>
+                <p className="text-[10px] text-zinc-500 pt-1">
+                  Alle Spieler werden zentral über Supabase (Postgres & Realtime) synchronisiert. Für Details rufe die App mit <code className="text-[#ff6b00]">?debug=1</code> auf.
+                </p>
+              </div>
             </div>
           </div>
 

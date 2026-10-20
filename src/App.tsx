@@ -4,9 +4,19 @@ import { PlayerArea } from './components/player/PlayerArea';
 import { AdminArea } from './components/admin/AdminArea';
 import { AdminAuthModal } from './components/admin/AdminAuthModal';
 import { MobileNavBar } from './components/navigation/MobileNavBar';
-import { Player, GameState, ServerStateResponse, GameSettings } from './types/game';
+import { DebugPanel } from './components/debug/DebugPanel';
+import {
+  Player,
+  GameState,
+  ServerStateResponse,
+  GameSettings,
+  KillRecord,
+  PartyTask,
+  TaskCompletion,
+  PartyPhoto
+} from './types/game';
 import { gameApi } from './utils/api';
-import { Smartphone, Monitor, Loader2, Sparkles } from 'lucide-react';
+import { Smartphone, Monitor, Loader2, Sparkles, Database, AlertCircle } from 'lucide-react';
 
 const LOCAL_STORAGE_PLAYER_ID = 'halloween_party_player_id';
 const SESSION_STORAGE_ADMIN_CODE = 'halloween_party_admin_code';
@@ -31,8 +41,9 @@ export default function App() {
   const [currentTab, setCurrentTab] = useState<'player' | 'admin'>('player');
   const [isMobileDeviceFrame, setIsMobileDeviceFrame] = useState(false);
   const [isInitializing, setIsInitializing] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
-  // Live state from central server database
+  // Live state from central Supabase database
   const [gameState, setGameState] = useState<GameState>({
     id: 'main',
     status: 'Lobby',
@@ -45,13 +56,18 @@ export default function App() {
       ghostCount: 4,
       hunterCount: 10,
     },
+    adminCode: '1031',
   });
 
   const [players, setPlayers] = useState<Player[]>([]);
+  const [kills, setKills] = useState<KillRecord[]>([]);
+  const [tasks, setTasks] = useState<PartyTask[]>([]);
+  const [taskCompletions, setTaskCompletions] = useState<TaskCompletion[]>([]);
+  const [photos, setPhotos] = useState<PartyPhoto[]>([]);
   const [totalJoinedCount, setTotalJoinedCount] = useState<number>(0);
   const [isRegistering, setIsRegistering] = useState<boolean>(false);
 
-  // Fetch live state from central server (polling every 3 seconds)
+  // Fetch live state from Supabase
   const fetchGameState = useCallback(async () => {
     try {
       const data: ServerStateResponse = await gameApi.getGameState(
@@ -60,9 +76,14 @@ export default function App() {
       );
       setGameState(data.gameState);
       setPlayers(data.players);
+      setKills(data.kills || []);
+      setTasks(data.tasks || []);
+      setTaskCompletions(data.taskCompletions || []);
+      setPhotos(data.photos || []);
       setTotalJoinedCount(data.totalJoinedCount);
+      setFetchError(null);
 
-      // Verify if stored player still exists in database
+      // Verify if stored player still exists in Supabase
       if (registeredPlayerId) {
         const found = data.players.find((p) => p.id === registeredPlayerId);
         if (!found) {
@@ -71,21 +92,26 @@ export default function App() {
           setRegisteredPlayerId(null);
         }
       }
-    } catch (err) {
-      // Temporary network hiccup, retain existing state and retry next interval
+    } catch (err: any) {
+      setFetchError(err?.message || 'Verbindung zu Supabase fehlgeschlagen');
     } finally {
       setIsInitializing(false);
     }
   }, [registeredPlayerId, adminCode, isAdminUnlocked]);
 
-  // Initial fetch and 3-second live polling interval
+  // Initial fetch, Supabase Realtime subscription & 3-second fallback polling
   useEffect(() => {
     fetchGameState();
+
+    // 1. Supabase Realtime Subscription
+    const unsubscribeRealtime = gameApi.subscribeToRealtime(fetchGameState);
+
+    // 2. 3-Second Fallback Polling (ensures freshness even if realtime is paused/backgrounded)
     const interval = setInterval(fetchGameState, 3000);
-    const unsubscribe = gameApi.subscribeToSync(fetchGameState);
+
     return () => {
       clearInterval(interval);
-      unsubscribe();
+      unsubscribeRealtime();
     };
   }, [fetchGameState]);
 
@@ -189,8 +215,28 @@ export default function App() {
     }
   };
 
+  // Player Actions: Kill, Tasks, Photos
+  const handleRecordKill = async (victimId: string) => {
+    if (!registeredPlayerId) return;
+    await gameApi.recordKill(registeredPlayerId, victimId);
+    await fetchGameState();
+  };
+
+  const handleCompleteTask = async (taskId: string, photoFileOrBlob?: Blob | File | string) => {
+    if (!registeredPlayerId) return;
+    await gameApi.completeTask(registeredPlayerId, taskId, photoFileOrBlob);
+    await fetchGameState();
+  };
+
+  const handleUploadPhoto = async (file: File, caption: string) => {
+    if (!registeredPlayerId) return;
+    await gameApi.uploadPartyPhoto(registeredPlayerId, file, caption);
+    await fetchGameState();
+  };
+
   // Resolve current active player object
   const currentPlayer = players.find((p) => p.id === registeredPlayerId);
+  const supabaseStatus = gameApi.getStatus();
 
   return (
     <div
@@ -217,6 +263,24 @@ export default function App() {
           </button>
         </div>
 
+        {/* Configuration Notice if Supabase credentials are not set */}
+        {!supabaseStatus.isConfigured && (
+          <div className="m-3 p-3.5 rounded-2xl bg-amber-950/80 border-2 border-amber-500/50 text-amber-200 text-xs shadow-xl space-y-2">
+            <div className="flex items-center gap-2 font-bold text-amber-300">
+              <Database className="w-4 h-4 shrink-0" />
+              <span>Supabase-Konfiguration erforderlich</span>
+            </div>
+            <p className="text-[11px] text-amber-200/90 leading-relaxed">
+              Trage <code className="font-mono bg-black/50 px-1 py-0.5 rounded">VITE_SUPABASE_URL</code> und{' '}
+              <code className="font-mono bg-black/50 px-1 py-0.5 rounded">VITE_SUPABASE_ANON_KEY</code> in Cloudflare Pages bzw.{' '}
+              <code className="font-mono bg-black/50 px-1 py-0.5 rounded">.env</code> ein.
+            </p>
+            <div className="text-[10px] text-amber-300/80">
+              Tipp: Hänge <span className="font-bold underline text-white">?debug=1</span> an die URL an, um Supabase-Keys testweise direkt im Browser einzutragen!
+            </div>
+          </div>
+        )}
+
         {/* INITIAL LOADING STATE (Prevents flash of login screen on page reload) */}
         {isInitializing && registeredPlayerId ? (
           <div className="min-h-screen flex flex-col items-center justify-center p-6 text-center space-y-4">
@@ -227,7 +291,7 @@ export default function App() {
               <h2 className="font-serif font-black text-xl text-white">Halloween-Party</h2>
               <p className="text-xs text-zinc-400 mt-1 flex items-center justify-center gap-2">
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-[#ff6b00]" />
-                Verbinde mit Server...
+                Verbinde mit Supabase...
               </p>
             </div>
           </div>
@@ -247,7 +311,14 @@ export default function App() {
                   players={players}
                   gameStatus={gameState.status}
                   totalJoinedCount={totalJoinedCount}
+                  kills={kills}
+                  tasks={tasks}
+                  taskCompletions={taskCompletions}
+                  photos={photos}
                   onLogoutDevice={handleLogoutDevice}
+                  onRecordKill={handleRecordKill}
+                  onCompleteTask={handleCompleteTask}
+                  onUploadPhoto={handleUploadPhoto}
                 />
               ) : (
                 <AdminArea
@@ -279,6 +350,14 @@ export default function App() {
           isOpen={isAdminModalOpen}
           onClose={() => setIsAdminModalOpen(false)}
           onVerify={handleVerifyAdminCode}
+        />
+
+        {/* DEBUG PANEL (Visible with ?debug=1 in URL) */}
+        <DebugPanel
+          registeredPlayerId={registeredPlayerId}
+          gameStatus={gameState.status}
+          totalJoinedCount={totalJoinedCount}
+          onRefresh={fetchGameState}
         />
       </div>
     </div>

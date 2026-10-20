@@ -14,9 +14,10 @@ export interface Player {
   role: RoleType;
   team: TeamType;
   status: PlayerStatus;
+  points: number;
+  killsCount?: number;
   joinedAt: string;
-  kills?: string[];
-  tasks?: string[];
+  tasksCompletedCount?: number;
 }
 
 export interface GameSettings {
@@ -33,11 +34,55 @@ export interface GameState {
   startedAt: string | null;
   endedAt: string | null;
   settings: GameSettings;
+  adminCode: string;
+  fullMoonTimes?: string[];
   updatedAt?: string;
+}
+
+export interface KillRecord {
+  id: string;
+  killerId: string;
+  victimId: string;
+  killerName?: string;
+  victimName?: string;
+  createdAt: string;
+  confirmed: boolean;
+}
+
+export interface PartyTask {
+  id: string;
+  title: string;
+  description: string;
+  points: number;
+  category: string;
+  createdAt?: string;
+}
+
+export interface TaskCompletion {
+  id: string;
+  taskId: string;
+  playerId: string;
+  playerName: string;
+  photoUrl?: string;
+  completedAt: string;
+}
+
+export interface PartyPhoto {
+  id: string;
+  photoUrl: string;
+  taskId?: string;
+  caption?: string;
+  playerId?: string;
+  photographerName?: string;
+  createdAt: string;
 }
 
 export interface ServerStateResponse {
   gameState: GameState;
   players: Player[];
+  kills: KillRecord[];
+  tasks: PartyTask[];
+  taskCompletions: TaskCompletion[];
+  photos: PartyPhoto[];
   totalJoinedCount: number;
 }
