@@ -1,4 +1,4 @@
-export type RoleType = 'Mensch' | 'Geisterjäger' | 'Vampir' | 'Werwolf' | 'Geist' | 'Unbekannt';
+export type RoleType = 'Mensch' | 'Geisterjäger' | 'Vampir' | 'Werwolf' | 'Geist' | 'unassigned' | 'Unbekannt';
 
 export type TeamType = 'Gut' | 'Böse';
 
@@ -24,7 +24,13 @@ export interface Player {
 
 export interface GameSettings {
   adminCode: string;
-  // Rollen-Verteilung (pro 100 Gäste bzw. absolute Defaults)
+  // Rollen-Verteilung: Zielanteile in Prozent (im Admin einstellbar)
+  vampirePercent?: number; // Standard: 6%
+  werewolfPercent?: number; // Standard: 4%
+  ghostPercent?: number; // Standard: 4%
+  hunterPercent?: number; // Standard: 10%
+
+  // Rollen-Verteilung (historische Zähler für Rückwärtskompatibilität)
   vampireCount: number;
   werewolfCount: number;
   ghostCount: number;

@@ -59,7 +59,7 @@ create table if not exists public.players (
   name text not null,
   costume_name text not null,
   photo_url text not null,
-  role text not null default 'Mensch',
+  role text default 'unassigned',
   team text not null default 'Gut',
   status text not null default 'lebendig' check (status in ('lebendig', 'tot', 'entfernt', 'pausiert')),
   points integer not null default 0,
@@ -71,6 +71,8 @@ create table if not exists public.players (
   created_at timestamptz not null default timezone('utc'::text, now())
 );
 
+alter table public.players alter column role set default 'unassigned';
+alter table public.players alter column role drop not null;
 alter table public.players add column if not exists kills_count integer not null default 0;
 alter table public.players add column if not exists tasks_completed_count integer not null default 0;
 alter table public.players add column if not exists last_kill_at timestamptz;
@@ -298,3 +300,151 @@ begin
   end if;
 end;
 $$;
+
+-- 13. SERVERSEITIGE ROLLENVERTEILUNG: assign_roles()
+-- Exakte Zielanzahlen, Mindestquoten für Tests, Fisher-Yates Zufallsmischung
+create or replace function public.assign_roles()
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_settings jsonb;
+  v_vampire_pct numeric := 6;
+  v_werewolf_pct numeric := 4;
+  v_ghost_pct numeric := 4;
+  v_hunter_pct numeric := 10;
+  
+  v_total integer;
+  v_vampires integer := 0;
+  v_werewolves integer := 0;
+  v_ghosts integer := 0;
+  v_hunters integer := 0;
+  v_humans integer := 0;
+  v_min_humans integer;
+  v_max_special integer;
+  v_special_sum integer;
+  
+  v_deck text[] := array[]::text[];
+  v_player_ids text[] := array[]::text[];
+  v_i integer;
+  v_assigned_role text;
+  v_assigned_team text;
+  v_result jsonb;
+begin
+  -- 1. Einstellungen aus game_state lesen
+  select settings into v_settings from public.game_state where id = 'main';
+  if v_settings is not null then
+    if (v_settings->>'vampirePercent') is not null then
+      v_vampire_pct := (v_settings->>'vampirePercent')::numeric;
+    end if;
+    if (v_settings->>'werewolfPercent') is not null then
+      v_werewolf_pct := (v_settings->>'werewolfPercent')::numeric;
+    end if;
+    if (v_settings->>'ghostPercent') is not null then
+      v_ghost_pct := (v_settings->>'ghostPercent')::numeric;
+    end if;
+    if (v_settings->>'hunterPercent') is not null then
+      v_hunter_pct := (v_settings->>'hunterPercent')::numeric;
+    end if;
+  end if;
+
+  -- 2. Alle anwesenden aktiven Spieler in zufälliger Reihenfolge holen
+  select array_agg(id order by random())
+  into v_player_ids
+  from public.players
+  where status != 'entfernt';
+
+  v_total := coalesce(array_length(v_player_ids, 1), 0);
+  if v_total = 0 then
+    return jsonb_build_object('success', false, 'message', 'Keine aktiven Spieler vorhanden');
+  end if;
+
+  -- 3. Exakte Zielanzahlen berechnen
+  if v_total = 1 then
+    v_humans := 1;
+  elsif v_total = 2 then
+    v_vampires := 1;
+    v_hunters := 1;
+  elsif v_total = 3 then
+    v_vampires := 1;
+    v_hunters := 1;
+    v_humans := 1;
+  elsif v_total = 4 then
+    v_vampires := 1;
+    v_werewolves := 1;
+    v_hunters := 1;
+    v_humans := 1;
+  elsif v_total = 5 then
+    v_vampires := 1;
+    v_werewolves := 1;
+    v_ghosts := 1;
+    v_hunters := 1;
+    v_humans := 1;
+  else
+    -- ab 6 Spielern:
+    -- Menschen dürfen nie weniger als 40% ausmachen:
+    v_min_humans := greatest(1, floor(v_total * 0.40)::integer);
+    v_max_special := greatest(0, v_total - v_min_humans);
+
+    -- Sonderrollen mit Mindestanzahl 1:
+    v_vampires := greatest(1, round(v_total * v_vampire_pct / 100.0)::integer);
+    v_werewolves := greatest(1, round(v_total * v_werewolf_pct / 100.0)::integer);
+    v_ghosts := greatest(1, round(v_total * v_ghost_pct / 100.0)::integer);
+    v_hunters := greatest(1, round(v_total * v_hunter_pct / 100.0)::integer);
+
+    v_special_sum := v_vampires + v_werewolves + v_ghosts + v_hunters;
+    while v_special_sum > v_max_special loop
+      if v_hunters > 1 then v_hunters := v_hunters - 1;
+      elsif v_vampires > 1 then v_vampires := v_vampires - 1;
+      elsif v_werewolves > 1 then v_werewolves := v_werewolves - 1;
+      elsif v_ghosts > 1 then v_ghosts := v_ghosts - 1;
+      else exit;
+      end if;
+      v_special_sum := v_vampires + v_werewolves + v_ghosts + v_hunters;
+    end loop;
+
+    v_humans := greatest(0, v_total - (v_vampires + v_werewolves + v_ghosts + v_hunters));
+  end if;
+
+  -- 4. Rollen-Deck zusammenstellen
+  for v_i in 1..v_vampires loop v_deck := array_append(v_deck, 'Vampir'); end loop;
+  for v_i in 1..v_werewolves loop v_deck := array_append(v_deck, 'Werwolf'); end loop;
+  for v_i in 1..v_ghosts loop v_deck := array_append(v_deck, 'Geist'); end loop;
+  for v_i in 1..v_hunters loop v_deck := array_append(v_deck, 'Geisterjäger'); end loop;
+  for v_i in 1..v_humans loop v_deck := array_append(v_deck, 'Mensch'); end loop;
+
+  -- Auffüllen falls Rundungsdifferenz
+  while array_length(v_deck, 1) < v_total loop
+    v_deck := array_append(v_deck, 'Mensch');
+  end loop;
+
+  -- 5. Rollen den zufällig sortierten Spielern zuweisen
+  for v_i in 1..v_total loop
+    v_assigned_role := v_deck[v_i];
+    v_assigned_team := case when v_assigned_role in ('Vampir', 'Werwolf', 'Geist') then 'Böse' else 'Gut' end;
+
+    update public.players
+    set role = v_assigned_role,
+        team = v_assigned_team
+    where id = v_player_ids[v_i];
+  end loop;
+
+  v_result := jsonb_build_object(
+    'success', true,
+    'total', v_total,
+    'vampires', v_vampires,
+    'werewolves', v_werewolves,
+    'ghosts', v_ghosts,
+    'hunters', v_hunters,
+    'humans', v_humans
+  );
+
+  return v_result;
+end;
+$$;
+
+grant execute on function public.assign_roles() to anon, authenticated, service_role;
+
+-- Schema-Cache von Supabase PostgREST aktualisieren
+notify pgrst, 'reload schema';

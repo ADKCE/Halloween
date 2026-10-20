@@ -14,6 +14,11 @@ import {
   FullMoonEvent,
 } from '../types/game';
 import { DEFAULT_PHOTO_TASKS, DEFAULT_QUIZ_QUESTIONS } from './gameDataPool';
+import {
+  distributeRoles,
+  determineLateJoinerRole,
+  DEFAULT_ROLE_PERCENTAGES,
+} from './roleDistribution';
 
 const STORAGE_URL_KEY = 'halloween_supabase_url';
 const STORAGE_ANON_KEY = 'halloween_supabase_anon_key';
@@ -31,6 +36,10 @@ export interface SupabaseConfigStatus {
 
 export const DEFAULT_GAME_SETTINGS: GameSettings = {
   adminCode: '1031',
+  vampirePercent: 6,
+  werewolfPercent: 4,
+  ghostPercent: 4,
+  hunterPercent: 10,
   vampireCount: 6,
   werewolfCount: 4,
   ghostCount: 4,
@@ -309,15 +318,30 @@ class SupabaseService {
       const mappedPlayers: Player[] = (playersData || []).map((p: any) => {
         const isSelf = playerId && p.id === playerId;
         const isHunterTeammate = isSelfHunter && p.role === 'Geisterjäger';
-        const canSeeRole = isGameEnded || isAdmin || isSelf || isHunterTeammate;
+        const rawRole = (p.role === 'unassigned' || !p.role) ? 'unassigned' : (p.role as RoleType);
+        const rawTeam = (p.team || 'Gut') as TeamType;
+
+        let resolvedRole: RoleType = 'Unbekannt';
+        let resolvedTeam: TeamType = 'Gut';
+
+        if (gameState.status === 'Lobby') {
+          // In der Lobby hat noch niemand eine Spielrolle (erst ab Spielstart)
+          resolvedRole = isAdmin ? rawRole : 'unassigned';
+          resolvedTeam = 'Gut';
+        } else {
+          // Läuft oder Beendet
+          const canSeeRole = isGameEnded || isAdmin || isSelf || isHunterTeammate;
+          resolvedRole = canSeeRole ? rawRole : 'Unbekannt';
+          resolvedTeam = canSeeRole ? rawTeam : 'Gut';
+        }
 
         return {
           id: p.id,
           name: p.name,
           costumeName: p.costume_name || '',
           photoUrl: p.photo_url || '',
-          role: (canSeeRole ? p.role : 'Unbekannt') as RoleType,
-          team: (canSeeRole ? p.team : 'Gut') as TeamType,
+          role: resolvedRole,
+          team: resolvedTeam,
           status: p.status || 'lebendig',
           points: p.points || 0,
           killsCount: p.kills_count || 0,
@@ -536,14 +560,45 @@ class SupabaseService {
       }
     }
 
+    // Determine role:
+    // If Lobby -> role: 'unassigned'
+    // If Läuft -> Nachzügler! Role allocated based on deficit
+    let assignedRole: RoleType = 'unassigned';
+    let assignedTeam: TeamType = 'Gut';
+
+    try {
+      const { data: stateData } = await client
+        .from('game_state')
+        .select('status, settings')
+        .eq('id', 'main')
+        .maybeSingle();
+
+      const gameStatus = stateData?.status || 'Lobby';
+      const rawSettings = stateData?.settings || {};
+      const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...rawSettings };
+
+      if (gameStatus === 'Läuft') {
+        const { data: existingPlayers } = await client
+          .from('players')
+          .select('role, status')
+          .neq('status', 'entfernt');
+
+        const lateAssignment = determineLateJoinerRole(existingPlayers || [], settings);
+        assignedRole = lateAssignment.role;
+        assignedTeam = lateAssignment.team;
+      }
+    } catch (e) {
+      console.warn('Error determining role during registration:', e);
+    }
+
     // Only insert core columns that are guaranteed to exist in standard schema
     const newRecord = {
       id,
       name: playerData.name.trim(),
       costume_name: playerData.costumeName.trim(),
       photo_url: uploadedPhotoUrl,
-      role: 'Mensch',
-      team: 'Gut',
+      role: assignedRole,
+      team: assignedTeam,
       status: 'lebendig',
       points: 0,
       created_at: new Date().toISOString(),
@@ -572,8 +627,8 @@ class SupabaseService {
       name: data.name,
       costumeName: data.costume_name,
       photoUrl: data.photo_url,
-      role: (data.role || 'Mensch') as RoleType,
-      team: (data.team || 'Gut') as TeamType,
+      role: (data.role || assignedRole) as RoleType,
+      team: (data.team || assignedTeam) as TeamType,
       status: data.status || 'lebendig',
       points: data.points || 0,
       killsCount: data.kills_count || 0,
@@ -613,56 +668,42 @@ class SupabaseService {
     const rawSettings = stateData?.settings || {};
     const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...rawSettings };
 
-    const { data: players } = await client.from('players').select('*').neq('status', 'entfernt');
-    if (!players || players.length === 0) {
-      throw new Error('Keine Spieler in der Lobby vorhanden');
+    // 1. Rollenverteilung: Zuerst serverseitig über Postgres RPC "assign_roles",
+    // andernfalls clientseitig per exakter Zielanzahl & Fisher-Yates-Mischung
+    let rpcDone = false;
+    try {
+      const { error: rpcError } = await client.rpc('assign_roles');
+      if (!rpcError) {
+        rpcDone = true;
+      } else {
+        console.warn('RPC assign_roles returned error:', rpcError);
+      }
+    } catch (rpcErr) {
+      console.warn('RPC assign_roles not available, using client distribution:', rpcErr);
     }
 
-    const shuffled = [...players].sort(() => Math.random() - 0.5);
-    const total = shuffled.length;
+    if (!rpcDone) {
+      const { data: players } = await client.from('players').select('id').neq('status', 'entfernt');
+      if (!players || players.length === 0) {
+        throw new Error('Keine Spieler in der Lobby vorhanden');
+      }
 
-    const numVampires = Math.min(settings.vampireCount || 6, total);
-    const numWerewolves = Math.min(settings.werewolfCount || 4, Math.max(0, total - numVampires));
-    const numGhosts = Math.min(settings.ghostCount || 4, Math.max(0, total - numVampires - numWerewolves));
-    const numHunters = Math.min(
-      settings.hunterCount || 10,
-      Math.max(0, total - numVampires - numWerewolves - numGhosts)
-    );
-
-    let idx = 0;
-    const assignments: { id: string; role: RoleType; team: TeamType }[] = [];
-
-    for (let i = 0; i < numVampires && idx < total; i++, idx++) {
-      assignments.push({ id: shuffled[idx].id, role: 'Vampir', team: 'Böse' });
-    }
-    for (let i = 0; i < numWerewolves && idx < total; i++, idx++) {
-      assignments.push({ id: shuffled[idx].id, role: 'Werwolf', team: 'Böse' });
-    }
-    for (let i = 0; i < numGhosts && idx < total; i++, idx++) {
-      assignments.push({ id: shuffled[idx].id, role: 'Geist', team: 'Böse' });
-    }
-    for (let i = 0; i < numHunters && idx < total; i++, idx++) {
-      assignments.push({ id: shuffled[idx].id, role: 'Geisterjäger', team: 'Gut' });
-    }
-    while (idx < total) {
-      assignments.push({ id: shuffled[idx].id, role: 'Mensch', team: 'Gut' });
-      idx++;
-    }
-
-    for (const a of assignments) {
-      await this.safeUpdatePlayer(
-        a.id,
-        {
-          role: a.role,
-          team: a.team,
-          status: 'lebendig',
-          points: 0,
-          cooldown_until: null,
-          kills_count: 0,
-          tasks_completed_count: 0,
-        },
-        ['role', 'team', 'status', 'points']
-      );
+      const assignments = distributeRoles(players, settings);
+      for (const a of assignments) {
+        await this.safeUpdatePlayer(
+          a.id,
+          {
+            role: a.role,
+            team: a.team,
+            status: 'lebendig',
+            points: 0,
+            cooldown_until: null,
+            kills_count: 0,
+            tasks_completed_count: 0,
+          },
+          ['role', 'team', 'status', 'points']
+        );
+      }
     }
 
     // Schedule initial full moon events (every 20 to 40 min, duration 5 min)
@@ -695,6 +736,45 @@ class SupabaseService {
     if (stateError) throw new Error(stateError.message);
   }
 
+  // --- REASSIGN ROLES ---
+  public async reassignRoles(adminCode: string): Promise<{ success: boolean; message: string }> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    const { data: stateData } = await client.from('game_state').select('*').eq('id', 'main').single();
+    const rawSettings = stateData?.settings || {};
+    const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...rawSettings };
+
+    let rpcDone = false;
+    try {
+      const { error: rpcError } = await client.rpc('assign_roles');
+      if (!rpcError) rpcDone = true;
+    } catch {}
+
+    if (!rpcDone) {
+      const { data: players } = await client.from('players').select('id').neq('status', 'entfernt');
+      if (!players || players.length === 0) {
+        throw new Error('Keine Spieler vorhanden');
+      }
+      const assignments = distributeRoles(players, settings);
+      for (const a of assignments) {
+        await this.safeUpdatePlayer(
+          a.id,
+          {
+            role: a.role,
+            team: a.team,
+          },
+          ['role', 'team']
+        );
+      }
+    }
+
+    return { success: true, message: 'Rollen erfolgreich neu verteilt!' };
+  }
+
   public async abortGame(adminCode: string): Promise<void> {
     const isValid = await this.verifyAdminCode(adminCode);
     if (!isValid) throw new Error('Ungültiger Admin-Code');
@@ -709,6 +789,17 @@ class SupabaseService {
         updated_at: new Date().toISOString(),
       })
       .eq('id', 'main');
+
+    // Reset players back to unassigned in Lobby
+    try {
+      await client
+        .from('players')
+        .update({
+          role: 'unassigned',
+          team: 'Gut',
+        })
+        .neq('status', 'entfernt');
+    } catch {}
   }
 
   public async endGame(adminCode: string): Promise<void> {
@@ -765,7 +856,7 @@ class SupabaseService {
         await client
           .from('players')
           .update({
-            role: 'Mensch',
+            role: 'unassigned',
             team: 'Gut',
             status: 'lebendig',
             points: 0,
@@ -779,14 +870,13 @@ class SupabaseService {
         await client
           .from('players')
           .update({
-            role: 'Mensch',
+            role: 'unassigned',
             team: 'Gut',
             status: 'lebendig',
             points: 0,
           })
           .neq('id', '__never__');
       }
-
       await client.from('kills').delete().neq('killer_id', '__never__');
       await client.from('task_completions').delete().neq('player_id', '__never__');
       await client.from('special_tasks').delete().neq('player_id', '__never__');

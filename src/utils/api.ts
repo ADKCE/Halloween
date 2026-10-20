@@ -26,6 +26,10 @@ class GameApiClient {
     return supabaseService.startGame(adminCode);
   }
 
+  async reassignRoles(adminCode: string): Promise<{ success: boolean; message: string }> {
+    return supabaseService.reassignRoles(adminCode);
+  }
+
   async abortGame(adminCode: string): Promise<void> {
     return supabaseService.abortGame(adminCode);
   }

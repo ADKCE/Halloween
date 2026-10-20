@@ -214,6 +214,16 @@ export default function App() {
     }
   };
 
+  const handleAdminReassignRoles = async () => {
+    try {
+      const res = await gameApi.reassignRoles(adminCode);
+      alert(res.message);
+      await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Fehler beim Neuverteilen der Rollen');
+    }
+  };
+
   const handleAdminPlayerAction = async (
     playerId: string,
     action: 'entfernen' | 'wiederbeleben' | 'toeten' | 'pausieren'
@@ -377,6 +387,7 @@ export default function App() {
                   kills={kills}
                   photos={photos}
                   onStartGame={handleAdminStartGame}
+                  onReassignRoles={handleAdminReassignRoles}
                   onAbortGame={handleAdminAbortGame}
                   onEndGame={handleAdminEndGame}
                   onRestartGame={handleAdminRestart}

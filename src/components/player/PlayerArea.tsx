@@ -24,7 +24,8 @@ import {
   Info,
   Layers,
   ChevronRight,
-  ShieldAlert
+  ShieldAlert,
+  HelpCircle
 } from 'lucide-react';
 import {
   Player,
@@ -482,6 +483,8 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                     ? 'bg-purple-950 border border-purple-600'
                     : player.role === 'Geisterjäger'
                     ? 'bg-blue-950 border border-blue-600'
+                    : player.role === 'Mensch'
+                    ? 'bg-emerald-950 border border-emerald-600'
                     : 'bg-zinc-800 border border-zinc-600'
                 }`}
               >
@@ -490,15 +493,18 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                 {player.role === 'Geist' && <Ghost className="w-6 h-6 text-purple-400" />}
                 {player.role === 'Geisterjäger' && <ShieldAlert className="w-6 h-6 text-blue-400" />}
                 {player.role === 'Mensch' && <Users className="w-6 h-6 text-emerald-400" />}
+                {(player.role === 'unassigned' || !player.role) && <HelpCircle className="w-6 h-6 text-zinc-400" />}
               </div>
               <div>
                 <span className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider block">
                   Deine Rolle
                 </span>
                 <span className="font-serif font-black text-xl text-white block">
-                  {player.role}
+                  {player.role === 'unassigned' || !player.role ? 'Noch nicht zugelost' : player.role}
                 </span>
-                <span className="text-xs text-zinc-400">Team {player.team}</span>
+                <span className="text-xs text-zinc-400">
+                  {player.role === 'unassigned' || !player.role ? 'Rolle folgt bei Spielstart' : `Team ${player.team}`}
+                </span>
               </div>
             </div>
 
@@ -891,12 +897,13 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
             {isRoleSecretRevealed ? (
               <div className="p-4 rounded-2xl bg-zinc-950 border border-zinc-700 text-center space-y-2 animate-in zoom-in-95">
                 <span className="text-2xl font-serif font-black text-white block">
-                  {player.role}
+                  {player.role === 'unassigned' || !player.role ? 'Noch nicht zugelost' : player.role}
                 </span>
                 <span className="inline-block px-3 py-0.5 rounded-full bg-zinc-800 text-zinc-300 text-xs font-bold">
-                  Team {player.team}
+                  {player.role === 'unassigned' || !player.role ? 'Lobby-Phase' : `Team ${player.team}`}
                 </span>
                 <p className="text-xs text-zinc-400 max-w-xs mx-auto">
+                  {(player.role === 'unassigned' || !player.role) && 'Das Spiel hat noch nicht begonnen. Deine Rolle wird beim Start des Spiels geheim zugeteilt!'}
                   {player.role === 'Vampir' && 'Du bist ein Vampir. Töte im Geheimen und entkomme den Geisterjägern.'}
                   {player.role === 'Werwolf' && 'Du bist ein Werwolf. Töte rasend schnell während des Vollmonds.'}
                   {player.role === 'Geist' && 'Du bist ein Geist. Schlage nur zu, wenn du mit dem Opfer allein bist.'}

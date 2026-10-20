@@ -38,6 +38,7 @@ import {
   PartyPhoto
 } from '../../types/game';
 import { gameApi } from '../../utils/api';
+import { calculateRoleDistribution, RoleCounts } from '../../utils/roleDistribution';
 
 interface AdminAreaProps {
   gameStatus: GameStatus;
@@ -47,6 +48,7 @@ interface AdminAreaProps {
   kills: KillRecord[];
   photos: PartyPhoto[];
   onStartGame: () => Promise<void>;
+  onReassignRoles: () => Promise<void>;
   onAbortGame: () => Promise<void>;
   onEndGame: () => Promise<void>;
   onRestartGame: (keepPlayers: boolean) => Promise<void>;
@@ -67,6 +69,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   kills,
   photos,
   onStartGame,
+  onReassignRoles,
   onAbortGame,
   onEndGame,
   onRestartGame,
@@ -89,9 +92,19 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   // Restart modal states
   const [isRestartModalOpen, setIsRestartModalOpen] = useState(false);
 
+  // Role distribution & Simulation modal states
+  const [isSimulateModalOpen, setIsSimulateModalOpen] = useState(false);
+  const [simulatePlayerCount, setSimulatePlayerCount] = useState<number>(100);
+  const [isReassignModalOpen, setIsReassignModalOpen] = useState(false);
+  const [isReassigning, setIsReassigning] = useState(false);
+
   // Settings form states
   const [formData, setFormData] = useState({
     adminCode: settings.adminCode || '1031',
+    vampirePercent: settings.vampirePercent ?? 6,
+    werewolfPercent: settings.werewolfPercent ?? 4,
+    ghostPercent: settings.ghostPercent ?? 4,
+    hunterPercent: settings.hunterPercent ?? 10,
     vampireCount: settings.vampireCount || 6,
     werewolfCount: settings.werewolfCount || 4,
     ghostCount: settings.ghostCount || 4,
@@ -122,6 +135,10 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   useEffect(() => {
     setFormData({
       adminCode: settings.adminCode || '1031',
+      vampirePercent: settings.vampirePercent ?? 6,
+      werewolfPercent: settings.werewolfPercent ?? 4,
+      ghostPercent: settings.ghostPercent ?? 4,
+      hunterPercent: settings.hunterPercent ?? 10,
       vampireCount: settings.vampireCount || 6,
       werewolfCount: settings.werewolfCount || 4,
       ghostCount: settings.ghostCount || 4,
@@ -188,6 +205,69 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
       livingGhosts,
     };
   }, [players]);
+
+  const activePlayers = useMemo(() => players.filter((p) => p.status !== 'entfernt'), [players]);
+
+  // Target distribution for current active player count
+  const targetCounts = useMemo(() => {
+    return calculateRoleDistribution(activePlayers.length, {
+      vampirePercent: formData.vampirePercent,
+      werewolfPercent: formData.werewolfPercent,
+      ghostPercent: formData.ghostPercent,
+      hunterPercent: formData.hunterPercent,
+    });
+  }, [activePlayers.length, formData.vampirePercent, formData.werewolfPercent, formData.ghostPercent, formData.hunterPercent]);
+
+  // Actual role counts
+  const actualRoleCounts = useMemo(() => {
+    const counts: Record<string, number> = {
+      Vampir: 0,
+      Werwolf: 0,
+      Geist: 0,
+      Geisterjäger: 0,
+      Mensch: 0,
+      unassigned: 0,
+      Unbekannt: 0,
+    };
+    for (const p of activePlayers) {
+      const r = p.role || 'unassigned';
+      counts[r] = (counts[r] || 0) + 1;
+    }
+    return counts;
+  }, [activePlayers]);
+
+  // Human percent (Rest)
+  const humanPercent = useMemo(() => {
+    return Math.max(0, 100 - (formData.vampirePercent + formData.werewolfPercent + formData.ghostPercent + formData.hunterPercent));
+  }, [formData.vampirePercent, formData.werewolfPercent, formData.ghostPercent, formData.hunterPercent]);
+
+  // Simulations
+  const sim100 = useMemo(() => {
+    return calculateRoleDistribution(100, {
+      vampirePercent: formData.vampirePercent,
+      werewolfPercent: formData.werewolfPercent,
+      ghostPercent: formData.ghostPercent,
+      hunterPercent: formData.hunterPercent,
+    });
+  }, [formData.vampirePercent, formData.werewolfPercent, formData.ghostPercent, formData.hunterPercent]);
+
+  const simCurrent = useMemo(() => {
+    return calculateRoleDistribution(activePlayers.length, {
+      vampirePercent: formData.vampirePercent,
+      werewolfPercent: formData.werewolfPercent,
+      ghostPercent: formData.ghostPercent,
+      hunterPercent: formData.hunterPercent,
+    });
+  }, [activePlayers.length, formData.vampirePercent, formData.werewolfPercent, formData.ghostPercent, formData.hunterPercent]);
+
+  const simCustom = useMemo(() => {
+    return calculateRoleDistribution(simulatePlayerCount, {
+      vampirePercent: formData.vampirePercent,
+      werewolfPercent: formData.werewolfPercent,
+      ghostPercent: formData.ghostPercent,
+      hunterPercent: formData.hunterPercent,
+    });
+  }, [simulatePlayerCount, formData.vampirePercent, formData.werewolfPercent, formData.ghostPercent, formData.hunterPercent]);
 
   // Unconfirmed Kills
   const unconfirmedKills = useMemo(() => {
@@ -362,6 +442,231 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
       {/* ======================================================== */}
       {activeTab === 'control' && (
         <div className="space-y-4">
+          {/* ROLLENVERTEILUNG: SOLL / IST TABELLE */}
+          <div className="p-5 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Users className="w-5 h-5 text-[#ff6b00]" />
+                <div>
+                  <h3 className="font-serif font-bold text-base text-white">Rollenverteilung (Soll / Ist)</h3>
+                  <p className="text-[10px] text-zinc-400">
+                    {activePlayers.length} aktive Spieler im Spiel
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsSimulateModalOpen(true)}
+                className="px-2.5 py-1.5 rounded-xl bg-purple-950/80 hover:bg-purple-900 border border-purple-500/40 text-purple-200 text-[11px] font-bold flex items-center gap-1.5 cursor-pointer transition"
+              >
+                <Sliders className="w-3.5 h-3.5 text-purple-400" />
+                Simulieren
+              </button>
+            </div>
+
+            {/* Soll/Ist Table */}
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="border-b border-zinc-800 text-[10px] uppercase font-bold text-zinc-400">
+                    <th className="py-1.5 px-2">Rolle</th>
+                    <th className="py-1.5 px-2 text-center">Team / Ziel</th>
+                    <th className="py-1.5 px-2 text-center">Soll</th>
+                    <th className="py-1.5 px-2 text-center">Ist</th>
+                    <th className="py-1.5 px-2 text-right">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-800/60 font-medium">
+                  {/* Vampir */}
+                  <tr className="hover:bg-zinc-800/30">
+                    <td className="py-2 px-2 flex items-center gap-1.5">
+                      <span className="text-sm">🧛</span>
+                      <span className="text-rose-300 font-bold">Vampir</span>
+                    </td>
+                    <td className="py-2 px-2 text-center text-[11px] text-rose-400 font-mono">
+                      Böse ({formData.vampirePercent}%)
+                    </td>
+                    <td className="py-2 px-2 text-center font-bold font-mono text-zinc-200">
+                      {targetCounts.Vampir}
+                    </td>
+                    <td className="py-2 px-2 text-center font-black font-mono text-white">
+                      {actualRoleCounts.Vampir}
+                    </td>
+                    <td className="py-2 px-2 text-right font-mono text-[11px]">
+                      {actualRoleCounts.Vampir === targetCounts.Vampir ? (
+                        <span className="inline-flex items-center gap-1 text-emerald-400">
+                          <Check className="w-3.5 h-3.5" /> Passt
+                        </span>
+                      ) : (
+                        <span className="text-amber-400">
+                          {actualRoleCounts.Vampir - targetCounts.Vampir > 0 ? `+${actualRoleCounts.Vampir - targetCounts.Vampir}` : `${actualRoleCounts.Vampir - targetCounts.Vampir}`}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+
+                  {/* Werwolf */}
+                  <tr className="hover:bg-zinc-800/30">
+                    <td className="py-2 px-2 flex items-center gap-1.5">
+                      <span className="text-sm">🐺</span>
+                      <span className="text-amber-300 font-bold">Werwolf</span>
+                    </td>
+                    <td className="py-2 px-2 text-center text-[11px] text-amber-400 font-mono">
+                      Böse ({formData.werewolfPercent}%)
+                    </td>
+                    <td className="py-2 px-2 text-center font-bold font-mono text-zinc-200">
+                      {targetCounts.Werwolf}
+                    </td>
+                    <td className="py-2 px-2 text-center font-black font-mono text-white">
+                      {actualRoleCounts.Werwolf}
+                    </td>
+                    <td className="py-2 px-2 text-right font-mono text-[11px]">
+                      {actualRoleCounts.Werwolf === targetCounts.Werwolf ? (
+                        <span className="inline-flex items-center gap-1 text-emerald-400">
+                          <Check className="w-3.5 h-3.5" /> Passt
+                        </span>
+                      ) : (
+                        <span className="text-amber-400">
+                          {actualRoleCounts.Werwolf - targetCounts.Werwolf > 0 ? `+${actualRoleCounts.Werwolf - targetCounts.Werwolf}` : `${actualRoleCounts.Werwolf - targetCounts.Werwolf}`}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+
+                  {/* Geist */}
+                  <tr className="hover:bg-zinc-800/30">
+                    <td className="py-2 px-2 flex items-center gap-1.5">
+                      <span className="text-sm">👻</span>
+                      <span className="text-purple-300 font-bold">Geist</span>
+                    </td>
+                    <td className="py-2 px-2 text-center text-[11px] text-purple-400 font-mono">
+                      Böse ({formData.ghostPercent}%)
+                    </td>
+                    <td className="py-2 px-2 text-center font-bold font-mono text-zinc-200">
+                      {targetCounts.Geist}
+                    </td>
+                    <td className="py-2 px-2 text-center font-black font-mono text-white">
+                      {actualRoleCounts.Geist}
+                    </td>
+                    <td className="py-2 px-2 text-right font-mono text-[11px]">
+                      {actualRoleCounts.Geist === targetCounts.Geist ? (
+                        <span className="inline-flex items-center gap-1 text-emerald-400">
+                          <Check className="w-3.5 h-3.5" /> Passt
+                        </span>
+                      ) : (
+                        <span className="text-amber-400">
+                          {actualRoleCounts.Geist - targetCounts.Geist > 0 ? `+${actualRoleCounts.Geist - targetCounts.Geist}` : `${actualRoleCounts.Geist - targetCounts.Geist}`}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+
+                  {/* Geisterjäger */}
+                  <tr className="hover:bg-zinc-800/30">
+                    <td className="py-2 px-2 flex items-center gap-1.5">
+                      <span className="text-sm">🏹</span>
+                      <span className="text-blue-300 font-bold">Geisterjäger</span>
+                    </td>
+                    <td className="py-2 px-2 text-center text-[11px] text-blue-400 font-mono">
+                      Gut ({formData.hunterPercent}%)
+                    </td>
+                    <td className="py-2 px-2 text-center font-bold font-mono text-zinc-200">
+                      {targetCounts.Geisterjäger}
+                    </td>
+                    <td className="py-2 px-2 text-center font-black font-mono text-white">
+                      {actualRoleCounts.Geisterjäger}
+                    </td>
+                    <td className="py-2 px-2 text-right font-mono text-[11px]">
+                      {actualRoleCounts.Geisterjäger === targetCounts.Geisterjäger ? (
+                        <span className="inline-flex items-center gap-1 text-emerald-400">
+                          <Check className="w-3.5 h-3.5" /> Passt
+                        </span>
+                      ) : (
+                        <span className="text-amber-400">
+                          {actualRoleCounts.Geisterjäger - targetCounts.Geisterjäger > 0 ? `+${actualRoleCounts.Geisterjäger - targetCounts.Geisterjäger}` : `${actualRoleCounts.Geisterjäger - targetCounts.Geisterjäger}`}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+
+                  {/* Mensch */}
+                  <tr className="hover:bg-zinc-800/30">
+                    <td className="py-2 px-2 flex items-center gap-1.5">
+                      <span className="text-sm">👤</span>
+                      <span className="text-zinc-200 font-bold">Mensch</span>
+                    </td>
+                    <td className="py-2 px-2 text-center text-[11px] text-zinc-400 font-mono">
+                      Gut ({humanPercent}%)
+                    </td>
+                    <td className="py-2 px-2 text-center font-bold font-mono text-zinc-200">
+                      {targetCounts.Mensch}
+                    </td>
+                    <td className="py-2 px-2 text-center font-black font-mono text-white">
+                      {actualRoleCounts.Mensch}
+                    </td>
+                    <td className="py-2 px-2 text-right font-mono text-[11px]">
+                      {actualRoleCounts.Mensch === targetCounts.Mensch ? (
+                        <span className="inline-flex items-center gap-1 text-emerald-400">
+                          <Check className="w-3.5 h-3.5" /> Passt
+                        </span>
+                      ) : (
+                        <span className="text-amber-400">
+                          {actualRoleCounts.Mensch - targetCounts.Mensch > 0 ? `+${actualRoleCounts.Mensch - targetCounts.Mensch}` : `${actualRoleCounts.Mensch - targetCounts.Mensch}`}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+
+                  {/* Unassigned row if any */}
+                  {actualRoleCounts.unassigned > 0 && (
+                    <tr className="bg-amber-950/20 text-amber-300">
+                      <td className="py-2 px-2 flex items-center gap-1.5">
+                        <span className="text-sm">⏳</span>
+                        <span className="font-bold">Noch ohne Rolle</span>
+                      </td>
+                      <td className="py-2 px-2 text-center text-[11px] text-amber-400/80 font-mono">
+                        Lobby / Beitritt
+                      </td>
+                      <td className="py-2 px-2 text-center font-bold font-mono text-zinc-400">-</td>
+                      <td className="py-2 px-2 text-center font-black font-mono text-amber-400">
+                        {actualRoleCounts.unassigned}
+                      </td>
+                      <td className="py-2 px-2 text-right font-mono text-[11px] text-amber-400 font-bold">
+                        Offen
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Reassign Button */}
+            <div className="pt-2 border-t border-zinc-800 flex gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  if (gameStatus === 'Läuft') {
+                    setIsReassignModalOpen(true);
+                  } else {
+                    if (confirm(`Möchtest du die Rollen für alle ${activePlayers.length} Spieler jetzt neu verteilen?`)) {
+                      onReassignRoles();
+                    }
+                  }
+                }}
+                disabled={activePlayers.length === 0}
+                className={`w-full py-2.5 rounded-xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer transition ${
+                  gameStatus === 'Läuft'
+                    ? 'bg-rose-950/80 hover:bg-rose-900 border border-rose-600 text-rose-200'
+                    : 'bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200'
+                }`}
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Rollen neu verteilen
+                {gameStatus === 'Läuft' && <span className="text-[10px] text-rose-400 font-normal">(Warnung)</span>}
+              </button>
+            </div>
+          </div>
+
           <div className="p-5 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3">
             <h3 className="font-serif font-bold text-base text-white">Spielsteuerung</h3>
 
@@ -704,6 +1009,92 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
             />
           </div>
 
+          {/* Rollen-Zielanteile in Prozent */}
+          <div className="pt-2 border-t border-zinc-800 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold uppercase tracking-wider text-zinc-400 block">
+                Rollen-Zielanteile (%)
+              </span>
+              <button
+                type="button"
+                onClick={() => setIsSimulateModalOpen(true)}
+                className="text-[10px] text-purple-400 hover:text-purple-300 font-bold underline flex items-center gap-1 cursor-pointer"
+              >
+                <Sliders className="w-3 h-3" />
+                Verteilung simulieren
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div>
+                <label className="block text-[11px] text-zinc-400 mb-1">🧛 Vampir-Anteil (%):</label>
+                <input
+                  type="number"
+                  min="0"
+                  max="40"
+                  value={formData.vampirePercent}
+                  onChange={(e) => setFormData({ ...formData, vampirePercent: Number(e.target.value) })}
+                  className="w-full px-3 py-1.5 rounded-xl bg-zinc-950 border border-zinc-700 text-white font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-zinc-400 mb-1">🐺 Werwolf-Anteil (%):</label>
+                <input
+                  type="number"
+                  min="0"
+                  max="40"
+                  value={formData.werewolfPercent}
+                  onChange={(e) => setFormData({ ...formData, werewolfPercent: Number(e.target.value) })}
+                  className="w-full px-3 py-1.5 rounded-xl bg-zinc-950 border border-zinc-700 text-white font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-zinc-400 mb-1">👻 Geist-Anteil (%):</label>
+                <input
+                  type="number"
+                  min="0"
+                  max="40"
+                  value={formData.ghostPercent}
+                  onChange={(e) => setFormData({ ...formData, ghostPercent: Number(e.target.value) })}
+                  className="w-full px-3 py-1.5 rounded-xl bg-zinc-950 border border-zinc-700 text-white font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-zinc-400 mb-1">🏹 Geisterjäger (%):</label>
+                <input
+                  type="number"
+                  min="0"
+                  max="40"
+                  value={formData.hunterPercent}
+                  onChange={(e) => setFormData({ ...formData, hunterPercent: Number(e.target.value) })}
+                  className="w-full px-3 py-1.5 rounded-xl bg-zinc-950 border border-zinc-700 text-white font-bold"
+                />
+              </div>
+            </div>
+
+            {/* Calculated Human Rest & Warning */}
+            <div
+              className={`p-2.5 rounded-xl border text-xs flex items-center justify-between ${
+                humanPercent < 40
+                  ? 'bg-amber-950/80 border-amber-500 text-amber-200'
+                  : 'bg-zinc-950 border-zinc-800 text-zinc-300'
+              }`}
+            >
+              <div>
+                <span className="font-bold">👤 Mensch-Anteil (Rest):</span>{' '}
+                <span className="font-mono font-bold text-white text-sm">{humanPercent}%</span>
+              </div>
+              {humanPercent < 40 && (
+                <span className="text-[10px] text-amber-400 font-bold flex items-center gap-1">
+                  <AlertTriangle className="w-3.5 h-3.5" /> Mindestens 40% empfohlen!
+                </span>
+              )}
+            </div>
+          </div>
+
           {/* Cooldowns & Zeiten */}
           <div className="pt-2 border-t border-zinc-800 space-y-2.5">
             <span className="text-xs font-bold uppercase tracking-wider text-zinc-400 block">
@@ -913,6 +1304,214 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
                 Abbrechen
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* REASSIGN CONFIRMATION MODAL (Warning in running game) */}
+      {isReassignModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90 backdrop-blur-md animate-in fade-in">
+          <div className="w-full max-w-sm rounded-3xl bg-zinc-950 border-2 border-rose-600 p-5 shadow-2xl space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 rounded-2xl bg-rose-600/20 text-rose-400 border border-rose-500/30">
+                <AlertTriangle className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="font-serif font-bold text-white text-base">Achtung: Spiel läuft!</h3>
+                <p className="text-[11px] text-rose-300">Rollen im laufenden Spiel neu verteilen</p>
+              </div>
+            </div>
+
+            <p className="text-xs text-zinc-300 leading-relaxed">
+              Möchtest du die Rollen für alle <strong>{activePlayers.length} Spieler</strong> wirklich neu verteilen?
+              Alle aktuellen Rollen werden überschrieben und den Spielern sofort neu zugewiesen.
+            </p>
+
+            <div className="space-y-2 pt-1">
+              <button
+                disabled={isReassigning}
+                onClick={async () => {
+                  setIsReassigning(true);
+                  try {
+                    await onReassignRoles();
+                    setIsReassignModalOpen(false);
+                  } finally {
+                    setIsReassigning(false);
+                  }
+                }}
+                className="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs uppercase tracking-wider shadow-lg shadow-rose-950 cursor-pointer transition"
+              >
+                {isReassigning ? 'Verteile neu...' : 'Ja, Rollen jetzt neu verteilen'}
+              </button>
+              <button
+                disabled={isReassigning}
+                onClick={() => setIsReassignModalOpen(false)}
+                className="w-full py-2.5 text-zinc-400 hover:text-white text-xs cursor-pointer"
+              >
+                Abbrechen
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* SIMULATE MODAL */}
+      {isSimulateModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-in fade-in">
+          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-3xl bg-zinc-950 border border-zinc-800 p-5 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
+              <div className="flex items-center gap-2">
+                <div className="p-2 rounded-xl bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                  <Sliders className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-serif font-bold text-white text-base">Rollenverteilung simulieren</h3>
+                  <p className="text-[10px] text-zinc-400">Reine Browser-Berechnung, keine Datenänderung</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsSimulateModalOpen(false)}
+                className="p-1.5 rounded-full bg-zinc-800 text-zinc-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* TABELLE 1: 100 SPIELER (REFERENZ) */}
+            <div className="p-4 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-white uppercase tracking-wider">
+                  Referenz: 100 Spieler
+                </span>
+                <span className="text-[10px] font-mono text-purple-400 font-bold">100% Verteilung</span>
+              </div>
+              <div className="grid grid-cols-5 gap-1.5 text-center text-xs">
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-800">
+                  <span className="text-[10px] text-rose-400 block font-bold">🧛 Vampir</span>
+                  <span className="font-mono font-bold text-white">{sim100.Vampir}</span>
+                  <span className="text-[9px] text-zinc-400 block">{formData.vampirePercent}%</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-800">
+                  <span className="text-[10px] text-amber-400 block font-bold">🐺 Werwolf</span>
+                  <span className="font-mono font-bold text-white">{sim100.Werwolf}</span>
+                  <span className="text-[9px] text-zinc-400 block">{formData.werewolfPercent}%</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-800">
+                  <span className="text-[10px] text-purple-400 block font-bold">👻 Geist</span>
+                  <span className="font-mono font-bold text-white">{sim100.Geist}</span>
+                  <span className="text-[9px] text-zinc-400 block">{formData.ghostPercent}%</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-800">
+                  <span className="text-[10px] text-blue-400 block font-bold">🏹 Jäger</span>
+                  <span className="font-mono font-bold text-white">{sim100.Geisterjäger}</span>
+                  <span className="text-[9px] text-zinc-400 block">{formData.hunterPercent}%</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-800">
+                  <span className="text-[10px] text-zinc-300 block font-bold">👤 Mensch</span>
+                  <span className="font-mono font-bold text-white">{sim100.Mensch}</span>
+                  <span className="text-[9px] text-zinc-400 block">{humanPercent}%</span>
+                </div>
+              </div>
+            </div>
+
+            {/* TABELLE 2: AKTUELLE SPIELERZAHL */}
+            <div className="p-4 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-white uppercase tracking-wider">
+                  Aktuelle Spieleranzahl ({activePlayers.length} Spieler)
+                </span>
+                <span className="text-[10px] text-zinc-400">Ist vs. Soll</span>
+              </div>
+              <div className="grid grid-cols-5 gap-1.5 text-center text-xs">
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-800">
+                  <span className="text-[10px] text-rose-400 block font-bold">🧛 Vampir</span>
+                  <span className="font-mono font-bold text-white">{simCurrent.Vampir}</span>
+                  <span className="text-[9px] text-zinc-500 block">Ist: {actualRoleCounts.Vampir}</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-800">
+                  <span className="text-[10px] text-amber-400 block font-bold">🐺 Werwolf</span>
+                  <span className="font-mono font-bold text-white">{simCurrent.Werwolf}</span>
+                  <span className="text-[9px] text-zinc-500 block">Ist: {actualRoleCounts.Werwolf}</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-800">
+                  <span className="text-[10px] text-purple-400 block font-bold">👻 Geist</span>
+                  <span className="font-mono font-bold text-white">{simCurrent.Geist}</span>
+                  <span className="text-[9px] text-zinc-500 block">Ist: {actualRoleCounts.Geist}</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-800">
+                  <span className="text-[10px] text-blue-400 block font-bold">🏹 Jäger</span>
+                  <span className="font-mono font-bold text-white">{simCurrent.Geisterjäger}</span>
+                  <span className="text-[9px] text-zinc-500 block">Ist: {actualRoleCounts.Geisterjäger}</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-800">
+                  <span className="text-[10px] text-zinc-300 block font-bold">👤 Mensch</span>
+                  <span className="font-mono font-bold text-white">{simCurrent.Mensch}</span>
+                  <span className="text-[9px] text-zinc-500 block">Ist: {actualRoleCounts.Mensch}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* INTERAKTIVER SIMULATOR */}
+            <div className="p-4 rounded-2xl bg-zinc-900/90 border border-zinc-800 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-white uppercase tracking-wider">
+                  Beliebige Spielerzahl testen
+                </span>
+                <span className="font-mono font-black text-sm text-[#ff6b00]">
+                  {simulatePlayerCount} Spieler
+                </span>
+              </div>
+
+              <input
+                type="range"
+                min="2"
+                max="150"
+                value={simulatePlayerCount}
+                onChange={(e) => setSimulatePlayerCount(Number(e.target.value))}
+                className="w-full accent-[#ff6b00] cursor-pointer"
+              />
+
+              <div className="grid grid-cols-5 gap-1.5 text-center text-xs">
+                <div className="p-2 rounded-xl bg-zinc-950 border border-rose-500/20">
+                  <span className="text-[10px] text-rose-400 block font-bold">Vampir</span>
+                  <span className="font-mono font-bold text-white text-sm">{simCustom.Vampir}</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-amber-500/20">
+                  <span className="text-[10px] text-amber-400 block font-bold">Werwolf</span>
+                  <span className="font-mono font-bold text-white text-sm">{simCustom.Werwolf}</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-purple-500/20">
+                  <span className="text-[10px] text-purple-400 block font-bold">Geist</span>
+                  <span className="font-mono font-bold text-white text-sm">{simCustom.Geist}</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-blue-500/20">
+                  <span className="text-[10px] text-blue-400 block font-bold">Jäger</span>
+                  <span className="font-mono font-bold text-white text-sm">{simCustom.Geisterjäger}</span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950 border border-zinc-700">
+                  <span className="text-[10px] text-zinc-300 block font-bold">Mensch</span>
+                  <span className="font-mono font-bold text-white text-sm">{simCustom.Mensch}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* REGEL-ERLÄUTERUNG */}
+            <div className="p-3 rounded-2xl bg-zinc-900 border border-zinc-800 text-[11px] text-zinc-400 space-y-1 leading-relaxed">
+              <span className="font-bold text-zinc-200 block text-xs">Hinterlegte Verteilungsregeln:</span>
+              <p>• <strong>2 Spieler:</strong> 1 Vampir, 1 Geisterjäger</p>
+              <p>• <strong>3 Spieler:</strong> 1 Vampir, 1 Geisterjäger, 1 Mensch</p>
+              <p>• <strong>4 Spieler:</strong> 1 Vampir, 1 Werwolf, 1 Geisterjäger, 1 Mensch</p>
+              <p>• <strong>5 Spieler:</strong> 1 Vampir, 1 Werwolf, 1 Geist, 1 Geisterjäger, 1 Mensch</p>
+              <p>• <strong>ab 6 Spielern:</strong> Prozentrechnung mit Mindestanzahl 1 pro Sonderrolle. Menschen machen nie weniger als 40% aus.</p>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setIsSimulateModalOpen(false)}
+              className="w-full py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-white font-bold text-xs cursor-pointer"
+            >
+              Schließen
+            </button>
           </div>
         </div>
       )}
