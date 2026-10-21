@@ -97,8 +97,7 @@ class GameApiClient {
     taskId: string;
     taskTitle: string;
     photoBlobOrUrl: Blob | File | string;
-    taggedPlayerIds: string[];
-  }): Promise<{ pointsAwarded: number; bonusPointsTotal: number }> {
+  }): Promise<{ pointsAwarded: number }> {
     return supabaseService.completePhotoTask(params);
   }
 
@@ -116,8 +115,11 @@ class GameApiClient {
     return supabaseService.completeSpecialTask(params);
   }
 
-  async deletePhoto(adminCode: string, photoId: string): Promise<void> {
-    return supabaseService.deletePhoto(adminCode, photoId);
+  async deletePhoto(options: { photoId: string; playerId?: string; adminCode?: string } | string, photoIdParam?: string): Promise<void> {
+    if (typeof options === 'string') {
+      return supabaseService.deletePhoto({ adminCode: options, photoId: photoIdParam || '' });
+    }
+    return supabaseService.deletePhoto(options);
   }
 
   public isFullMoonActive(gameState: any): boolean {

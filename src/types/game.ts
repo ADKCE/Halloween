@@ -53,9 +53,11 @@ export interface GameSettings {
   // Punkte
   pointsPhotoTask: number; // Standard: 10
   pointsSpecialTask: number; // Standard: 20
-  pointsTaggedCoPlayer: number; // Standard: 2
   pointsEvilKill: number; // Standard: 15
   pointsExorcismSuccess: number; // Standard: 25
+
+  // Download-Freischaltung für Fotos
+  photoDownloadUnlocked?: 'ended' | 'always'; // Standard: 'ended' (ab Spielende), alternativ 'always' (sofort)
 
   // Spezialaufgaben (für Menschen)
   specialTaskIntervalMinMinutes: number; // Standard: 10
@@ -161,11 +163,10 @@ export interface PartyTask {
 export interface TaskCompletion {
   id: string;
   taskId: string;
+  taskTitle?: string;
   playerId: string;
   playerName: string;
   photoUrl?: string;
-  taggedPlayerIds?: string[];
-  taggedPlayerNames?: string[];
   pointsAwarded: number;
   completedAt: string;
 }
@@ -174,10 +175,10 @@ export interface PartyPhoto {
   id: string;
   photoUrl: string;
   taskId?: string;
+  taskTitle?: string;
   caption?: string;
   playerId?: string;
   photographerName?: string;
-  taggedPlayerNames?: string[];
   createdAt: string;
 }
 

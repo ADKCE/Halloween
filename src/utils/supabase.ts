@@ -56,9 +56,9 @@ export const DEFAULT_GAME_SETTINGS: GameSettings = {
   fullMoonDurationMinutes: 5,
   pointsPhotoTask: 10,
   pointsSpecialTask: 20,
-  pointsTaggedCoPlayer: 2,
   pointsEvilKill: 15,
   pointsExorcismSuccess: 25,
+  photoDownloadUnlocked: 'ended',
   specialTaskIntervalMinMinutes: 10,
   specialTaskIntervalMaxMinutes: 20,
 };
@@ -418,11 +418,10 @@ class SupabaseService {
       const mappedCompletions: TaskCompletion[] = (completionsData || []).map((c: any) => ({
         id: c.id,
         taskId: c.task_id,
+        taskTitle: c.task_title || '',
         playerId: c.player_id,
         playerName: c.player_name,
         photoUrl: c.photo_url,
-        taggedPlayerIds: c.tagged_player_ids || [],
-        taggedPlayerNames: c.tagged_player_names || [],
         pointsAwarded: c.points_awarded || 10,
         completedAt: c.completed_at,
       }));
@@ -432,16 +431,16 @@ class SupabaseService {
         .from('photos')
         .select('*')
         .order('created_at', { ascending: false })
-        .limit(100);
+        .limit(200);
 
       const mappedPhotos: PartyPhoto[] = (photosData || []).map((ph: any) => ({
         id: ph.id,
         photoUrl: ph.photo_url,
         taskId: ph.task_id,
-        caption: ph.caption,
+        taskTitle: ph.task_title || ph.caption || 'Foto-Aufgabe',
+        caption: ph.caption || ph.task_title || 'Foto-Aufgabe',
         playerId: ph.player_id,
-        photographerName: ph.photographer_name,
-        taggedPlayerNames: ph.tagged_player_names || [],
+        photographerName: ph.photographer_name || 'Gast',
         createdAt: ph.created_at,
       }));
 
@@ -1422,14 +1421,13 @@ class SupabaseService {
     await client.from('kills').delete().eq('id', killId);
   }
 
-  // --- PHOTO TASKS (2 open tasks per player with tagged co-players) ---
+  // --- PHOTO TASKS (Upload photo for task without tagging) ---
   public async completePhotoTask(params: {
     playerId: string;
     taskId: string;
     taskTitle: string;
     photoBlobOrUrl: Blob | File | string;
-    taggedPlayerIds: string[];
-  }): Promise<{ pointsAwarded: number; bonusPointsTotal: number }> {
+  }): Promise<{ pointsAwarded: number }> {
     const client = this.getClient();
     if (!client) throw new Error('Supabase nicht verfügbar');
 
@@ -1440,41 +1438,21 @@ class SupabaseService {
     if (!player) throw new Error('Spieler nicht gefunden');
 
     const uploadedPhotoUrl = await this.uploadPhoto(params.photoBlobOrUrl, 'task');
-
-    // Resolve tagged player names
-    const taggedIds = params.taggedPlayerIds || [];
-    let taggedNames: string[] = [];
-    if (taggedIds.length > 0) {
-      const { data: taggedList } = await client.from('players').select('id, name, points').in('id', taggedIds);
-      if (taggedList) {
-        taggedNames = taggedList.map((p) => p.name);
-        // Award 2 bonus points to each tagged co-player
-        const bonusPts = settings.pointsTaggedCoPlayer || 2;
-        for (const tp of taggedList) {
-          await client
-            .from('players')
-            .update({
-              points: (tp.points || 0) + bonusPts,
-            })
-            .eq('id', tp.id);
-        }
-      }
-    }
-
     const taskPoints = settings.pointsPhotoTask || 10;
 
-    // 1. Insert completion
-    await client.from('task_completions').insert([
+    // 1. Insert completion (keine getaggten Personen)
+    const { error: completionErr } = await client.from('task_completions').insert([
       {
         task_id: params.taskId,
         player_id: player.id,
         player_name: player.name,
         photo_url: uploadedPhotoUrl || null,
-        tagged_player_ids: taggedIds,
-        tagged_player_names: taggedNames,
         points_awarded: taskPoints,
       },
     ]);
+    if (completionErr) {
+      console.warn('task_completions insert Hinweis:', completionErr.message);
+    }
 
     // 2. Award main player points
     await this.safeUpdatePlayer(
@@ -1486,23 +1464,25 @@ class SupabaseService {
       ['points']
     );
 
-    // 3. Add to party photo gallery
+    // 3. Add to party photo gallery (Aufgabe, Uhrzeit, Fotograf)
     if (uploadedPhotoUrl) {
-      await client.from('photos').insert([
+      const { error: photoErr } = await client.from('photos').insert([
         {
           photo_url: uploadedPhotoUrl,
           task_id: params.taskId,
-          caption: `Aufgabe "${params.taskTitle}" gelöst von ${player.name}`,
+          caption: params.taskTitle,
           player_id: player.id,
           photographer_name: player.name,
-          tagged_player_names: taggedNames,
         },
       ]);
+      if (photoErr) {
+        this.lastError = `Galerie-Eintrag fehlgeschlagen: ${photoErr.message}`;
+        console.warn('photos insert Fehler:', photoErr.message);
+      }
     }
 
     return {
       pointsAwarded: taskPoints,
-      bonusPointsTotal: taggedIds.length * (settings.pointsTaggedCoPlayer || 2),
     };
   }
 
@@ -1657,15 +1637,54 @@ class SupabaseService {
     return { startsInMinutes: diffMin, durationMinutes: durationMin };
   }
 
-  // --- DELETE PHOTO (ADMIN) ---
-  public async deletePhoto(adminCode: string, photoId: string): Promise<void> {
-    const isValid = await this.verifyAdminCode(adminCode);
-    if (!isValid) throw new Error('Ungültiger Admin-Code');
-
+  // --- DELETE PHOTO (Fotograf oder Admin) ---
+  public async deletePhoto(options: { photoId: string; playerId?: string; adminCode?: string }): Promise<void> {
     const client = this.getClient();
     if (!client) throw new Error('Supabase nicht verfügbar');
 
-    await client.from('photos').delete().eq('id', photoId);
+    // 1. Serverseitige Prüfung per Postgres RPC falls vorhanden
+    try {
+      const { data: rpcSuccess, error: rpcErr } = await client.rpc('delete_photo', {
+        p_photo_id: options.photoId,
+        p_player_id: options.playerId || null,
+        p_admin_code: options.adminCode || null,
+      });
+      if (!rpcErr && rpcSuccess) {
+        return;
+      }
+    } catch {
+      // Fallback auf direkte Abfrage
+    }
+
+    // 2. Direkte Prüfung und Löschung
+    if (options.adminCode) {
+      const isValid = await this.verifyAdminCode(options.adminCode);
+      if (!isValid) throw new Error('Ungültiger Admin-Code');
+      const { error: delErr } = await client.from('photos').delete().eq('id', options.photoId);
+      if (delErr) throw new Error(`Löschen fehlgeschlagen: ${delErr.message}`);
+      return;
+    }
+
+    if (options.playerId) {
+      const { data: existing, error: fetchErr } = await client
+        .from('photos')
+        .select('player_id')
+        .eq('id', options.photoId)
+        .single();
+      if (fetchErr) throw new Error(`Foto nicht gefunden: ${fetchErr.message}`);
+      if (existing?.player_id !== options.playerId) {
+        throw new Error('Du kannst nur Fotos löschen, die du selbst hochgeladen hast!');
+      }
+      const { error: delErr } = await client
+        .from('photos')
+        .delete()
+        .eq('id', options.photoId)
+        .eq('player_id', options.playerId);
+      if (delErr) throw new Error(`Löschen fehlgeschlagen: ${delErr.message}`);
+      return;
+    }
+
+    throw new Error('Keine Berechtigung zum Löschen des Fotos');
   }
 
   // --- SUBSCRIBE TO REALTIME ---
