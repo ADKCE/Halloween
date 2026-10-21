@@ -84,6 +84,10 @@ class GameApiClient {
     return supabaseService.confirmKill(killId, false);
   }
 
+  async reportSelfDeath(playerId: string, killerRole?: string): Promise<{ confirmedExisting: boolean; message: string }> {
+    return supabaseService.reportSelfDeath(playerId, killerRole);
+  }
+
   async adminUndoKill(adminCode: string, killId: string): Promise<void> {
     return supabaseService.adminUndoKill(adminCode, killId);
   }

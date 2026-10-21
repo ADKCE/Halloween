@@ -91,7 +91,7 @@ export interface KillRecord {
   victimRole?: RoleType;
   victimTeam?: TeamType;
   killerTeam?: TeamType;
-  reason?: 'kill' | 'exorcism';
+  reason?: 'kill' | 'exorcism' | 'self_reported' | string;
   exorcismHit?: boolean; // War Exorzismus Treffer (Opfer böse)?
   ghostSoloConfirmed?: boolean; // Für Geister
   createdAt: string;

@@ -45,6 +45,7 @@ import { PhotoTaskModal } from './PhotoTaskModal';
 import { SpecialTaskCard } from './SpecialTaskCard';
 import { FullMoonBanner } from './FullMoonBanner';
 import { KillNotificationModal } from './KillNotificationModal';
+import { SelfDeathModal } from './SelfDeathModal';
 import { GameEndView } from './GameEndView';
 import { gameApi } from '../../utils/api';
 
@@ -59,6 +60,7 @@ interface PlayerAreaProps {
   photos: PartyPhoto[];
   onLogoutDevice: () => void;
   onRefreshState: () => Promise<void>;
+  onSelfReportDeath: (killerRole: string) => Promise<void>;
 }
 
 export const PlayerArea: React.FC<PlayerAreaProps> = ({
@@ -72,6 +74,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   photos,
   onLogoutDevice,
   onRefreshState,
+  onSelfReportDeath,
 }) => {
   // Main Navigation Tabs: 1. "actions" (Aktionen) | 2. "tasks" (Aufgaben) | 3. "ranking" (Ranking) | 4. "profile" (Profil & Regeln)
   const [activeTab, setActiveTab] = useState<'actions' | 'tasks' | 'ranking' | 'profile'>('actions');
@@ -81,6 +84,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
 
   // Modals
   const [isKillModalOpen, setIsKillModalOpen] = useState(false);
+  const [isSelfDeathModalOpen, setIsSelfDeathModalOpen] = useState(false);
   const [activeTaskModal, setActiveTaskModal] = useState<{ id: string; title: string; desc: string } | null>(null);
 
   // Special task for humans
@@ -91,7 +95,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   const [gracePeriodSeconds, setGracePeriodSeconds] = useState<number>(0);
 
   // Filter/Search in Ranking
-  const [rankingFilter, setRankingFilter] = useState<'all' | 'dead'>('all');
+  const [rankingFilter, setRankingFilter] = useState<'all' | 'dead' | 'kills'>('all');
   const [playerSearchTerm, setPlayerSearchTerm] = useState('');
 
   // Check if player has pending kill on themselves
@@ -231,8 +235,11 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   // Handlers
   const handleConfirmKillOnSelf = async () => {
     if (!pendingKillOnSelf) return;
-    await gameApi.confirmKill(pendingKillOnSelf.id);
-    await onRefreshState();
+    await onSelfReportDeath('Unbekannt');
+  };
+
+  const handleSelfReportDeath = async (killerRole: string) => {
+    await onSelfReportDeath(killerRole);
   };
 
   const handleReportKill = async (victimId: string, ghostSoloConfirmed?: boolean) => {
@@ -384,17 +391,32 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
         />
       )}
 
-      {/* 3. DEAD PLAYER BANNER */}
+      {/* 3. DEAD PLAYER BANNER / ZUSCHAUER-MODUS */}
       {isDead && (
-        <div className="p-4 rounded-3xl bg-gradient-to-r from-purple-950 to-zinc-950 border-2 border-purple-600/80 shadow-xl space-y-1 text-center">
+        <div className="p-5 rounded-3xl bg-gradient-to-b from-purple-950/90 via-zinc-950 to-zinc-950 border-2 border-purple-600/80 shadow-2xl space-y-3 text-center animate-in fade-in">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-purple-500/20 text-purple-300 text-xs font-black uppercase tracking-wider">
-            <Skull className="w-4 h-4" />
-            Totenreich
+            <Skull className="w-4 h-4 text-purple-400" />
+            Totenreich • Zuschauer-Modus
           </div>
-          <h3 className="text-xl font-serif font-black text-white">Du bist tot!</h3>
-          <p className="text-xs text-zinc-300 max-w-xs mx-auto">
-            Du darfst deine Rolle verraten. Bleibe im Spiel als Zuschauer und sammle Punkte für das Totenreich-Ranking!
+          <h3 className="text-2xl font-serif font-black text-white">Du bist tot!</h3>
+          <p className="text-xs text-zinc-300 max-w-sm mx-auto leading-relaxed">
+            Du scheidest aus dem aktiven Jagen und Töten aus, bleibst aber als <strong className="text-purple-300">Zuschauer</strong> voll im Spielgeschehen!
           </p>
+
+          <div className="grid grid-cols-2 gap-2 text-left pt-1">
+            <div className="p-2.5 rounded-2xl bg-zinc-900/90 border border-purple-500/30 text-[11px] text-zinc-300 space-y-1">
+              <span className="font-bold text-purple-300 block">👁️ Rollen aufdecken:</span>
+              <p className="text-[10px] text-zinc-400 leading-tight">Deine Rolle ({player.role}) ist kein Geheimnis mehr. Du darfst sie jetzt offen verraten!</p>
+            </div>
+            <div className="p-2.5 rounded-2xl bg-zinc-900/90 border border-purple-500/30 text-[11px] text-zinc-300 space-y-1">
+              <span className="font-bold text-amber-300 block">📸 Foto-Punkte:</span>
+              <p className="text-[10px] text-zinc-400 leading-tight">Löse Foto-Aufgaben im Tab "Aufgaben", um Punkte im Totenreich-Ranking zu sammeln!</p>
+            </div>
+          </div>
+
+          <div className="p-2 rounded-xl bg-zinc-900/60 border border-zinc-800 text-[10px] text-zinc-400">
+            Der Spielleiter/Admin kann dich im Admin-Bereich jederzeit <span className="text-emerald-400 font-bold">wiederbeleben</span>.
+          </div>
         </div>
       )}
 
@@ -665,6 +687,23 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                 </div>
               </div>
             )}
+
+            {/* BUTTON "ICH WURDE GETÖTET" (IM TAB AKTIONEN) */}
+            {!isDead && (
+              <div className="pt-3 border-t border-zinc-800 space-y-1.5">
+                <button
+                  type="button"
+                  onClick={() => setIsSelfDeathModalOpen(true)}
+                  className="w-full py-3.5 rounded-2xl bg-zinc-950 hover:bg-rose-950/40 border border-zinc-700 hover:border-rose-500/70 text-zinc-200 hover:text-rose-200 font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 shadow-sm"
+                >
+                  <Skull className="w-4 h-4 text-rose-500" />
+                  <span>Ich wurde getötet (Selbstmeldung)</span>
+                </button>
+                <p className="text-[10px] text-zinc-500 text-center">
+                  Tippe hier, wenn dich jemand berührt und angeflüstert hat.
+                </p>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -793,32 +832,85 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
             </div>
           </div>
 
-          {/* Ranking Sub-Filter: All or Totenreich */}
-          <div className="flex rounded-2xl bg-zinc-900 p-1 border border-zinc-800 text-xs font-bold">
+          {/* Ranking Sub-Filter: All, Totenreich or Kill-Log */}
+          <div className="flex rounded-2xl bg-zinc-900 p-1 border border-zinc-800 text-xs font-bold gap-1">
             <button
               onClick={() => setRankingFilter('all')}
-              className={`flex-1 py-1.5 rounded-xl transition cursor-pointer ${
+              className={`flex-1 py-1.5 rounded-xl transition cursor-pointer text-center ${
                 rankingFilter === 'all'
                   ? 'bg-[#ff6b00] text-zinc-950 font-black'
                   : 'text-zinc-400 hover:text-white'
               }`}
             >
-              Top 20 Gesamt
+              Top 20
             </button>
             <button
               onClick={() => setRankingFilter('dead')}
-              className={`flex-1 py-1.5 rounded-xl transition cursor-pointer ${
+              className={`flex-1 py-1.5 rounded-xl transition cursor-pointer text-center ${
                 rankingFilter === 'dead'
                   ? 'bg-purple-600 text-white font-black'
                   : 'text-zinc-400 hover:text-white'
               }`}
             >
-              Totenreich-Ranking
+              Totenreich
+            </button>
+            <button
+              onClick={() => setRankingFilter('kills')}
+              className={`flex-1 py-1.5 rounded-xl transition cursor-pointer text-center ${
+                rankingFilter === 'kills'
+                  ? 'bg-rose-600 text-white font-black'
+                  : 'text-zinc-400 hover:text-white'
+              }`}
+            >
+              Kill-Log ({kills.filter((k) => k.confirmed).length})
             </button>
           </div>
 
-          {/* Player list (Top 20, roles hidden!) */}
-          <div className="space-y-1.5 max-h-[460px] overflow-y-auto pr-1">
+          {/* KILL-LOG VIEW */}
+          {rankingFilter === 'kills' ? (
+            <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
+              {kills.filter((k) => k.confirmed).length === 0 ? (
+                <div className="p-6 text-center text-xs text-zinc-500 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-1">
+                  <Skull className="w-6 h-6 mx-auto text-zinc-600" />
+                  <p>Bisher wurden keine Kills gemeldet. Alle Gäste leben noch!</p>
+                </div>
+              ) : (
+                kills
+                  .filter((k) => k.confirmed)
+                  .map((k) => (
+                    <div
+                      key={k.id}
+                      className="p-3 rounded-2xl bg-zinc-900/90 border border-zinc-800 space-y-1 text-xs"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-white flex items-center gap-1.5">
+                          <Skull className="w-3.5 h-3.5 text-rose-500" />
+                          <span>{k.victimName} wurde getötet</span>
+                        </span>
+                        <span className="text-[10px] text-zinc-400 font-mono">
+                          {new Date(k.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-zinc-400 flex items-center justify-between">
+                        <span>
+                          Täter: <strong className="text-rose-300">{k.killerName || 'Unbekannt'}</strong>
+                          {k.killerRole && k.killerRole !== 'Unbekannt' && ` (${k.killerRole})`}
+                        </span>
+                        <span className="text-[10px] text-zinc-500">
+                          {k.reason === 'self_reported'
+                            ? 'Selbstmeldung'
+                            : k.reason === 'exorcism'
+                            ? 'Exorzismus'
+                            : 'Angriff'}
+                        </span>
+                      </div>
+                    </div>
+                  ))
+              )}
+            </div>
+          ) : (
+            /* Player list (Top 20, roles hidden!) */
+            <div className="space-y-1.5 max-h-[460px] overflow-y-auto pr-1">
             {(rankingFilter === 'all' ? overallRanking.slice(0, 20) : deadRanking).map((p, idx) => (
               <div
                 key={p.id}
@@ -871,6 +963,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
               </div>
             ))}
           </div>
+          )}
         </div>
       )}
 
@@ -923,6 +1016,27 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
               </div>
             )}
           </div>
+
+          {/* BUTTON "ICH WURDE GETÖTET" (IM TAB PROFIL) */}
+          {!isDead && (
+            <div className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-2">
+              <div className="flex items-center gap-2 text-rose-400 font-bold text-xs">
+                <Skull className="w-4 h-4 text-rose-500" />
+                <span>Wurdest du im echten Leben erwischt?</span>
+              </div>
+              <p className="text-[11px] text-zinc-400 leading-relaxed">
+                Falls dich ein Vampir, Geist oder Werwolf berührt und dir deinen Tod ins Ohr geflüstert hat:
+              </p>
+              <button
+                type="button"
+                onClick={() => setIsSelfDeathModalOpen(true)}
+                className="w-full py-3.5 rounded-2xl bg-gradient-to-r from-rose-950 via-rose-900 to-red-950 hover:from-rose-900 hover:to-red-900 border border-rose-600/70 text-rose-100 font-black text-xs flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 shadow-md shadow-rose-950/60"
+              >
+                <Skull className="w-4 h-4 text-rose-400" />
+                <span>Ich wurde getötet</span>
+              </button>
+            </div>
+          )}
 
           {/* RULES SUMMARY */}
           <div className="p-5 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3 text-xs text-zinc-300">
@@ -983,6 +1097,14 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
           onComplete={handleCompletePhotoTask}
         />
       )}
+
+      {/* SELF DEATH CONFIRMATION MODAL */}
+      <SelfDeathModal
+        isOpen={isSelfDeathModalOpen}
+        onClose={() => setIsSelfDeathModalOpen(false)}
+        playerName={player.name}
+        onConfirmDeath={handleSelfReportDeath}
+      />
     </div>
   );
 };

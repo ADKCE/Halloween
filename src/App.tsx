@@ -16,7 +16,7 @@ import {
   PartyPhoto
 } from './types/game';
 import { gameApi } from './utils/api';
-import { Smartphone, Monitor, Loader2, Sparkles, Database, AlertCircle } from 'lucide-react';
+import { Smartphone, Monitor, Loader2, Sparkles, Database, AlertCircle, AlertTriangle, CheckCircle2, X } from 'lucide-react';
 
 const LOCAL_STORAGE_PLAYER_ID = 'halloween_party_player_id';
 const SESSION_STORAGE_ADMIN_CODE = 'halloween_party_admin_code';
@@ -42,6 +42,8 @@ export default function App() {
   const [isMobileDeviceFrame, setIsMobileDeviceFrame] = useState(false);
   const [isInitializing, setIsInitializing] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<{ title: string; detail: string; timestamp: number } | null>(null);
+  const [successToast, setSuccessToast] = useState<string | null>(null);
 
   // Live state from central Supabase database
   const [gameState, setGameState] = useState<GameState>({
@@ -294,6 +296,33 @@ export default function App() {
     }
   };
 
+  const handleSelfReportDeath = async (killerRole: string) => {
+    if (!registeredPlayerId) return;
+
+    // 1. Sofortiger lokaler Optimistic Update (Spieler sieht sofort den "Du bist tot"-Screen!)
+    setPlayers((prev) =>
+      prev.map((p) => (p.id === registeredPlayerId ? { ...p, status: 'tot' as const } : p))
+    );
+
+    try {
+      const res = await gameApi.reportSelfDeath(registeredPlayerId, killerRole);
+      setSuccessToast(res.message);
+      setTimeout(() => setSuccessToast(null), 5000);
+      await fetchGameState();
+    } catch (err: any) {
+      console.error('Fehler bei reportSelfDeath:', err);
+      // Fehler IMMER sichtbar ausgeben!
+      setErrorMessage({
+        title: 'Fehler beim Als-Tot-Markieren',
+        detail: err?.message || 'Die Datenbank hat das Update verweigert. Bitte RLS-Policies und SQL-Fix prüfen.',
+        timestamp: Date.now(),
+      });
+      // Nach Fehler State wieder mit DB synchronisieren
+      await fetchGameState();
+      throw err;
+    }
+  };
+
   // Resolve current active player object
   const currentPlayer = players.find((p) => p.id === registeredPlayerId);
   const supabaseStatus = gameApi.getStatus();
@@ -322,6 +351,45 @@ export default function App() {
             {isMobileDeviceFrame ? <Monitor className="w-3.5 h-3.5" /> : <Smartphone className="w-3.5 h-3.5" />}
           </button>
         </div>
+
+        {/* GLOBAL ERROR TOAST (FEHLER IMMER SICHTBAR ANZEIGEN) */}
+        {errorMessage && (
+          <div className="m-3 p-3.5 rounded-2xl bg-rose-950 border-2 border-rose-500 text-rose-100 text-xs shadow-2xl flex items-start justify-between gap-3 animate-in fade-in slide-in-from-top-2 z-50">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5 animate-pulse" />
+              <div className="space-y-0.5">
+                <span className="font-bold text-rose-300 block text-xs">{errorMessage.title}</span>
+                <p className="text-[11px] text-rose-200/90 break-words leading-relaxed">{errorMessage.detail}</p>
+                <span className="text-[9px] text-rose-400/80 font-mono block">
+                  {new Date(errorMessage.timestamp).toLocaleTimeString()} • Siehe ?debug=1 für Details
+                </span>
+              </div>
+            </div>
+            <button
+              onClick={() => setErrorMessage(null)}
+              className="p-1 rounded-lg text-rose-400 hover:text-white hover:bg-rose-900/50 transition cursor-pointer shrink-0"
+              title="Schließen"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {/* GLOBAL SUCCESS TOAST */}
+        {successToast && (
+          <div className="m-3 p-3 rounded-2xl bg-emerald-950 border border-emerald-500/70 text-emerald-200 text-xs shadow-xl flex items-center justify-between gap-2 animate-in fade-in slide-in-from-top-2 z-50">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span className="text-[11px] font-bold">{successToast}</span>
+            </div>
+            <button
+              onClick={() => setSuccessToast(null)}
+              className="p-1 rounded-lg text-emerald-400 hover:text-white transition cursor-pointer shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* Configuration Notice if Supabase credentials are not set */}
         {!supabaseStatus.isConfigured && (
@@ -377,6 +445,7 @@ export default function App() {
                   photos={photos}
                   onLogoutDevice={handleLogoutDevice}
                   onRefreshState={fetchGameState}
+                  onSelfReportDeath={handleSelfReportDeath}
                 />
               ) : (
                 <AdminArea

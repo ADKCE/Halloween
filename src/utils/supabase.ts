@@ -923,9 +923,17 @@ class SupabaseService {
     }
 
     if (action === 'entfernen') {
-      await client.from('players').delete().eq('id', playerId);
+      const { error } = await client.from('players').delete().eq('id', playerId);
+      if (error) {
+        this.lastError = `Spieler entfernen fehlgeschlagen: ${error.message}`;
+        throw new Error(`Spieler entfernen fehlgeschlagen: ${error.message}`);
+      }
     } else {
-      await client.from('players').update({ status: newStatus }).eq('id', playerId);
+      const { error } = await client.from('players').update({ status: newStatus }).eq('id', playerId);
+      if (error) {
+        this.lastError = `Aktion '${action}' fehlgeschlagen: ${error.message}`;
+        throw new Error(`Aktion '${action}' fehlgeschlagen: ${error.message}`);
+      }
     }
   }
 
@@ -1229,7 +1237,11 @@ class SupabaseService {
     const client = this.getClient();
     if (!client) throw new Error('Supabase nicht verfügbar');
 
-    const { data: kill } = await client.from('kills').select('*').eq('id', killId).single();
+    const { data: kill, error: fetchErr } = await client.from('kills').select('*').eq('id', killId).single();
+    if (fetchErr) {
+      this.lastError = `Kill-Abruf fehlgeschlagen: ${fetchErr.message}`;
+      throw new Error(`Kill nicht gefunden: ${fetchErr.message}`);
+    }
     if (!kill) return;
     if (kill.confirmed) return;
 
@@ -1237,23 +1249,29 @@ class SupabaseService {
     const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...(stateData?.settings || {}) };
 
     // 1. Mark victim as tot
-    await client.from('players').update({ status: 'tot' }).eq('id', kill.victim_id);
+    const { error: victimUpdateError } = await client.from('players').update({ status: 'tot' }).eq('id', kill.victim_id);
+    if (victimUpdateError) {
+      this.lastError = `Spielerstatus-Update fehlgeschlagen: ${victimUpdateError.message}`;
+      throw new Error(`Konnte Opfer nicht als tot markieren: ${victimUpdateError.message}`);
+    }
 
-    // 2. Award killer points (+15 Pkt für bösen Kill)
-    const { data: killer } = await client.from('players').select('points, kills_count').eq('id', kill.killer_id).single();
-    if (killer) {
-      await this.safeUpdatePlayer(
-        kill.killer_id,
-        {
-          points: (killer.points || 0) + (settings.pointsEvilKill || 15),
-          kills_count: (killer.kills_count || 0) + 1,
-        },
-        ['points']
-      );
+    // 2. Award killer points (+15 Pkt für bösen Kill) falls Täter existiert
+    if (kill.killer_id) {
+      const { data: killer } = await client.from('players').select('points, kills_count').eq('id', kill.killer_id).single();
+      if (killer) {
+        await this.safeUpdatePlayer(
+          kill.killer_id,
+          {
+            points: (killer.points || 0) + (settings.pointsEvilKill || 15),
+            kills_count: (killer.kills_count || 0) + 1,
+          },
+          ['points']
+        );
+      }
     }
 
     // 3. Mark kill confirmed
-    await client
+    const { error: confirmErr } = await client
       .from('kills')
       .update({
         confirmed: true,
@@ -1261,6 +1279,117 @@ class SupabaseService {
         auto_confirmed: auto,
       })
       .eq('id', killId);
+
+    if (confirmErr) {
+      this.lastError = `Kill-Bestätigung fehlgeschlagen: ${confirmErr.message}`;
+      throw new Error(`Kill-Bestätigung in DB fehlgeschlagen: ${confirmErr.message}`);
+    }
+  }
+
+  // --- REPORT SELF DEATH ("ICH WURDE GETÖTET") ---
+  public async reportSelfDeath(
+    playerId: string,
+    killerRole: string = 'Unbekannt'
+  ): Promise<{ confirmedExisting: boolean; message: string }> {
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    // 1. Zuerst serverseitige Postgres-Funktion mark_self_dead versuchen (RPC)
+    try {
+      const { data: rpcData, error: rpcError } = await client.rpc('mark_self_dead', {
+        p_player_id: playerId,
+        p_killer_role: killerRole || 'Unbekannt',
+      });
+
+      if (!rpcError && rpcData && rpcData.success) {
+        return {
+          confirmedExisting: Boolean(rpcData.confirmed_existing_kill),
+          message: rpcData.confirmed_existing_kill
+            ? 'Offener Angriff erfolgreich bestätigt! Du bist nun im Totenreich.'
+            : 'Du hast dich als tot markiert. Willkommen im Totenreich (Zuschauer-Modus)!',
+        };
+      }
+    } catch (rpcEx) {
+      console.warn('RPC mark_self_dead nicht verfügbar oder fehlgeschlagen, nutze Client-Fallback:', rpcEx);
+    }
+
+    // 2. Fallback: Client-basierte Abwicklung
+    // a) Prüfen, ob bereits ein offener Kill vorliegt
+    const { data: openKills, error: openKillErr } = await client
+      .from('kills')
+      .select('*')
+      .eq('victim_id', playerId)
+      .eq('confirmed', false)
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (!openKillErr && openKills && openKills.length > 0) {
+      await this.confirmKill(openKills[0].id);
+      return {
+        confirmedExisting: true,
+        message: 'Offener Angriff erfolgreich bestätigt! Du bist nun im Totenreich.',
+      };
+    }
+
+    // b) Kein offener Kill vorhanden: Spieler auf 'tot' setzen
+    const { error: updateError } = await client
+      .from('players')
+      .update({ status: 'tot' })
+      .eq('id', playerId);
+
+    if (updateError) {
+      this.lastError = `Spielerstatus-Update auf 'tot' fehlgeschlagen: ${updateError.message}`;
+      throw new Error(`Konnte Spieler nicht als tot markieren: ${updateError.message}`);
+    }
+
+    // c) Opfer-Daten laden für Kill-Log Eintrag
+    const { data: victim, error: victimErr } = await client
+      .from('players')
+      .select('id, name, role, team')
+      .eq('id', playerId)
+      .single();
+
+    if (victimErr) {
+      console.warn('Opfer-Daten konnten nicht vollständig geladen werden:', victimErr.message);
+    }
+
+    // d) Neuen Eintrag in 'kills' anlegen (Täter 'Unbekannt')
+    let insertPayload: any = {
+      killer_id: null,
+      victim_id: playerId,
+      killer_name: 'Unbekannt',
+      victim_name: victim?.name || 'Spieler',
+      killer_role: killerRole || 'Unbekannt',
+      victim_role: victim?.role || 'Unbekannt',
+      killer_team: 'Böse',
+      victim_team: victim?.team || 'Gut',
+      reason: 'self_reported',
+      confirmed: true,
+      confirmed_at: new Date().toISOString(),
+      auto_confirmed: false,
+    };
+
+    const { error: insertError } = await client.from('kills').insert([insertPayload]);
+    if (insertError) {
+      // Falls killer_id NOT NULL ist (bevor der Nutzer das SQL-Skript ausgeführt hat),
+      // nutzen wir als Ausweichlösung victim.id als killer_id mit Name 'Unbekannt'
+      if (insertError.message?.includes('killer_id') || insertError.code === '23502') {
+        insertPayload.killer_id = playerId;
+        const { error: retryError } = await client.from('kills').insert([insertPayload]);
+        if (retryError) {
+          this.lastError = `Kill-Log Eintrag fehlgeschlagen: ${retryError.message}`;
+          throw new Error(`Kill-Log Eintrag fehlgeschlagen: ${retryError.message}`);
+        }
+      } else {
+        this.lastError = `Kill-Log Eintrag fehlgeschlagen: ${insertError.message}`;
+        throw new Error(`Kill-Log Eintrag fehlgeschlagen: ${insertError.message}`);
+      }
+    }
+
+    return {
+      confirmedExisting: false,
+      message: 'Du hast dich als tot gemeldet. Willkommen im Totenreich (Zuschauer-Modus)!',
+    };
   }
 
   public async adminUndoKill(adminCode: string, killId: string): Promise<void> {

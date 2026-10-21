@@ -105,6 +105,11 @@ create table if not exists public.kills (
   created_at timestamptz not null default timezone('utc'::text, now())
 );
 
+alter table public.kills alter column killer_id drop not null;
+alter table public.kills alter column killer_name drop not null;
+alter table public.kills drop constraint if exists kills_killer_id_fkey;
+alter table public.kills add constraint kills_killer_id_fkey foreign key (killer_id) references public.players(id) on delete set null;
+
 alter table public.kills add column if not exists killer_role text;
 alter table public.kills add column if not exists victim_role text;
 alter table public.kills add column if not exists killer_team text;
@@ -445,6 +450,92 @@ end;
 $$;
 
 grant execute on function public.assign_roles() to anon, authenticated, service_role;
+
+-- 14. FUNKTION: mark_self_dead (Selbst als tot markieren & offene Kills abgleichen)
+create or replace function public.mark_self_dead(
+  p_player_id text,
+  p_killer_role text default 'Unbekannt'
+)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_victim record;
+  v_open_kill record;
+  v_result jsonb;
+begin
+  select * into v_victim from public.players where id = p_player_id;
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'Spieler nicht gefunden');
+  end if;
+
+  update public.players
+  set status = 'tot'
+  where id = p_player_id;
+
+  select * into v_open_kill
+  from public.kills
+  where victim_id = p_player_id and confirmed = false
+  order by created_at desc
+  limit 1;
+
+  if found then
+    update public.kills
+    set confirmed = true,
+        confirmed_at = now()
+    where id = v_open_kill.id;
+
+    if v_open_kill.killer_id is not null then
+      update public.players
+      set points = points + 15,
+          kills_count = kills_count + 1
+      where id = v_open_kill.killer_id;
+    end if;
+
+    v_result := jsonb_build_object(
+      'success', true,
+      'confirmed_existing_kill', true,
+      'kill_id', v_open_kill.id
+    );
+  else
+    insert into public.kills (
+      killer_id,
+      victim_id,
+      killer_name,
+      victim_name,
+      killer_role,
+      victim_role,
+      killer_team,
+      victim_team,
+      reason,
+      confirmed,
+      confirmed_at
+    ) values (
+      null,
+      p_player_id,
+      'Unbekannt',
+      v_victim.name,
+      coalesce(nullif(p_killer_role, ''), 'Unbekannt'),
+      v_victim.role,
+      'Böse',
+      v_victim.team,
+      'self_reported',
+      true,
+      now()
+    );
+
+    v_result := jsonb_build_object(
+      'success', true,
+      'created_new_kill', true
+    );
+  end if;
+
+  return v_result;
+end;
+$$;
+
+grant execute on function public.mark_self_dead(text, text) to anon, authenticated, service_role;
 
 -- Schema-Cache von Supabase PostgREST aktualisieren
 notify pgrst, 'reload schema';

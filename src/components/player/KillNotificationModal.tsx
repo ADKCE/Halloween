@@ -13,14 +13,17 @@ export const KillNotificationModal: React.FC<KillNotificationModalProps> = ({
 }) => {
   const [isConfirming, setIsConfirming] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const handleConfirm = async () => {
     setIsConfirming(true);
+    setErrorMessage(null);
     try {
       await onConfirm();
       setConfirmed(true);
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
+      setErrorMessage(e?.message || 'Bestätigung fehlgeschlagen. Bitte erneut versuchen.');
     } finally {
       setIsConfirming(false);
     }
@@ -51,6 +54,16 @@ export const KillNotificationModal: React.FC<KillNotificationModalProps> = ({
             Du kannst weiterhin als Zuschauer im Spiel bleiben und Aufgaben im Totenreich lösen!
           </p>
         </div>
+
+        {errorMessage && (
+          <div className="p-3 rounded-2xl bg-rose-950/90 border border-rose-500 text-rose-200 text-xs text-left flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-bold block">Fehler beim Bestätigen:</span>
+              <span className="text-[11px] break-words">{errorMessage}</span>
+            </div>
+          </div>
+        )}
 
         {confirmed ? (
           <div className="p-3 rounded-2xl bg-emerald-950/40 border border-emerald-500/50 text-emerald-300 text-xs font-bold flex items-center justify-center gap-2">
