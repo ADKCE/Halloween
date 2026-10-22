@@ -25,7 +25,8 @@ import {
   Layers,
   ChevronRight,
   ShieldAlert,
-  HelpCircle
+  HelpCircle,
+  Check
 } from 'lucide-react';
 import {
   Player,
@@ -37,17 +38,19 @@ import {
   PartyPhoto,
   SpecialTaskAssignment,
   GameState,
-  FullMoonEvent
+  FullMoonEvent,
+  PlayerPhotoTask
 } from '../../types/game';
 import { DEFAULT_PHOTO_TASKS } from '../../utils/gameDataPool';
 import { KillModal } from './KillModal';
 import { PhotoTaskModal } from './PhotoTaskModal';
-import { SpecialTaskCard } from './SpecialTaskCard';
 import { FullMoonBanner } from './FullMoonBanner';
 import { KillNotificationModal } from './KillNotificationModal';
 import { SelfDeathModal } from './SelfDeathModal';
 import { GameEndView } from './GameEndView';
 import { GalleryView } from './GalleryView';
+import { PendingDeathScreen } from './PendingDeathScreen';
+import { SpecialTaskModal } from './SpecialTaskModal';
 import { gameApi } from '../../utils/api';
 
 interface PlayerAreaProps {
@@ -59,6 +62,8 @@ interface PlayerAreaProps {
   tasks: PartyTask[];
   taskCompletions: TaskCompletion[];
   photos: PartyPhoto[];
+  photoTasks?: PlayerPhotoTask[];
+  specialTasks?: SpecialTaskAssignment[];
   activeTab: 'actions' | 'tasks' | 'ranking' | 'gallery' | 'profile';
   onTabChange: (tab: 'actions' | 'tasks' | 'ranking' | 'gallery' | 'profile') => void;
   onLogoutDevice: () => void;
@@ -78,6 +83,8 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   tasks,
   taskCompletions,
   photos,
+  photoTasks = [],
+  specialTasks = [],
   activeTab,
   onTabChange,
   onLogoutDevice,
@@ -95,32 +102,26 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   const [isSelfDeathModalOpen, setIsSelfDeathModalOpen] = useState(false);
   const [activeTaskModal, setActiveTaskModal] = useState<{ id: string; title: string; desc: string } | null>(null);
 
-  // Special task for humans
-  const [pendingSpecialTask, setPendingSpecialTask] = useState<SpecialTaskAssignment | null>(null);
+  // Special task modal
+  const [isSpecialModalOpen, setIsSpecialModalOpen] = useState(false);
+  const [activeSpecialTask, setActiveSpecialTask] = useState<SpecialTaskAssignment | null>(null);
 
   // Cooldown countdown state
   const [cooldownRemainingSeconds, setCooldownRemainingSeconds] = useState<number>(0);
   const [gracePeriodSeconds, setGracePeriodSeconds] = useState<number>(0);
+  const [liveNow, setLiveNow] = useState<number>(Date.now());
 
   // Filter/Search in Ranking
   const [rankingFilter, setRankingFilter] = useState<'all' | 'dead' | 'kills'>('all');
   const [playerSearchTerm, setPlayerSearchTerm] = useState('');
 
-  // Check if player has pending kill on themselves
-  const pendingKillOnSelf = useMemo(() => {
-    return kills.find((k) => k.victimId === player.id && !k.confirmed);
-  }, [kills, player.id]);
+  // 1-second live ticker
+  useEffect(() => {
+    const interval = setInterval(() => setLiveNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, []);
 
-  // Check if full moon is active
-  const isFullMoon = useMemo(() => {
-    return gameApi.isFullMoonActive(gameState);
-  }, [gameState]);
-
-  const nextFullMoonInfo = useMemo(() => {
-    return gameApi.getNextFullMoon(gameState);
-  }, [gameState]);
-
-  // Check Grace Period (Schonfrist: 15 min nach startedAt)
+  // Check Grace Period & Player Cooldown
   useEffect(() => {
     const checkGraceAndCooldown = () => {
       // 1. Schonfrist
@@ -157,24 +158,68 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
     return () => clearInterval(interval);
   }, [gameState, player, players]);
 
-  // Load pending special task for living humans
+  // Load pending special task for living humans and pop up modal
   useEffect(() => {
     if (gameState.status === 'Läuft' && player.role === 'Mensch' && player.status === 'lebendig') {
-      gameApi.getPendingSpecialTask(player.id).then((st) => {
-        setPendingSpecialTask(st);
-      });
+      // Check passed specialTasks prop first
+      const pendingFromProp = specialTasks.find(
+        (st) => st.playerId === player.id && st.status === 'pending' && new Date(st.expiresAt).getTime() > Date.now()
+      );
+
+      if (pendingFromProp) {
+        setActiveSpecialTask(pendingFromProp);
+        setIsSpecialModalOpen(true);
+      } else {
+        gameApi.getPendingSpecialTask(player.id).then((st) => {
+          if (st) {
+            setActiveSpecialTask(st);
+            setIsSpecialModalOpen(true);
+          }
+        });
+      }
     }
-  }, [gameState.status, player.role, player.status, player.id]);
+  }, [gameState.status, player.role, player.status, player.id, specialTasks]);
 
   const isDead = player.status === 'tot';
+  const isPendingDeath = player.status === 'pending_death' || player.status === 'tod_ausstehend';
   const isHunter = player.role === 'Geisterjäger';
   const isKiller = ['Vampir', 'Werwolf', 'Geist'].includes(player.role);
   const isWerewolf = player.role === 'Werwolf';
 
-  // Alive players excluding self
-  const potentialVictims = useMemo(() => {
-    return players.filter((p) => p.id !== player.id && p.status === 'lebendig');
+  // Check if player was recently revived after an unconfirmed kill timeout
+  const unconfirmedRevivalNotice = useMemo(() => {
+    if (player.status !== 'lebendig') return null;
+    const recentUnconfirmed = kills.find(
+      (k) =>
+        k.victimId === player.id &&
+        k.reason === 'unconfirmed_timeout' &&
+        Date.now() - new Date(k.createdAt).getTime() < 3 * 60 * 1000
+    );
+    return recentUnconfirmed ? 'Dein Tod wurde nicht bestätigt, du bist wieder im Spiel!' : null;
+  }, [kills, player.id, player.status]);
+
+  // List of players currently in pending_death (for evil roles to select from)
+  const pendingVictims = useMemo(() => {
+    return players.filter(
+      (p) => p.id !== player.id && (p.status === 'pending_death' || p.status === 'tod_ausstehend')
+    );
   }, [players, player.id]);
+
+  // Alive players excluding self and excluding pending_death (for Geisterjäger exorcism)
+  const potentialVictims = useMemo(() => {
+    return players.filter(
+      (p) => p.id !== player.id && p.status === 'lebendig'
+    );
+  }, [players, player.id]);
+
+  // Check if full moon is active
+  const isFullMoon = useMemo(() => {
+    return gameApi.isFullMoonActive(gameState);
+  }, [gameState]);
+
+  const nextFullMoonInfo = useMemo(() => {
+    return gameApi.getNextFullMoon(gameState);
+  }, [gameState]);
 
   // Hunters teammate list (Geisterjäger sehen sich gegenseitig)
   const fellowHunters = useMemo(() => {
@@ -194,68 +239,65 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   );
   const myRank = overallRanking.findIndex((p) => p.id === player.id) + 1;
 
-  // Active 2 photo tasks for the player (derived deterministically or rotating)
-  const myActivePhotoTasks = useMemo(() => {
-    // Generate 2 rotating tasks from pool
-    const completedCount = player.tasksCompletedCount || 0;
-    const pool = DEFAULT_PHOTO_TASKS;
-    const task1 = pool[completedCount % pool.length];
-    const task2 = pool[(completedCount + 1) % pool.length];
+  // ----------------------------------------------------------------------------
+  // FOTO-AUFGABEN LOGIK (Serverseitige player_photo_tasks + Slot Countdown)
+  // ----------------------------------------------------------------------------
+  const photoIntervalMin = gameState.settings?.photoTaskIntervalMinutes ?? 10;
 
-    // Pick a random other player for specific templates
-    const otherPlayers = players.filter((p) => p.id !== player.id && p.status !== 'entfernt');
-    const randomTarget = otherPlayers.length > 0 ? otherPlayers[completedCount % otherPlayers.length] : null;
+  // Countdown "Nächste Aufgabe in mm:ss"
+  const nextTaskCountdown = useMemo(() => {
+    if (gameState.status !== 'Läuft' || !gameState.startedAt) return '00:00';
+    const startMs = new Date(gameState.startedAt).getTime();
+    const intervalMs = photoIntervalMin * 60 * 1000;
+    const elapsedMs = Math.max(0, liveNow - startMs);
+    const nextSlotMs = startMs + (Math.floor(elapsedMs / intervalMs) + 1) * intervalMs;
+    const diffSec = Math.max(0, Math.floor((nextSlotMs - liveNow) / 1000));
+    const m = Math.floor(diffSec / 60);
+    const s = diffSec % 60;
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  }, [gameState.status, gameState.startedAt, photoIntervalMin, liveNow]);
 
-    const formatDesc = (t: typeof task1) => {
-      let txt = t.text;
-      if (randomTarget) {
-        txt = txt
-          .replace('{playerName}', randomTarget.name)
-          .replace('{costumeName}', randomTarget.costumeName || 'Kostüm');
-      } else {
-        txt = txt
-          .replace('{playerName}', 'einem Mitspieler')
-          .replace('{costumeName}', 'einem Grusel-Kostüm');
-      }
-      return txt;
-    };
+  // Open photo tasks for current player (max 3, non-expired)
+  const openPhotoTasks = useMemo(() => {
+    const list = photoTasks.filter(
+      (t) => t.status === 'open' && new Date(t.expiresAt).getTime() > liveNow
+    );
+    if (list.length > 0) return list.slice(0, 3);
+
+    // Fallback: Wenn noch keine Aufgaben in der DB existieren, generiere die erste Slot-Aufgabe
+    const otherLiving = players.filter((p) => p.id !== player.id && p.status === 'lebendig');
+    const randomTarget = otherLiving.length > 0 ? otherLiving[0] : null;
 
     return [
       {
-        id: `${task1.id}_${completedCount}`,
-        title: task1.type === 'specific_player' ? `Foto mit ${randomTarget?.name || 'Gast'}` : 'Foto-Challenge #1',
-        description: formatDesc(task1),
+        id: `initial_slot_0_${player.id}`,
+        playerId: player.id,
+        slotNumber: 0,
+        title: randomTarget ? `Foto mit ${randomTarget.name}` : 'Halloween Gruppenfoto',
+        description: randomTarget
+          ? `Mach ein Foto mit ${randomTarget.name} (${randomTarget.costumeName || 'Kostüm'}).`
+          : 'Mach ein schauriges Gruppenfoto mit 3 Mitspielern!',
+        taskType: (randomTarget ? 'specific_player' : 'group') as any,
+        targetPlayerName: randomTarget?.name,
+        targetPlayerCostume: randomTarget?.costumeName,
+        targetPlayerPhoto: randomTarget?.photoUrl,
         points: gameState.settings.pointsPhotoTask || 10,
-        rawTemplate: task1,
-        targetPlayer: randomTarget,
-      },
-      {
-        id: `${task2.id}_${completedCount + 1}`,
-        title: task2.type === 'specific_costume' ? `Kostüm-Foto` : 'Foto-Challenge #2',
-        description: formatDesc(task2),
-        points: gameState.settings.pointsPhotoTask || 10,
-        rawTemplate: task2,
-        targetPlayer: randomTarget,
+        status: 'open' as const,
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
       },
     ];
-  }, [player.tasksCompletedCount, player.id, players, gameState.settings.pointsPhotoTask]);
+  }, [photoTasks, liveNow, players, player.id, gameState.settings.pointsPhotoTask]);
+
+  // Completed photo tasks history for current player
+  const completedPhotoTasksHistory = useMemo(() => {
+    const fromCompletions = taskCompletions.filter((c) => c.playerId === player.id);
+    return fromCompletions;
+  }, [taskCompletions, player.id]);
 
   // Handlers
-  const handleConfirmKillOnSelf = async () => {
-    if (!pendingKillOnSelf) return;
-    await onSelfReportDeath('Unbekannt');
-  };
-
-  const handleSelfReportDeath = async (killerRole: string) => {
-    await onSelfReportDeath(killerRole);
-  };
-
-  const handleReportKill = async (victimId: string, ghostSoloConfirmed?: boolean) => {
-    const res = await gameApi.reportKill({
-      killerId: player.id,
-      victimId,
-      ghostSoloConfirmed,
-    });
+  const handleConfirmKill = async (victimId: string, ghostSoloConfirmed?: boolean) => {
+    const res = await gameApi.confirmKill(player.id, victimId, ghostSoloConfirmed);
     await onRefreshState();
     return res;
   };
@@ -264,6 +306,11 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
     const res = await gameApi.exorcise(player.id, targetId);
     await onRefreshState();
     return res;
+  };
+
+  const handleSelfReportDeath = async () => {
+    await gameApi.reportPendingDeath(player.id);
+    await onRefreshState();
   };
 
   const handleCompletePhotoTask = async (photoBlobOrUrl: Blob | File | string) => {
@@ -278,17 +325,23 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
     await onRefreshState();
   };
 
-  const handleCompleteSpecialTask = async (userAnswer?: number, scannedQrCode?: string) => {
-    if (!pendingSpecialTask) throw new Error('Keine Spezialaufgabe aktiv');
-    const res = await gameApi.completeSpecialTask({
-      specialTaskId: pendingSpecialTask.id,
-      playerId: player.id,
-      userAnswer,
-      scannedQrCode,
-    });
+  const handleSolveSpecialTask = async (params: any) => {
+    const res = await gameApi.completeSpecialTask(params);
     await onRefreshState();
     return res;
   };
+
+  // ----------------------------------------------------------------------------
+  // IF PLAYER IS IN 'PENDING_DEATH' STATUS -> SHOW DEDICATED BLOCKING SCREEN
+  // ----------------------------------------------------------------------------
+  if (isPendingDeath) {
+    return (
+      <PendingDeathScreen
+        player={player}
+        timeoutMinutes={gameState.settings?.pendingDeathTimeoutMinutes || 4}
+      />
+    );
+  }
 
   // IF GAME IS OVER (Beendet), SHOW END VIEW
   if (gameState.status === 'Beendet') {
@@ -448,20 +501,20 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   // --- GAME IS RUNNING ('Läuft') ---
   return (
     <div className="space-y-4 animate-in fade-in pb-16">
-      {/* 1. FULL MOON BANNER */}
+      {/* 1. REVIVED NOTIFICATION (Wenn Frist abgelaufen und wiederbelebt) */}
+      {unconfirmedRevivalNotice && (
+        <div className="p-3.5 rounded-2xl bg-emerald-950/80 border border-emerald-500/60 text-emerald-200 text-xs flex items-center gap-2 shadow-lg animate-in zoom-in-95">
+          <HeartPulse className="w-5 h-5 text-emerald-400 shrink-0 animate-pulse" />
+          <span className="font-bold">{unconfirmedRevivalNotice}</span>
+        </div>
+      )}
+
+      {/* 2. FULL MOON BANNER */}
       <FullMoonBanner
         activeFullMoon={gameState.activeFullMoon || null}
         isWerewolf={isWerewolf}
         onMoonEnd={onRefreshState}
       />
-
-      {/* 2. PENDING KILL FULL-SCREEN NOTIFICATION */}
-      {pendingKillOnSelf && (
-        <KillNotificationModal
-          pendingKill={pendingKillOnSelf}
-          onConfirm={handleConfirmKillOnSelf}
-        />
-      )}
 
       {/* 3. DEAD PLAYER BANNER / ZUSCHAUER-MODUS */}
       {isDead && (
@@ -507,8 +560,6 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
           </div>
         </div>
       )}
-
-
 
       {/* ======================================================== */}
       {/* TAB 1: AKTIONEN (Fähigkeiten der eigenen Rolle)            */}
@@ -604,13 +655,13 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                 </p>
               </div>
             ) : isKiller ? (
-              /* VAMPIR, WERWOLF, GEIST */
+              /* VAMPIR, WERWOLF, GEIST -> BUTTON "ICH HABE JEMANDEN GETÖTET" */
               <div className="space-y-3">
                 <div className="text-xs text-zinc-300 space-y-1 leading-relaxed">
                   {player.role === 'Vampir' && (
                     <p>
-                      🧛 <strong>Vampir:</strong> Töte ein Opfer durch kurzes Berühren an Schulter/Arm und
-                      Flüstern: <em>"Du wurdest von einem Vampir getötet."</em> (Cooldown: 6 Min).
+                      🧛 <strong>Vampir:</strong> Berühre das Opfer an Schulter/Arm und flüstere:{" "}
+                      <em>"Du wurdest von einem Vampir getötet."</em> Wenn das Opfer seinen Tod meldet, wähle es unten aus und bestätige den Kill. Cooldown: 6 Minuten.
                     </p>
                   )}
                   {player.role === 'Werwolf' && (
@@ -621,8 +672,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                   )}
                   {player.role === 'Geist' && (
                     <p>
-                      👻 <strong>Geist:</strong> Du kannst nur zuschlagen, wenn du mit dem Opfer <strong>allein</strong> im
-                      Raum bist (Pflicht-Bestätigung). Cooldown: 6 Minuten.
+                      👻 <strong>Geist:</strong> Du kannst nur zuschlagen, wenn du mit dem Opfer <strong>allein im Raum</strong> warst (Pflicht-Häkchen). Cooldown: 6 Minuten.
                     </p>
                   )}
                 </div>
@@ -655,13 +705,19 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                   </div>
                 )}
 
+                {/* KILLER BUTTON: ICH HABE JEMANDEN GETÖTET */}
                 <button
                   onClick={() => setIsKillModalOpen(true)}
                   disabled={cooldownRemainingSeconds > 0 || (isWerewolf && !isFullMoon) || gracePeriodSeconds > 0}
                   className="w-full py-4 rounded-2xl bg-gradient-to-r from-rose-600 to-red-700 hover:from-rose-500 hover:to-red-600 text-white font-black text-sm shadow-xl shadow-rose-950/80 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 disabled:opacity-50"
                 >
                   <Skull className="w-5 h-5" />
-                  Kill melden ({player.role})
+                  <span>Ich habe jemanden getötet</span>
+                  {pendingVictims.length > 0 && (
+                    <span className="ml-1 px-2 py-0.5 rounded-full bg-white text-rose-700 text-xs font-black animate-pulse">
+                      {pendingVictims.length} offen
+                    </span>
+                  )}
                 </button>
               </div>
             ) : isHunter ? (
@@ -669,9 +725,9 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
               <div className="space-y-3">
                 <div className="text-xs text-zinc-300 space-y-1 leading-relaxed">
                   <p>
-                    🏹 <strong>Exorzismus:</strong> Wähle eine Person aus.
-                    Ist sie böse (Vampir, Werwolf oder Geist), stirbt sie sofort (+25 Pkt, Cooldown 15 Min).
-                    Ist sie gut (Mensch), bleibt sie am Leben und du bist für 30 Minuten gesperrt!
+                    🏹 <strong>Exorzismus:</strong> Wähle ein Ziel auf deinem Smartphone aus.
+                    Ist es böse (Vampir, Werwolf oder Geist), ist es sofort tot (+25 Pkt, Cooldown 15 Min).
+                    Ist es gut (Mensch), bleibt es am Leben und du bist für 30 Minuten gesperrt!
                   </p>
                 </div>
 
@@ -693,7 +749,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                   className="w-full py-4 rounded-2xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-black text-sm shadow-xl shadow-blue-950/80 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 disabled:opacity-50"
                 >
                   <ShieldAlert className="w-5 h-5" />
-                  Exorzieren
+                  <span>Exorzismus durchführen</span>
                 </button>
               </div>
             ) : (
@@ -701,12 +757,10 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
               <div className="space-y-3 text-xs text-zinc-300 leading-relaxed">
                 <p>
                   🧍 <strong>Deine Rolle als Mensch:</strong> Du kannst niemanden töten.
-                  Deine Aufgabe ist es zu überleben, Party-Aufgaben zu lösen und den Geisterjägern zu helfen,
-                  die Kreaturen der Nacht zu entlarven!
+                  Deine Aufgabe ist es zu überleben, Foto- und Spezialaufgaben zu lösen und den Geisterjägern Hinweise zuzustecken!
                 </p>
                 <div className="p-3 rounded-2xl bg-emerald-950/40 border border-emerald-500/40 text-emerald-300 text-xs">
-                  ✨ <strong>Spezialaufgaben:</strong> Alle 10–20 Minuten erhältst du vielleicht eine
-                  Spezialaufgabe (Quiz, QR-Code oder Foto). Damit erfährst du die geheime Rolle eines Mitspielers!
+                  ✨ <strong>Spezialaufgaben:</strong> Alle 10–20 Minuten erhältst du ein Mini-Spiel (Kopfrechnen, Anagramm, Merk-Sequenz, Quiz oder Geheimcode). Bei Erfolg erfährst du die geheime Rolle eines Bösen!
                 </div>
               </div>
             )}
@@ -720,7 +774,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                   className="w-full py-3.5 rounded-2xl bg-zinc-950 hover:bg-rose-950/40 border border-zinc-700 hover:border-rose-500/70 text-zinc-200 hover:text-rose-200 font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 shadow-sm"
                 >
                   <Skull className="w-4 h-4 text-rose-500" />
-                  <span>Ich wurde getötet (Selbstmeldung)</span>
+                  <span>Ich wurde getötet</span>
                 </button>
                 <p className="text-[10px] text-zinc-500 text-center">
                   Tippe hier, wenn dich jemand berührt und angeflüstert hat.
@@ -736,78 +790,120 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
       {/* ======================================================== */}
       {activeTab === 'tasks' && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
+          {/* Header with next task countdown */}
+          <div className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 flex items-center justify-between">
             <div>
-              <h3 className="font-bold text-white text-sm">Offene Aufgaben</h3>
-              <p className="text-[11px] text-zinc-400">
-                Gilt für alle Spieler (auch Böse & Tote für Punkte)
-              </p>
+              <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
+                Foto-Aufgaben (alle {photoIntervalMin} Min)
+              </span>
+              <h3 className="font-bold text-white text-sm">
+                Offene Aufgaben ({openPhotoTasks.length}/3)
+              </h3>
             </div>
-            <span className="text-xs font-mono font-bold text-[#ff6b00]">
-              {player.tasksCompletedCount || 0} gelöst
-            </span>
+            <div className="text-right">
+              <span className="text-[10px] text-zinc-400 block">Nächste Aufgabe in:</span>
+              <span className="text-sm font-mono font-black text-[#ff6b00]">
+                {nextTaskCountdown}
+              </span>
+            </div>
           </div>
 
-          {/* SPECIAL TASK FOR HUMANS IF PENDING */}
-          {player.role === 'Mensch' && pendingSpecialTask && (
-            <SpecialTaskCard
-              specialTask={pendingSpecialTask}
-              onComplete={handleCompleteSpecialTask}
-            />
-          )}
-
-          {/* 2 OFFENE FOTO-AUFGABEN */}
+          {/* LISTE DER OFFENEN FOTO-AUFGABEN */}
           <div className="space-y-3">
-            {myActivePhotoTasks.map((t, idx) => (
-              <div
-                key={t.id}
-                className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3 hover:border-zinc-700 transition"
-              >
-                <div className="flex items-center justify-between">
-                  <span className="px-2.5 py-0.5 rounded-full bg-[#ff6b00]/15 text-[#ff6b00] text-[10px] font-bold uppercase tracking-wider">
-                    Foto-Aufgabe {idx + 1}
-                  </span>
-                  <span className="text-xs font-mono font-bold text-[#ff6b00]">
-                    +{t.points} Pkt
-                  </span>
-                </div>
+            {openPhotoTasks.map((t, idx) => {
+              const diffSec = Math.max(0, Math.floor((new Date(t.expiresAt).getTime() - liveNow) / 1000));
+              const expMin = Math.floor(diffSec / 60);
+              const expSec = diffSec % 60;
+              const formattedExp = `${expMin}:${expSec.toString().padStart(2, '0')}`;
 
-                <div>
-                  <h4 className="font-bold text-white text-sm">{t.title}</h4>
-                  <p className="text-xs text-zinc-300 mt-0.5 leading-relaxed">{t.description}</p>
-                </div>
-
-                {t.targetPlayer && (
-                  <div className="flex items-center gap-2 p-2 rounded-2xl bg-zinc-950 border border-zinc-800">
-                    <img
-                      src={t.targetPlayer.photoUrl || '/placeholder.png'}
-                      alt={t.targetPlayer.name}
-                      className="w-8 h-8 rounded-xl object-cover border border-zinc-700"
-                    />
-                    <div>
-                      <span className="text-[10px] text-zinc-400 block">Gesuchtes Kostüm:</span>
-                      <span className="text-xs font-bold text-white">
-                        {t.targetPlayer.name} als "{t.targetPlayer.costumeName}"
+              return (
+                <div
+                  key={t.id}
+                  className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3 hover:border-zinc-700 transition"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="px-2.5 py-0.5 rounded-full bg-[#ff6b00]/15 text-[#ff6b00] text-[10px] font-bold uppercase tracking-wider">
+                      Aufgabe #{idx + 1}
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] font-mono text-zinc-400 flex items-center gap-1">
+                        <Clock className="w-3 h-3 text-amber-400" />
+                        noch {formattedExp}
+                      </span>
+                      <span className="text-xs font-mono font-bold text-[#ff6b00]">
+                        +{t.points} Pkt
                       </span>
                     </div>
                   </div>
-                )}
 
-                <button
-                  onClick={() =>
-                    setActiveTaskModal({
-                      id: t.id,
-                      title: t.title,
-                      desc: t.description,
-                    })
-                  }
-                  className="w-full py-2.5 rounded-2xl bg-gradient-to-r from-[#ff6b00] to-orange-600 hover:from-[#ff7c1f] hover:to-orange-500 text-zinc-950 font-black text-xs shadow-md shadow-orange-950 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95"
-                >
-                  <Camera className="w-4 h-4" />
-                  Foto aufnehmen & lösen
-                </button>
+                  <div>
+                    <h4 className="font-bold text-white text-sm">{t.title}</h4>
+                    <p className="text-xs text-zinc-300 mt-0.5 leading-relaxed">{t.description}</p>
+                  </div>
+
+                  {/* Target Preview (showing costume photo & costume name, NO roles) */}
+                  {(t.targetPlayerPhoto || t.targetPlayerName) && (
+                    <div className="flex items-center gap-2.5 p-2 rounded-2xl bg-zinc-950 border border-zinc-800">
+                      {t.targetPlayerPhoto && (
+                        <img
+                          src={t.targetPlayerPhoto}
+                          alt={t.targetPlayerName || 'Ziel'}
+                          className="w-10 h-10 rounded-xl object-cover border border-zinc-700 shrink-0"
+                        />
+                      )}
+                      <div>
+                        <span className="text-[10px] text-zinc-400 block">Zielperson / Kostüm:</span>
+                        <span className="text-xs font-bold text-white block">
+                          {t.targetPlayerName} {t.targetPlayerCostume ? `als "${t.targetPlayerCostume}"` : ''}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  <button
+                    onClick={() =>
+                      setActiveTaskModal({
+                        id: t.id,
+                        title: t.title,
+                        desc: t.description,
+                      })
+                    }
+                    className="w-full py-2.5 rounded-2xl bg-gradient-to-r from-[#ff6b00] to-orange-600 hover:from-[#ff7c1f] hover:to-orange-500 text-zinc-950 font-black text-xs shadow-md shadow-orange-950 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95"
+                  >
+                    <Camera className="w-4 h-4" />
+                    Foto aufnehmen & lösen
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* VERLAUF ERLEDIGTER AUFGABEN */}
+          <div className="pt-3 border-t border-zinc-800 space-y-2">
+            <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">
+              Erledigte Aufgaben ({completedPhotoTasksHistory.length})
+            </h4>
+
+            {completedPhotoTasksHistory.length === 0 ? (
+              <p className="text-xs text-zinc-500 italic py-2">Noch keine Aufgaben gelöst.</p>
+            ) : (
+              <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                {completedPhotoTasksHistory.map((ch) => (
+                  <div
+                    key={ch.id}
+                    className="p-2.5 rounded-2xl bg-zinc-900/60 border border-zinc-800 text-xs flex items-center justify-between"
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span className="text-zinc-200 truncate">{ch.taskTitle || 'Foto-Aufgabe'}</span>
+                    </div>
+                    <span className="text-xs font-mono font-bold text-emerald-400 shrink-0 ml-2">
+                      +{ch.pointsAwarded || 10} Pkt
+                    </span>
+                  </div>
+                ))}
               </div>
-            ))}
+            )}
           </div>
         </div>
       )}
@@ -867,113 +963,129 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                   : 'text-zinc-400 hover:text-white'
               }`}
             >
-              Kill-Log ({kills.filter((k) => k.confirmed).length})
+              Kill-Log
             </button>
           </div>
 
-          {/* KILL-LOG VIEW */}
+          {/* Search bar */}
+          <div className="relative">
+            <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-zinc-500" />
+            <input
+              type="text"
+              placeholder="Spieler oder Kostüm suchen..."
+              value={playerSearchTerm}
+              onChange={(e) => setPlayerSearchTerm(e.target.value)}
+              className="w-full pl-8 pr-3 py-1.5 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-white placeholder-zinc-500 outline-none focus:border-[#ff6b00]"
+            />
+          </div>
+
+          {/* Ranking List */}
           {rankingFilter === 'kills' ? (
             <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
-              {kills.filter((k) => k.confirmed).length === 0 ? (
-                <div className="p-6 text-center text-xs text-zinc-500 rounded-2xl bg-zinc-900 border border-zinc-800 space-y-1">
-                  <Skull className="w-6 h-6 mx-auto text-zinc-600" />
-                  <p>Bisher wurden keine Kills gemeldet. Alle Gäste leben noch!</p>
-                </div>
+              {kills.length === 0 ? (
+                <p className="text-xs text-zinc-500 text-center py-8">Noch keine Kills verzeichnet</p>
               ) : (
-                kills
-                  .filter((k) => k.confirmed)
-                  .map((k) => (
-                    <div
-                      key={k.id}
-                      className="p-3 rounded-2xl bg-zinc-900/90 border border-zinc-800 space-y-1 text-xs"
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="font-bold text-white flex items-center gap-1.5">
-                          <Skull className="w-3.5 h-3.5 text-rose-500" />
-                          <span>{k.victimName} wurde getötet</span>
-                        </span>
-                        <span className="text-[10px] text-zinc-400 font-mono">
-                          {new Date(k.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                        </span>
-                      </div>
-                      <div className="text-[11px] text-zinc-400 flex items-center justify-between">
-                        <span>
-                          Täter: <strong className="text-rose-300">{k.killerName || 'Unbekannt'}</strong>
-                          {k.killerRole && k.killerRole !== 'Unbekannt' && ` (${k.killerRole})`}
-                        </span>
-                        <span className="text-[10px] text-zinc-500">
-                          {k.reason === 'self_reported'
-                            ? 'Selbstmeldung'
-                            : k.reason === 'exorcism'
-                            ? 'Exorzismus'
-                            : 'Angriff'}
-                        </span>
-                      </div>
+                kills.map((k) => (
+                  <div
+                    key={k.id}
+                    className="p-3 rounded-2xl bg-zinc-900/70 border border-zinc-800/80 text-xs space-y-1"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-white">
+                        {k.killerName || 'Unbekannt'} &rarr; {k.victimName || 'Opfer'}
+                      </span>
+                      <span className="text-[10px] font-mono text-zinc-400">
+                        {new Date(k.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </span>
                     </div>
-                  ))
+                    <div className="text-[11px] text-zinc-400 flex items-center justify-between">
+                      <span>Art: {k.reason === 'exorcism' ? 'Exorzismus' : k.reason === 'unconfirmed_timeout' ? 'Nicht bestätigt' : 'Kill'}</span>
+                      {k.reason === 'unconfirmed_timeout' ? (
+                        <span className="text-zinc-400 italic">Timeout</span>
+                      ) : (
+                        <span className="text-emerald-400 font-bold">Bestätigt</span>
+                      )}
+                    </div>
+                  </div>
+                ))
               )}
             </div>
           ) : (
-            /* Player list (Top 20, roles hidden!) */
-            <div className="space-y-1.5 max-h-[460px] overflow-y-auto pr-1">
-            {(rankingFilter === 'all' ? overallRanking.slice(0, 20) : deadRanking).map((p, idx) => (
-              <div
-                key={p.id}
-                className={`flex items-center justify-between p-2.5 rounded-2xl border transition ${
-                  p.id === player.id
-                    ? 'bg-[#ff6b00]/15 border-[#ff6b00]/50'
-                    : 'bg-zinc-900/80 border-zinc-800'
-                }`}
-              >
-                <div className="flex items-center gap-2.5">
-                  <span
-                    className={`font-mono font-black text-xs w-5 text-center ${
-                      idx === 0
-                        ? 'text-amber-400'
-                        : idx === 1
-                        ? 'text-zinc-300'
-                        : idx === 2
-                        ? 'text-amber-600'
-                        : 'text-zinc-500'
-                    }`}
-                  >
-                    #{idx + 1}
-                  </span>
-                  <img
-                    src={p.photoUrl || '/placeholder.png'}
-                    alt={p.name}
-                    className="w-9 h-9 rounded-full object-cover border border-zinc-700"
-                  />
-                  <div>
-                    <div className="text-xs font-bold text-white flex items-center gap-1.5">
-                      {p.name}
-                      {p.id === player.id && (
-                        <span className="text-[10px] text-[#ff6b00] font-black">(Du)</span>
-                      )}
-                    </div>
-                    <div className="text-[10px] text-zinc-400">{p.costumeName}</div>
-                  </div>
-                </div>
+            <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
+              {(rankingFilter === 'dead' ? deadRanking : overallRanking)
+                .filter(
+                  (p) =>
+                    p.name.toLowerCase().includes(playerSearchTerm.toLowerCase()) ||
+                    p.costumeName.toLowerCase().includes(playerSearchTerm.toLowerCase())
+                )
+                .slice(0, 20)
+                .map((p, idx) => {
+                  const isMe = p.id === player.id;
+                  return (
+                    <div
+                      key={p.id}
+                      className={`p-3 rounded-2xl border flex items-center justify-between transition ${
+                        isMe
+                          ? 'bg-[#ff6b00]/10 border-[#ff6b00]/60'
+                          : p.status === 'tot'
+                          ? 'bg-purple-950/20 border-purple-900/40'
+                          : 'bg-zinc-900/70 border-zinc-800'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <span
+                          className={`w-6 text-center font-mono font-black text-sm ${
+                            idx === 0
+                              ? 'text-amber-400'
+                              : idx === 1
+                              ? 'text-zinc-300'
+                              : idx === 2
+                              ? 'text-amber-600'
+                              : 'text-zinc-500'
+                          }`}
+                        >
+                          {idx + 1}
+                        </span>
+                        <img
+                          src={p.photoUrl || '/placeholder.png'}
+                          alt={p.name}
+                          className="w-10 h-10 rounded-xl object-cover border border-zinc-700"
+                        />
+                        <div>
+                          <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                            <span>{p.name}</span>
+                            {isMe && (
+                              <span className="px-1.5 py-0.2 rounded bg-[#ff6b00] text-zinc-950 text-[9px] font-black uppercase">
+                                Du
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-zinc-400">{p.costumeName}</div>
+                        </div>
+                      </div>
 
-                <div className="text-right">
-                  <span className="font-mono font-bold text-xs text-[#ff6b00]">{p.points} Pkt</span>
-                  <span
-                    className={`block text-[9px] font-bold ${
-                      p.status === 'lebendig' ? 'text-emerald-400' : 'text-purple-400'
-                    }`}
-                  >
-                    {p.status}
-                  </span>
-                </div>
-              </div>
-            ))}
-          </div>
+                      <div className="text-right">
+                        <div className="text-xs font-mono font-black text-[#ff6b00]">
+                          {p.points} Pkt
+                        </div>
+                        <div
+                          className={`text-[9px] font-bold ${
+                            p.status === 'lebendig' ? 'text-emerald-400' : 'text-purple-400'
+                          }`}
+                        >
+                          {p.status === 'lebendig' ? 'Lebendig' : 'Tot'}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
           )}
         </div>
       )}
 
       {/* ======================================================== */}
-      {/* TAB: GALERIE (Party-Galerie aller gelösten Foto-Aufgaben)  */}
+      {/* TAB 4: GALERIE (Zentrales Foto-Archiv)                    */}
       {/* ======================================================== */}
       {activeTab === 'gallery' && (
         <GalleryView
@@ -988,7 +1100,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
       )}
 
       {/* ======================================================== */}
-      {/* TAB 4: PROFIL & REGELN (Profil, Rollenkarte, Regeln)     */}
+      {/* TAB 5: PROFIL & REGELN (Profil, Rollenkarte, Regeln)     */}
       {/* ======================================================== */}
       {activeTab === 'profile' && (
         <div className="space-y-4">
@@ -1066,14 +1178,12 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
               <div>
                 <span className="font-bold text-white block">1. Berühren & Flüstern:</span>
                 Zum Töten das Opfer kurz an Arm/Schulter berühren und ins Ohr flüstern:{" "}
-                <span className="italic text-rose-400">"Du wurdest von einem [Rolle] getötet."</span> Danach in der App melden.
+                <span className="italic text-rose-400">"Du wurdest von einem [Rolle] getötet."</span> Danach tippt das Opfer auf "Ich wurde getötet".
               </div>
 
               <div>
-                <span className="font-bold text-white block">2. Siegbedingungen:</span>
-                • <strong>GUT gewinnt:</strong> Wenn alle Bösen tot sind.<br />
-                • <strong>BÖSE gewinnt:</strong> Wenn alle Geisterjäger tot sind oder &gt;75% des guten Teams tot sind.<br />
-                • Bei Zeitende gewinnt das Team mit prozentual mehr Überlebenden.
+                <span className="font-bold text-white block">2. Täter-Bestätigung:</span>
+                Der Täter bestätigt den Kill in der Liste ausstehender Tode. Erfolgt innerhalb von 4 Minuten keine Bestätigung, wird das Opfer automatisch wiederbelebt!
               </div>
 
               <div>
@@ -1106,14 +1216,16 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
         </div>
       )}
 
-      {/* KILL MODAL POPUP */}
+      {/* KILL MODAL POPUP (für Täter Bestätigung der pending_death Opfer & für Geisterjäger) */}
       <KillModal
         isOpen={isKillModalOpen}
         onClose={() => setIsKillModalOpen(false)}
         killer={player}
         potentialVictims={potentialVictims}
+        pendingVictims={pendingVictims}
         isFullMoonActive={isFullMoon}
-        onReportKill={handleReportKill}
+        timeoutMinutes={gameState.settings?.pendingDeathTimeoutMinutes || 4}
+        onConfirmKill={handleConfirmKill}
         onExorcise={handleExorcise}
       />
 
@@ -1128,13 +1240,26 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
         />
       )}
 
-      {/* SELF DEATH CONFIRMATION MODAL */}
+      {/* SELF DEATH CONFIRMATION MODAL ("Ich wurde getötet") */}
       <SelfDeathModal
         isOpen={isSelfDeathModalOpen}
         onClose={() => setIsSelfDeathModalOpen(false)}
         playerName={player.name}
         onConfirmDeath={handleSelfReportDeath}
       />
+
+      {/* SPEZIALAUFGABE MINI-GAME MODAL (für lebende Menschen) */}
+      {isSpecialModalOpen && activeSpecialTask && (
+        <SpecialTaskModal
+          isOpen={isSpecialModalOpen}
+          onClose={() => {
+            setIsSpecialModalOpen(false);
+            setActiveSpecialTask(null);
+          }}
+          task={activeSpecialTask}
+          onSolve={handleSolveSpecialTask}
+        />
+      )}
     </div>
   );
 };

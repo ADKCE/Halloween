@@ -62,6 +62,30 @@ class GameApiClient {
     return supabaseService.stopFullMoon(adminCode);
   }
 
+  async reportPendingDeath(playerId: string): Promise<{ success: boolean; message: string }> {
+    return supabaseService.reportPendingDeath(playerId);
+  }
+
+  async confirmKill(
+    killerIdOrKillId: string,
+    victimId?: string,
+    ghostSoloConfirmed = false
+  ): Promise<{ success: boolean; message: string; cooldownUntil?: string }> {
+    return supabaseService.confirmKill(killerIdOrKillId, victimId, ghostSoloConfirmed);
+  }
+
+  async adminConfirmKill(adminCode: string, victimId: string, killerId?: string): Promise<void> {
+    return supabaseService.adminConfirmKill(adminCode, victimId, killerId);
+  }
+
+  async adminRevivePlayer(adminCode: string, playerId: string): Promise<void> {
+    return supabaseService.adminRevivePlayer(adminCode, playerId);
+  }
+
+  async tickGame(): Promise<any> {
+    return supabaseService.tickGame();
+  }
+
   async reportKill(params: {
     killerId: string;
     victimId: string;
@@ -80,10 +104,6 @@ class GameApiClient {
     return supabaseService.exorcise(hunterId, targetId);
   }
 
-  async confirmKill(killId: string): Promise<void> {
-    return supabaseService.confirmKill(killId, false);
-  }
-
   async reportSelfDeath(playerId: string, killerRole?: string): Promise<{ confirmedExisting: boolean; message: string }> {
     return supabaseService.reportSelfDeath(playerId, killerRole);
   }
@@ -97,6 +117,7 @@ class GameApiClient {
     taskId: string;
     taskTitle: string;
     photoBlobOrUrl: Blob | File | string;
+    slotNumber?: number;
   }): Promise<{ pointsAwarded: number }> {
     return supabaseService.completePhotoTask(params);
   }
@@ -109,8 +130,10 @@ class GameApiClient {
     specialTaskId: string;
     playerId: string;
     userAnswer?: number;
-    scannedQrCode?: string;
-    photoBlobOrUrl?: Blob | File | string;
+    mathAnswers?: number[];
+    anagramAnswer?: string;
+    sequenceAnswer?: string[];
+    codeAnswer?: string;
   }): Promise<{ success: boolean; rewardPlayerName: string; rewardRole: RoleType; message: string }> {
     return supabaseService.completeSpecialTask(params);
   }

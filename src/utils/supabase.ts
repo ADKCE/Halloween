@@ -12,8 +12,17 @@ import {
   GameSettings,
   SpecialTaskAssignment,
   FullMoonEvent,
+  PlayerPhotoTask,
 } from '../types/game';
-import { DEFAULT_PHOTO_TASKS, DEFAULT_QUIZ_QUESTIONS } from './gameDataPool';
+import {
+  DEFAULT_PHOTO_TASKS,
+  DEFAULT_QUIZ_QUESTIONS,
+  HALLOWEEN_ANAGRAMS,
+  generateScrambledWord,
+  generateMathQuestions,
+  generateSequence,
+  generateSecretCode,
+} from './gameDataPool';
 import {
   distributeRoles,
   determineLateJoinerRole,
@@ -50,7 +59,8 @@ export const DEFAULT_GAME_SETTINGS: GameSettings = {
   werewolfCooldownMinutes: 2,
   hunterHitCooldownMinutes: 15,
   hunterMissPenaltyMinutes: 30,
-  killConfirmationTimeoutMinutes: 5,
+  pendingDeathTimeoutMinutes: 4,
+  unconfirmedKillAction: 'revive',
   fullMoonMinIntervalMinutes: 20,
   fullMoonMaxIntervalMinutes: 40,
   fullMoonDurationMinutes: 5,
@@ -58,6 +68,8 @@ export const DEFAULT_GAME_SETTINGS: GameSettings = {
   pointsSpecialTask: 20,
   pointsEvilKill: 15,
   pointsExorcismSuccess: 25,
+  photoTaskIntervalMinutes: 10,
+  photoTaskExpirationMinutes: 30,
   photoDownloadUnlocked: 'ended',
   specialTaskIntervalMinMinutes: 10,
   specialTaskIntervalMaxMinutes: 20,
@@ -348,6 +360,7 @@ class SupabaseService {
           tasksCompletedCount: p.tasks_completed_count || 0,
           cooldownUntil: p.cooldown_until || undefined,
           lastKillAt: p.last_kill_at || undefined,
+          pendingDeathAt: p.pending_death_at || null,
           joinedAt: p.created_at,
         };
       });
@@ -378,19 +391,7 @@ class SupabaseService {
         createdAt: k.created_at,
       }));
 
-      // Check auto-confirmation of pending kills (if older than killConfirmationTimeoutMinutes)
-      if (gameState.status === 'Läuft') {
-        const timeoutMinutes = settings.killConfirmationTimeoutMinutes || 5;
-        const now = Date.now();
-        const pendingKills = mappedKills.filter((k) => !k.confirmed);
-        for (const pk of pendingKills) {
-          const killTime = new Date(pk.createdAt).getTime();
-          if (now - killTime > timeoutMinutes * 60 * 1000) {
-            // Auto confirm!
-            this.confirmKill(pk.id, true).catch((e) => console.warn('Auto confirm error:', e));
-          }
-        }
-      }
+
 
       // Check win conditions if game is running
       if (gameState.status === 'Läuft') {
@@ -444,6 +445,77 @@ class SupabaseService {
         createdAt: ph.created_at,
       }));
 
+      // 7. Fetch player photo tasks (from DB table player_photo_tasks)
+      let mappedPhotoTasks: PlayerPhotoTask[] = [];
+      if (playerId) {
+        try {
+          const { data: ptData } = await client
+            .from('player_photo_tasks')
+            .select('*')
+            .eq('player_id', playerId)
+            .order('slot_number', { ascending: false });
+
+          if (ptData && Array.isArray(ptData)) {
+            mappedPhotoTasks = ptData.map((pt: any) => ({
+              id: pt.id,
+              playerId: pt.player_id,
+              slotNumber: pt.slot_number,
+              title: pt.title,
+              description: pt.description,
+              taskType: pt.task_type,
+              targetPlayerId: pt.target_player_id,
+              targetPlayerName: pt.target_player_name,
+              targetPlayerCostume: pt.target_player_costume,
+              targetPlayerPhoto: pt.target_player_photo,
+              targetSecondPlayerId: pt.target_second_player_id,
+              targetSecondPlayerName: pt.target_second_player_name,
+              targetSecondPlayerCostume: pt.target_second_player_costume,
+              targetSecondPlayerPhoto: pt.target_second_player_photo,
+              targetCostumeName: pt.target_costume_name,
+              groupCount: pt.group_count,
+              points: pt.points || 10,
+              status: pt.status || 'open',
+              createdAt: pt.created_at,
+              expiresAt: pt.expires_at,
+              completedAt: pt.completed_at,
+              photoUrl: pt.photo_url,
+            }));
+          }
+        } catch {}
+      }
+
+      // 8. Fetch special tasks (for living humans)
+      let mappedSpecialTasks: SpecialTaskAssignment[] = [];
+      if (playerId) {
+        try {
+          const { data: stData } = await client
+            .from('special_tasks')
+            .select('*')
+            .eq('player_id', playerId)
+            .order('created_at', { ascending: false })
+            .limit(5);
+
+          if (stData && Array.isArray(stData)) {
+            mappedSpecialTasks = stData.map((st: any) => ({
+              id: st.id,
+              playerId: st.player_id,
+              type: st.type,
+              title: st.title,
+              description: st.description,
+              points: st.points || 20,
+              status: st.status || (st.completed_at ? 'completed' : 'pending'),
+              createdAt: st.created_at,
+              expiresAt: st.expires_at,
+              completedAt: st.completed_at,
+              rewardRevealedPlayerId: st.reward_player_id,
+              rewardRevealedPlayerName: st.reward_player_name,
+              rewardRevealedRole: st.reward_role,
+              taskData: st.task_data || {},
+            }));
+          }
+        } catch {}
+      }
+
       this.lastSyncTime = new Date().toLocaleTimeString();
       this.lastError = null;
 
@@ -454,6 +526,8 @@ class SupabaseService {
         tasks: mappedTasks,
         taskCompletions: mappedCompletions,
         photos: mappedPhotos,
+        photoTasks: mappedPhotoTasks,
+        specialTasks: mappedSpecialTasks,
         totalJoinedCount: mappedPlayers.filter((p) => p.status !== 'entfernt').length,
       };
     } catch (err: any) {
@@ -1231,163 +1305,616 @@ class SupabaseService {
     };
   }
 
-  // --- CONFIRM OR UNDO KILL ---
-  public async confirmKill(killId: string, auto = false): Promise<void> {
+  // ==============================================================================
+  // --- 1. NEUER KILL-ABLAUF (Opfer meldet pending_death, Täter bestätigt) ---
+  // ==============================================================================
+
+  /**
+   * Opfer meldet sich selbst als getötet -> setzt Status auf 'pending_death' mit Zeitstempel
+   */
+  public async reportPendingDeath(playerId: string): Promise<{ success: boolean; message: string }> {
     const client = this.getClient();
     if (!client) throw new Error('Supabase nicht verfügbar');
 
-    const { data: kill, error: fetchErr } = await client.from('kills').select('*').eq('id', killId).single();
-    if (fetchErr) {
-      this.lastError = `Kill-Abruf fehlgeschlagen: ${fetchErr.message}`;
-      throw new Error(`Kill nicht gefunden: ${fetchErr.message}`);
-    }
-    if (!kill) return;
-    if (kill.confirmed) return;
-
-    const { data: stateData } = await client.from('game_state').select('settings').eq('id', 'main').single();
-    const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...(stateData?.settings || {}) };
-
-    // 1. Mark victim as tot
-    const { error: victimUpdateError } = await client.from('players').update({ status: 'tot' }).eq('id', kill.victim_id);
-    if (victimUpdateError) {
-      this.lastError = `Spielerstatus-Update fehlgeschlagen: ${victimUpdateError.message}`;
-      throw new Error(`Konnte Opfer nicht als tot markieren: ${victimUpdateError.message}`);
-    }
-
-    // 2. Award killer points (+15 Pkt für bösen Kill) falls Täter existiert
-    if (kill.killer_id) {
-      const { data: killer } = await client.from('players').select('points, kills_count').eq('id', kill.killer_id).single();
-      if (killer) {
-        await this.safeUpdatePlayer(
-          kill.killer_id,
-          {
-            points: (killer.points || 0) + (settings.pointsEvilKill || 15),
-            kills_count: (killer.kills_count || 0) + 1,
-          },
-          ['points']
-        );
-      }
-    }
-
-    // 3. Mark kill confirmed
-    const { error: confirmErr } = await client
-      .from('kills')
-      .update({
-        confirmed: true,
-        confirmed_at: new Date().toISOString(),
-        auto_confirmed: auto,
-      })
-      .eq('id', killId);
-
-    if (confirmErr) {
-      this.lastError = `Kill-Bestätigung fehlgeschlagen: ${confirmErr.message}`;
-      throw new Error(`Kill-Bestätigung in DB fehlgeschlagen: ${confirmErr.message}`);
-    }
-  }
-
-  // --- REPORT SELF DEATH ("ICH WURDE GETÖTET") ---
-  public async reportSelfDeath(
-    playerId: string,
-    killerRole: string = 'Unbekannt'
-  ): Promise<{ confirmedExisting: boolean; message: string }> {
-    const client = this.getClient();
-    if (!client) throw new Error('Supabase nicht verfügbar');
-
-    // 1. Zuerst serverseitige Postgres-Funktion mark_self_dead versuchen (RPC)
+    // 1. Zuerst serverseitige Postgres-Funktion RPC "report_pending_death" versuchen
     try {
-      const { data: rpcData, error: rpcError } = await client.rpc('mark_self_dead', {
-        p_player_id: playerId,
-        p_killer_role: killerRole || 'Unbekannt',
-      });
-
-      if (!rpcError && rpcData && rpcData.success) {
-        return {
-          confirmedExisting: Boolean(rpcData.confirmed_existing_kill),
-          message: rpcData.confirmed_existing_kill
-            ? 'Offener Angriff erfolgreich bestätigt! Du bist nun im Totenreich.'
-            : 'Du hast dich als tot markiert. Willkommen im Totenreich (Zuschauer-Modus)!',
-        };
+      const { data, error } = await client.rpc('report_pending_death', { p_player_id: playerId });
+      if (!error && data && data.success) {
+        return { success: true, message: data.message || 'Warte auf Bestätigung durch den Täter.' };
       }
-    } catch (rpcEx) {
-      console.warn('RPC mark_self_dead nicht verfügbar oder fehlgeschlagen, nutze Client-Fallback:', rpcEx);
+    } catch {}
+
+    // 2. Client-seitiger Fallback
+    const { data: player, error: fetchErr } = await client.from('players').select('id, status').eq('id', playerId).single();
+    if (fetchErr || !player) throw new Error('Spieler nicht gefunden');
+    if (player.status !== 'lebendig') {
+      throw new Error('Nur lebende Spieler können sich als getötet melden');
     }
 
-    // 2. Fallback: Client-basierte Abwicklung
-    // a) Prüfen, ob bereits ein offener Kill vorliegt
-    const { data: openKills, error: openKillErr } = await client
-      .from('kills')
-      .select('*')
-      .eq('victim_id', playerId)
-      .eq('confirmed', false)
-      .order('created_at', { ascending: false })
-      .limit(1);
-
-    if (!openKillErr && openKills && openKills.length > 0) {
-      await this.confirmKill(openKills[0].id);
-      return {
-        confirmedExisting: true,
-        message: 'Offener Angriff erfolgreich bestätigt! Du bist nun im Totenreich.',
-      };
-    }
-
-    // b) Kein offener Kill vorhanden: Spieler auf 'tot' setzen
-    const { error: updateError } = await client
+    const { error: updateErr } = await client
       .from('players')
-      .update({ status: 'tot' })
+      .update({
+        status: 'pending_death',
+        pending_death_at: new Date().toISOString(),
+      })
       .eq('id', playerId);
 
-    if (updateError) {
-      this.lastError = `Spielerstatus-Update auf 'tot' fehlgeschlagen: ${updateError.message}`;
-      throw new Error(`Konnte Spieler nicht als tot markieren: ${updateError.message}`);
-    }
-
-    // c) Opfer-Daten laden für Kill-Log Eintrag
-    const { data: victim, error: victimErr } = await client
-      .from('players')
-      .select('id, name, role, team')
-      .eq('id', playerId)
-      .single();
-
-    if (victimErr) {
-      console.warn('Opfer-Daten konnten nicht vollständig geladen werden:', victimErr.message);
-    }
-
-    // d) Neuen Eintrag in 'kills' anlegen (Täter 'Unbekannt')
-    let insertPayload: any = {
-      killer_id: null,
-      victim_id: playerId,
-      killer_name: 'Unbekannt',
-      victim_name: victim?.name || 'Spieler',
-      killer_role: killerRole || 'Unbekannt',
-      victim_role: victim?.role || 'Unbekannt',
-      killer_team: 'Böse',
-      victim_team: victim?.team || 'Gut',
-      reason: 'self_reported',
-      confirmed: true,
-      confirmed_at: new Date().toISOString(),
-      auto_confirmed: false,
-    };
-
-    const { error: insertError } = await client.from('kills').insert([insertPayload]);
-    if (insertError) {
-      // Falls killer_id NOT NULL ist (bevor der Nutzer das SQL-Skript ausgeführt hat),
-      // nutzen wir als Ausweichlösung victim.id als killer_id mit Name 'Unbekannt'
-      if (insertError.message?.includes('killer_id') || insertError.code === '23502') {
-        insertPayload.killer_id = playerId;
-        const { error: retryError } = await client.from('kills').insert([insertPayload]);
-        if (retryError) {
-          this.lastError = `Kill-Log Eintrag fehlgeschlagen: ${retryError.message}`;
-          throw new Error(`Kill-Log Eintrag fehlgeschlagen: ${retryError.message}`);
-        }
-      } else {
-        this.lastError = `Kill-Log Eintrag fehlgeschlagen: ${insertError.message}`;
-        throw new Error(`Kill-Log Eintrag fehlgeschlagen: ${insertError.message}`);
-      }
+    if (updateErr) {
+      throw new Error(`Konnte Status nicht aktualisieren: ${updateErr.message}`);
     }
 
     return {
+      success: true,
+      message: 'Du hast dich als getötet gemeldet. Warte auf Bestätigung durch den Täter.',
+    };
+  }
+
+  /**
+   * Täter (Vampir, Werwolf, Geist) wählt ein Opfer im Status 'pending_death' und bestätigt den Kill
+   */
+  public async confirmKill(
+    killerIdOrKillId: string,
+    victimId?: string,
+    ghostSoloConfirmed = false
+  ): Promise<{ success: boolean; message: string; cooldownUntil?: string }> {
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    // Wenn nur 1 Parameter übergeben wurde: altes Format mit killId
+    if (!victimId) {
+      const { data: kill } = await client.from('kills').select('*').eq('id', killerIdOrKillId).single();
+      if (!kill || kill.confirmed) return { success: true, message: 'Bereits bestätigt' };
+      await client.from('players').update({ status: 'tot', pending_death_at: null }).eq('id', kill.victim_id);
+      await client.from('kills').update({ confirmed: true, confirmed_at: new Date().toISOString() }).eq('id', killerIdOrKillId);
+      return { success: true, message: 'Kill bestätigt' };
+    }
+
+    const killerId = killerIdOrKillId;
+
+    // 1. Zuerst serverseitige Postgres-Funktion RPC "confirm_kill" aufrufen (atomar mit FOR UPDATE)
+    try {
+      const { data, error } = await client.rpc('confirm_kill', {
+        p_killer_id: killerId,
+        p_victim_id: victimId,
+        p_ghost_solo: Boolean(ghostSoloConfirmed),
+      });
+
+      if (!error && data) {
+        if (!data.success) {
+          throw new Error(data.error || 'Kill-Bestätigung fehlgeschlagen');
+        }
+        if (data.cooldownUntil) {
+          try {
+            sessionStorage.setItem(`cd_${killerId}`, data.cooldownUntil);
+          } catch {}
+        }
+        return {
+          success: true,
+          message: data.message || 'Kill erfolgreich bestätigt! +15 Punkte.',
+          cooldownUntil: data.cooldownUntil,
+        };
+      }
+    } catch (rpcErr: any) {
+      // Wenn der Fehler eine Business-Logik-Meldung ist (z.B. Cooldown aktiv), diesen direkt weiterwerfen
+      if (rpcErr.message && !rpcErr.message.includes('function') && !rpcErr.message.includes('does not exist')) {
+        throw rpcErr;
+      }
+      console.warn('RPC confirm_kill nicht verfügbar, führe Client-Fallback aus:', rpcErr);
+    }
+
+    // 2. Client-seitiger Fallback (validiert alle Regeln serverseitig über Tabellenabfragen)
+    const { data: stateData } = await client.from('game_state').select('*').eq('id', 'main').single();
+    if (stateData?.status !== 'Läuft') throw new Error('Das Spiel läuft derzeit nicht!');
+
+    const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...(stateData.settings || {}) };
+    const now = Date.now();
+
+    // Schonfrist prüfen
+    if (stateData.started_at) {
+      const elapsedMin = (now - new Date(stateData.started_at).getTime()) / (1000 * 60);
+      const graceMin = settings.gracePeriodMinutes || 15;
+      if (elapsedMin < graceMin) {
+        const remaining = Math.ceil(graceMin - elapsedMin);
+        throw new Error(`Schonfrist aktiv! Noch ${remaining} Minuten.`);
+      }
+    }
+
+    const { data: killer } = await client.from('players').select('*').eq('id', killerId).single();
+    const { data: victim } = await client.from('players').select('*').eq('id', victimId).single();
+
+    if (!killer || !victim) throw new Error('Spieler nicht gefunden');
+    if (killer.status !== 'lebendig') throw new Error('Nur lebende Spieler können Kills bestätigen');
+    if (!['Vampir', 'Werwolf', 'Geist'].includes(killer.role)) {
+      throw new Error('Nur böse Rollen (Vampir, Werwolf, Geist) können Kills bestätigen');
+    }
+
+    // Cooldown prüfen
+    if (killer.cooldown_until) {
+      const cdEnd = new Date(killer.cooldown_until).getTime();
+      if (now < cdEnd) {
+        const diffSec = Math.ceil((cdEnd - now) / 1000);
+        throw new Error(`Dein Cooldown ist noch aktiv! Bitte warte noch ${diffSec} Sekunden.`);
+      }
+    }
+
+    // Werwolf nur bei Vollmond
+    if (killer.role === 'Werwolf' && !this.isFullMoonActive(stateData)) {
+      throw new Error('Werwölfe können nur bei aktivem Vollmond töten!');
+    }
+
+    // Geist Allein-im-Raum Checkbox
+    if (killer.role === 'Geist' && !ghostSoloConfirmed) {
+      throw new Error('Als Geist musst du bestätigen, dass du mit dem Opfer allein im Raum warst!');
+    }
+
+    // Opfer-Status prüfen
+    if (victim.status !== 'pending_death' && victim.status !== 'tod_ausstehend') {
+      throw new Error('Dieses Opfer ist nicht im Status "Tod ausstehend" oder wurde bereits bestätigt!');
+    }
+
+    // Cooldown berechnen
+    let cooldownMinutes = 6;
+    if (killer.role === 'Vampir') cooldownMinutes = settings.vampireCooldownMinutes || 6;
+    else if (killer.role === 'Werwolf') cooldownMinutes = settings.werewolfCooldownMinutes || 2;
+    else if (killer.role === 'Geist') cooldownMinutes = settings.ghostCooldownMinutes || 6;
+
+    const cooldownUntil = new Date(now + cooldownMinutes * 60 * 1000).toISOString();
+    try {
+      sessionStorage.setItem(`cd_${killer.id}`, cooldownUntil);
+    } catch {}
+
+    // Opfer endgültig töten
+    await client
+      .from('players')
+      .update({ status: 'tot', pending_death_at: null })
+      .eq('id', victim.id);
+
+    // Täter Punkte und Cooldown
+    await this.safeUpdatePlayer(
+      killer.id,
+      {
+        points: (killer.points || 0) + (settings.pointsEvilKill || 15),
+        kills_count: (killer.kills_count || 0) + 1,
+        last_kill_at: new Date().toISOString(),
+        cooldown_until: cooldownUntil,
+      },
+      ['points']
+    );
+
+    // Kill ins Log eintragen
+    await client.from('kills').insert([
+      {
+        killer_id: killer.id,
+        victim_id: victim.id,
+        killer_name: killer.name,
+        victim_name: victim.name,
+        killer_role: killer.role,
+        victim_role: victim.role,
+        killer_team: 'Böse',
+        victim_team: victim.team,
+        reason: 'kill',
+        ghost_solo_confirmed: Boolean(ghostSoloConfirmed),
+        confirmed: true,
+        confirmed_at: new Date().toISOString(),
+      },
+    ]);
+
+    return {
+      success: true,
+      message: `Kill an ${victim.name} erfolgreich bestätigt! +15 Punkte.`,
+      cooldownUntil,
+    };
+  }
+
+  /**
+   * Admin-Funktionen: Kill manuell bestätigen oder Spieler wiederbeleben
+   */
+  public async adminConfirmKill(adminCode: string, victimId: string, killerId?: string): Promise<void> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    try {
+      const { data, error } = await client.rpc('admin_confirm_kill', {
+        p_admin_code: adminCode,
+        p_victim_id: victimId,
+        p_killer_id: killerId || null,
+      });
+      if (!error && data?.success) return;
+    } catch {}
+
+    const { data: victim } = await client.from('players').select('*').eq('id', victimId).single();
+    if (!victim) throw new Error('Opfer nicht gefunden');
+
+    await client.from('players').update({ status: 'tot', pending_death_at: null }).eq('id', victimId);
+
+    await client.from('kills').insert([
+      {
+        killer_id: killerId || null,
+        victim_id: victim.id,
+        killer_name: killerId ? 'Täter' : 'Admin-Bestätigung',
+        victim_name: victim.name,
+        victim_role: victim.role,
+        reason: 'admin_confirmed',
+        confirmed: true,
+        confirmed_at: new Date().toISOString(),
+      },
+    ]);
+  }
+
+  public async adminRevivePlayer(adminCode: string, playerId: string): Promise<void> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    try {
+      const { data, error } = await client.rpc('admin_revive_player', {
+        p_admin_code: adminCode,
+        p_player_id: playerId,
+      });
+      if (!error && data?.success) return;
+    } catch {}
+
+    await client
+      .from('players')
+      .update({ status: 'lebendig', pending_death_at: null })
+      .eq('id', playerId);
+  }
+
+  /**
+   * tickGame: Führt serverseitigen Postgres-Ticker tick_game() aus oder Client-Fallback.
+   * Prüft:
+   * 1. 4-Minuten-Timeout für ausstehende Tode (wiederbeleben vs. als tot lassen)
+   * 2. Foto-Aufgaben Generierung für jeden lebenden Spieler alle 10 Minuten (Slot-basiert, max 3 offene)
+   * 3. 30-Minuten-Ablauf für offene Foto-Aufgaben
+   * 4. Spezialaufgaben für lebende Menschen alle 10-20 Minuten
+   */
+  public async tickGame(): Promise<any> {
+    const client = this.getClient();
+    if (!client) return null;
+
+    try {
+      const { data, error } = await client.rpc('tick_game');
+      if (!error && data) {
+        return data;
+      }
+    } catch {}
+
+    return await this.fallbackTickGame();
+  }
+
+  private async fallbackTickGame(): Promise<any> {
+    const client = this.getClient();
+    if (!client) return null;
+
+    try {
+      const { data: stateData } = await client.from('game_state').select('*').eq('id', 'main').single();
+      if (!stateData || stateData.status !== 'Läuft' || !stateData.started_at) {
+        return { status: 'idle' };
+      }
+
+      const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...(stateData.settings || {}) };
+      const now = Date.now();
+      const elapsedMin = Math.floor((now - new Date(stateData.started_at).getTime()) / (1000 * 60));
+
+      // ------------------------------------------------------------------------
+      // A) Ausstehende Tode prüfen (Standard: 4 Minuten Frist)
+      // ------------------------------------------------------------------------
+      const timeoutMin = settings.pendingDeathTimeoutMinutes ?? 4;
+      const unconfirmedAction = settings.unconfirmedKillAction ?? 'revive';
+
+      const { data: pendingPlayers } = await client
+        .from('players')
+        .select('*')
+        .in('status', ['pending_death', 'tod_ausstehend']);
+
+      if (pendingPlayers && pendingPlayers.length > 0) {
+        for (const p of pendingPlayers) {
+          if (!p.pending_death_at) continue;
+          const pendingTime = new Date(p.pending_death_at).getTime();
+          if (now - pendingTime >= timeoutMin * 60 * 1000) {
+            if (unconfirmedAction === 'stay_dead') {
+              await client.from('players').update({ status: 'tot', pending_death_at: null }).eq('id', p.id);
+            } else {
+              await client.from('players').update({ status: 'lebendig', pending_death_at: null }).eq('id', p.id);
+            }
+
+            await client.from('kills').insert([
+              {
+                killer_id: null,
+                victim_id: p.id,
+                killer_name: 'Nicht bestätigt',
+                victim_name: p.name,
+                victim_role: p.role,
+                reason: 'unconfirmed_timeout',
+                confirmed: true,
+                confirmed_at: new Date().toISOString(),
+              },
+            ]);
+          }
+        }
+      }
+
+      // ------------------------------------------------------------------------
+      // B) Foto-Aufgaben generieren (alle 10 Min, max 3 offene, 30 Min Ablauf)
+      // ------------------------------------------------------------------------
+      const photoInterval = settings.photoTaskIntervalMinutes ?? 10;
+      const currentSlot = Math.floor(elapsedMin / photoInterval);
+
+      const { data: livingPlayers } = await client
+        .from('players')
+        .select('id, name, costume_name, photo_url')
+        .eq('status', 'lebendig');
+
+      if (livingPlayers && livingPlayers.length > 0) {
+        // Zuerst abgelaufene Aufgaben (älter als 30 Min) auf 'expired' setzen
+        try {
+          await client
+            .from('player_photo_tasks')
+            .update({ status: 'expired' })
+            .eq('status', 'open')
+            .lt('expires_at', new Date().toISOString());
+        } catch {}
+
+        for (const lp of livingPlayers) {
+          try {
+            // Prüfen, ob für diesen Slot schon eine Aufgabe existiert
+            const { data: existingSlot } = await client
+              .from('player_photo_tasks')
+              .select('id')
+              .eq('player_id', lp.id)
+              .eq('slot_number', currentSlot)
+              .maybeSingle();
+
+            if (existingSlot) continue;
+
+            // Prüfen, ob bereits 3 offene Aufgaben vorliegen
+            const { count } = await client
+              .from('player_photo_tasks')
+              .select('id', { count: 'exact', head: true })
+              .eq('player_id', lp.id)
+              .eq('status', 'open');
+
+            if ((count || 0) >= 3) continue;
+
+            // Andere lebende Spieler zur Auswahl
+            const others = livingPlayers.filter((o) => o.id !== lp.id);
+            if (others.length === 0) continue;
+
+            const target = others[Math.floor(Math.random() * others.length)];
+            const secondOthers = others.filter((o) => o.id !== target.id);
+            const secondTarget = secondOthers.length > 0 ? secondOthers[Math.floor(Math.random() * secondOthers.length)] : null;
+
+            const taskTypeRandom = Math.floor(Math.random() * 4);
+            let title = '';
+            let description = '';
+            let taskType = 'specific_player';
+            let targetPlayerId: string | null = null;
+            let targetPlayerName: string | null = null;
+            let targetPlayerCostume: string | null = null;
+            let targetPlayerPhoto: string | null = null;
+            let targetSecondPlayerId: string | null = null;
+            let targetSecondPlayerName: string | null = null;
+            let targetCostumeName: string | null = null;
+            let groupCount: number | null = null;
+
+            if (taskTypeRandom === 0) {
+              // 1. Foto mit bestimmtem Spieler (niemals Rolle nennen!)
+              taskType = 'specific_player';
+              title = `Foto mit ${target.name}`;
+              description = `Mach ein Foto mit ${target.name} (${target.costume_name || 'Grusel-Kostüm'}).`;
+              targetPlayerId = target.id;
+              targetPlayerName = target.name;
+              targetPlayerCostume = target.costume_name;
+              targetPlayerPhoto = target.photo_url;
+            } else if (taskTypeRandom === 1) {
+              // 2. Foto mit jemandem in bestimmtem Kostüm
+              taskType = 'specific_costume';
+              const costume = target.costume_name || 'Hexen- oder Vampirkostüm';
+              title = `Kostüm: ${costume}`;
+              description = `Mach ein Foto mit jemandem im Kostüm "${costume}".`;
+              targetCostumeName = costume;
+            } else if (taskTypeRandom === 2) {
+              // 3. Gruppenfoto (3 bis 8 Leute)
+              taskType = 'group';
+              const countNeeded = Math.floor(Math.random() * 6) + 3; // 3 bis 8
+              title = `Gruppenfoto (${countNeeded} Personen)`;
+              description = `Mach ein Gruppenfoto mit mindestens ${countNeeded} Leuten!`;
+              groupCount = countNeeded;
+            } else {
+              // 4. Foto mit zwei Personen zusammen
+              if (secondTarget) {
+                taskType = 'two_players';
+                title = `Foto mit ${target.name} & ${secondTarget.name}`;
+                description = `Mach ein Foto mit ${target.name} und ${secondTarget.name} zusammen.`;
+                targetPlayerId = target.id;
+                targetPlayerName = target.name;
+                targetPlayerCostume = target.costume_name;
+                targetPlayerPhoto = target.photo_url;
+                targetSecondPlayerId = secondTarget.id;
+                targetSecondPlayerName = secondTarget.name;
+              } else {
+                taskType = 'specific_player';
+                title = `Foto mit ${target.name}`;
+                description = `Mach ein Foto mit ${target.name}.`;
+                targetPlayerId = target.id;
+                targetPlayerName = target.name;
+                targetPlayerCostume = target.costume_name;
+                targetPlayerPhoto = target.photo_url;
+              }
+            }
+
+            const expiresAt = new Date(now + 30 * 60 * 1000).toISOString();
+
+            await client.from('player_photo_tasks').insert([
+              {
+                player_id: lp.id,
+                slot_number: currentSlot,
+                title,
+                description,
+                task_type: taskType,
+                target_player_id: targetPlayerId,
+                target_player_name: targetPlayerName,
+                target_player_costume: targetPlayerCostume,
+                target_player_photo: targetPlayerPhoto,
+                target_second_player_id: targetSecondPlayerId,
+                target_second_player_name: targetSecondPlayerName,
+                target_costume_name: targetCostumeName,
+                group_count: groupCount,
+                points: settings.pointsPhotoTask || 10,
+                status: 'open',
+                expires_at: expiresAt,
+              },
+            ]);
+          } catch {}
+        }
+      }
+
+      // ------------------------------------------------------------------------
+      // C) Spezialaufgaben für lebende Menschen (alle 10-20 Minuten, 1-2 Spieler)
+      // ------------------------------------------------------------------------
+      const { data: livingHumans } = await client
+        .from('players')
+        .select('id, name')
+        .eq('role', 'Mensch')
+        .eq('status', 'lebendig');
+
+      if (livingHumans && livingHumans.length > 0) {
+        // Prüfen, wann die letzte Spezialaufgabe erzeugt wurde
+        const { data: lastSpecials } = await client
+          .from('special_tasks')
+          .select('created_at')
+          .order('created_at', { ascending: false })
+          .limit(1);
+
+        let shouldTriggerSpecial = false;
+        if (!lastSpecials || lastSpecials.length === 0) {
+          if (elapsedMin >= 10) shouldTriggerSpecial = true;
+        } else {
+          const lastTime = new Date(lastSpecials[0].created_at).getTime();
+          const minutesSinceLast = (now - lastTime) / (1000 * 60);
+          if (minutesSinceLast >= 15) shouldTriggerSpecial = true;
+        }
+
+        if (shouldTriggerSpecial) {
+          // Wähle 1 bis 2 zufällige Menschen aus
+          const shuffledHumans = [...livingHumans].sort(() => 0.5 - Math.random());
+          const chosenCount = Math.min(shuffledHumans.length, Math.floor(Math.random() * 2) + 1);
+          const chosenHumans = shuffledHumans.slice(0, chosenCount);
+
+          const miniGameTypes: ('math' | 'anagram' | 'sequence' | 'quiz' | 'code')[] = [
+            'math',
+            'anagram',
+            'sequence',
+            'quiz',
+            'code',
+          ];
+
+          for (const human of chosenHumans) {
+            const chosenType = miniGameTypes[Math.floor(Math.random() * miniGameTypes.length)];
+            let title = '';
+            let description = '';
+            let taskData: any = {};
+
+            if (chosenType === 'math') {
+              title = 'Spezialaufgabe: Kopfrechnen';
+              description = 'Löse 3 Kopfrechenaufgaben nacheinander in 60 Sekunden!';
+              taskData = {
+                math: {
+                  questions: generateMathQuestions(),
+                  timeLimitSeconds: 60,
+                },
+              };
+            } else if (chosenType === 'anagram') {
+              const anagramItem = HALLOWEEN_ANAGRAMS[Math.floor(Math.random() * HALLOWEEN_ANAGRAMS.length)];
+              const scrambled = generateScrambledWord(anagramItem.word);
+              title = 'Spezialaufgabe: Halloween-Anagramm';
+              description = `Entschlüssle das Buchstabensalat-Wort "${scrambled}" in 30 Sekunden!`;
+              taskData = {
+                anagram: {
+                  scrambledWord: scrambled,
+                  originalWord: anagramItem.word,
+                  hint: anagramItem.hint,
+                  timeLimitSeconds: 30,
+                },
+              };
+            } else if (chosenType === 'sequence') {
+              const seq = generateSequence(5);
+              title = 'Spezialaufgabe: Merk-Sequenz';
+              description = 'Merke dir die Reihenfolge der 5 Halloween-Symbole und tippe sie nach!';
+              taskData = {
+                sequence: {
+                  symbols: ['🎃', '👻', '🦇', '💀', '🕷️'],
+                  sequence: seq,
+                  timeLimitSeconds: 40,
+                },
+              };
+            } else if (chosenType === 'quiz') {
+              const q = DEFAULT_QUIZ_QUESTIONS[Math.floor(Math.random() * DEFAULT_QUIZ_QUESTIONS.length)];
+              title = 'Spezialaufgabe: Halloween-Quiz';
+              description = 'Beantworte die Grusel-Frage richtig in 20 Sekunden!';
+              taskData = {
+                quiz: {
+                  question: q.question,
+                  options: q.options,
+                  correctIndex: q.correctIndex,
+                  explanation: q.explanation,
+                  timeLimitSeconds: 20,
+                },
+              };
+            } else {
+              // Code
+              const secret = generateSecretCode(4);
+              title = 'Spezialaufgabe: Geheimcode knacken';
+              description = 'Finde den 4-stelligen Geheimcode in 45 Sekunden durch logisches Raten!';
+              taskData = {
+                code: {
+                  secretCode: secret,
+                  timeLimitSeconds: 45,
+                },
+              };
+            }
+
+            const expiresAt = new Date(now + 10 * 60 * 1000).toISOString();
+
+            try {
+              await client.from('special_tasks').insert([
+                {
+                  player_id: human.id,
+                  type: chosenType,
+                  title,
+                  description,
+                  points: settings.pointsSpecialTask || 20,
+                  task_data: taskData,
+                  status: 'pending',
+                  expires_at: expiresAt,
+                },
+              ]);
+            } catch {}
+          }
+        }
+      }
+
+      return { status: 'success', elapsedMin };
+    } catch (err: any) {
+      console.warn('Fallback tick_game error:', err);
+      return { status: 'error', error: err?.message };
+    }
+  }
+
+  // Für Abwärtskompatibilität: altes reportSelfDeath leitet auf reportPendingDeath um
+  public async reportSelfDeath(
+    playerId: string,
+    _killerRole: string = 'Unbekannt'
+  ): Promise<{ confirmedExisting: boolean; message: string }> {
+    const res = await this.reportPendingDeath(playerId);
+    return {
       confirmedExisting: false,
-      message: 'Du hast dich als tot gemeldet. Willkommen im Totenreich (Zuschauer-Modus)!',
+      message: res.message,
     };
   }
 
@@ -1402,19 +1929,21 @@ class SupabaseService {
     if (!kill) throw new Error('Kill nicht gefunden');
 
     // Revive victim
-    await client.from('players').update({ status: 'lebendig' }).eq('id', kill.victim_id);
+    await client.from('players').update({ status: 'lebendig', pending_death_at: null }).eq('id', kill.victim_id);
 
     // Deduct killer points
-    const { data: killer } = await client.from('players').select('points, kills_count').eq('id', kill.killer_id).single();
-    if (killer) {
-      await this.safeUpdatePlayer(
-        kill.killer_id,
-        {
-          points: Math.max(0, (killer.points || 0) - 15),
-          kills_count: Math.max(0, (killer.kills_count || 0) - 1),
-        },
-        ['points']
-      );
+    if (kill.killer_id) {
+      const { data: killer } = await client.from('players').select('points, kills_count').eq('id', kill.killer_id).single();
+      if (killer) {
+        await this.safeUpdatePlayer(
+          kill.killer_id,
+          {
+            points: Math.max(0, (killer.points || 0) - 15),
+            kills_count: Math.max(0, (killer.kills_count || 0) - 1),
+          },
+          ['points']
+        );
+      }
     }
 
     // Delete kill record
@@ -1427,6 +1956,7 @@ class SupabaseService {
     taskId: string;
     taskTitle: string;
     photoBlobOrUrl: Blob | File | string;
+    slotNumber?: number;
   }): Promise<{ pointsAwarded: number }> {
     const client = this.getClient();
     if (!client) throw new Error('Supabase nicht verfügbar');
@@ -1440,8 +1970,22 @@ class SupabaseService {
     const uploadedPhotoUrl = await this.uploadPhoto(params.photoBlobOrUrl, 'task');
     const taskPoints = settings.pointsPhotoTask || 10;
 
-    // 1. Insert completion (keine getaggten Personen)
-    const { error: completionErr } = await client.from('task_completions').insert([
+    // 1. Task in player_photo_tasks als abgeschlossen markieren
+    try {
+      if (params.taskId) {
+        await client
+          .from('player_photo_tasks')
+          .update({
+            status: 'completed',
+            completed_at: new Date().toISOString(),
+            photo_url: uploadedPhotoUrl || null,
+          })
+          .eq('id', params.taskId);
+      }
+    } catch {}
+
+    // 2. Insert completion (keine Personen-Tags)
+    await client.from('task_completions').insert([
       {
         task_id: params.taskId,
         player_id: player.id,
@@ -1450,11 +1994,8 @@ class SupabaseService {
         points_awarded: taskPoints,
       },
     ]);
-    if (completionErr) {
-      console.warn('task_completions insert Hinweis:', completionErr.message);
-    }
 
-    // 2. Award main player points
+    // 3. Award player points (+10 Pkt)
     await this.safeUpdatePlayer(
       player.id,
       {
@@ -1464,9 +2005,9 @@ class SupabaseService {
       ['points']
     );
 
-    // 3. Add to party photo gallery (Aufgabe, Uhrzeit, Fotograf)
+    // 4. In die zentrale Galerie einfügen (Aufgabe, Uhrzeit, Fotograf - keine Rollen!)
     if (uploadedPhotoUrl) {
-      const { error: photoErr } = await client.from('photos').insert([
+      await client.from('photos').insert([
         {
           photo_url: uploadedPhotoUrl,
           task_id: params.taskId,
@@ -1475,18 +2016,12 @@ class SupabaseService {
           photographer_name: player.name,
         },
       ]);
-      if (photoErr) {
-        this.lastError = `Galerie-Eintrag fehlgeschlagen: ${photoErr.message}`;
-        console.warn('photos insert Fehler:', photoErr.message);
-      }
     }
 
-    return {
-      pointsAwarded: taskPoints,
-    };
+    return { pointsAwarded: taskPoints };
   }
 
-  // --- SPECIAL TASKS FOR HUMANS (QR Code, Quiz, Motif) ---
+  // --- SPECIAL TASKS FOR HUMANS (Kopfrechnen, Anagramm, Merk-Sequenz, Quiz, Geheimcode) ---
   public async getPendingSpecialTask(playerId: string): Promise<SpecialTaskAssignment | null> {
     const client = this.getClient();
     if (!client) return null;
@@ -1496,7 +2031,9 @@ class SupabaseService {
         .from('special_tasks')
         .select('*')
         .eq('player_id', playerId)
+        .eq('status', 'pending')
         .is('completed_at', null)
+        .gt('expires_at', new Date().toISOString())
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -1509,15 +2046,15 @@ class SupabaseService {
         type: data.type,
         title: data.title,
         description: data.description,
-        points: data.points,
-        qrCodeExpected: data.qr_code_expected,
-        quizData: data.quiz_data,
-        motifDescription: data.motif_description,
+        points: data.points || 20,
         createdAt: data.created_at,
+        expiresAt: data.expires_at,
         completedAt: data.completed_at,
+        status: data.status || 'pending',
         rewardRevealedPlayerId: data.reward_player_id,
         rewardRevealedPlayerName: data.reward_player_name,
         rewardRevealedRole: data.reward_role,
+        taskData: data.task_data || {},
       };
     } catch {
       return null;
@@ -1528,8 +2065,10 @@ class SupabaseService {
     specialTaskId: string;
     playerId: string;
     userAnswer?: number;
-    scannedQrCode?: string;
-    photoBlobOrUrl?: Blob | File | string;
+    mathAnswers?: number[];
+    anagramAnswer?: string;
+    sequenceAnswer?: string[];
+    codeAnswer?: string;
   }): Promise<{
     success: boolean;
     rewardPlayerName: string;
@@ -1543,55 +2082,97 @@ class SupabaseService {
     if (!st) throw new Error('Spezialaufgabe nicht gefunden');
     if (st.completed_at) throw new Error('Diese Aufgabe wurde bereits abgeschlossen');
 
-    // Verify answer
-    if (st.type === 'quiz') {
-      const correctIdx = st.quiz_data?.correctIndex ?? 0;
-      if (params.userAnswer !== correctIdx) {
-        throw new Error('Leider falsch beantwortet! Versuche es noch einmal.');
+    // Ablaufdatum prüfen
+    if (st.expires_at && new Date(st.expires_at).getTime() < Date.now()) {
+      await client.from('special_tasks').update({ status: 'expired' }).eq('id', params.specialTaskId);
+      throw new Error('Die Frist für diese Spezialaufgabe ist abgelaufen!');
+    }
+
+    const taskData = st.task_data || {};
+
+    // 1. Antwort prüfen
+    if (st.type === 'math') {
+      const questions = taskData.math?.questions || [];
+      const answers = params.mathAnswers || [];
+      const isAllCorrect = questions.every((q: any, idx: number) => Number(answers[idx]) === Number(q.answer));
+      if (!isAllCorrect) {
+        throw new Error('Nicht alle Kopfrechenaufgaben waren korrekt!');
       }
-    } else if (st.type === 'qr_code') {
-      if (params.scannedQrCode?.trim().toUpperCase() !== st.qr_code_expected?.trim().toUpperCase()) {
-        throw new Error('Ungültiger QR-Code für diese Spezialaufgabe!');
+    } else if (st.type === 'anagram') {
+      const target = (taskData.anagram?.originalWord || '').trim().toUpperCase();
+      const user = (params.anagramAnswer || '').trim().toUpperCase();
+      if (user !== target) {
+        throw new Error('Das eingegebene Anagramm-Wort ist leider nicht richtig!');
+      }
+    } else if (st.type === 'sequence') {
+      const targetSeq = taskData.sequence?.sequence || [];
+      const userSeq = params.sequenceAnswer || [];
+      if (targetSeq.join(',') !== userSeq.join(',')) {
+        throw new Error('Die eingegebene Symbol-Reihenfolge war leider falsch!');
+      }
+    } else if (st.type === 'quiz') {
+      const correctIdx = taskData.quiz?.correctIndex ?? 0;
+      if (params.userAnswer !== correctIdx) {
+        throw new Error('Leider falsch geantwortet!');
+      }
+    } else if (st.type === 'code') {
+      const secret = (taskData.code?.secretCode || '').trim();
+      const userCode = (params.codeAnswer || '').trim();
+      if (userCode !== secret) {
+        throw new Error('Falscher Geheimcode!');
       }
     }
 
-    // Pick a random living person to reveal
-    const { data: allLiving } = await client
+    // 2. Zufälligen lebenden BÖSEN Spieler finden, dessen Rolle aufgedeckt wird!
+    const { data: evilPlayers } = await client
       .from('players')
       .select('id, name, role')
       .neq('id', params.playerId)
-      .eq('status', 'lebendig');
+      .eq('status', 'lebendig')
+      .in('role', ['Vampir', 'Werwolf', 'Geist']);
 
-    let revealedName = 'Jemand Unbekanntes';
-    let revealedRole: RoleType = 'Mensch';
+    let revealedName = 'Ein dunkler Schatten';
+    let revealedRole: RoleType = 'Vampir';
     let revealedId = '';
 
-    if (allLiving && allLiving.length > 0) {
-      const randomTarget = allLiving[Math.floor(Math.random() * allLiving.length)];
-      revealedId = randomTarget.id;
-      revealedName = randomTarget.name;
-      revealedRole = randomTarget.role as RoleType;
+    if (evilPlayers && evilPlayers.length > 0) {
+      const randomEvil = evilPlayers[Math.floor(Math.random() * evilPlayers.length)];
+      revealedId = randomEvil.id;
+      revealedName = randomEvil.name;
+      revealedRole = randomEvil.role as RoleType;
+    } else {
+      // Falls keine bösen mehr leben: beliebiger lebender Spieler
+      const { data: anyLiving } = await client
+        .from('players')
+        .select('id, name, role')
+        .neq('id', params.playerId)
+        .eq('status', 'lebendig');
+      if (anyLiving && anyLiving.length > 0) {
+        const rand = anyLiving[Math.floor(Math.random() * anyLiving.length)];
+        revealedId = rand.id;
+        revealedName = rand.name;
+        revealedRole = rand.role as RoleType;
+      }
     }
 
     const { data: stateData } = await client.from('game_state').select('settings').eq('id', 'main').single();
     const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...(stateData?.settings || {}) };
     const taskPoints = settings.pointsSpecialTask || 20;
 
-    // Award points
+    // Punkte gutschreiben
     const { data: player } = await client.from('players').select('points').eq('id', params.playerId).single();
     if (player) {
       await client
         .from('players')
-        .update({
-          points: (player.points || 0) + taskPoints,
-        })
+        .update({ points: (player.points || 0) + taskPoints })
         .eq('id', params.playerId);
     }
 
-    // Mark task completed & save reward
+    // Aufgabe als abgeschlossen markieren
     await client
       .from('special_tasks')
       .update({
+        status: 'completed',
         completed_at: new Date().toISOString(),
         reward_player_id: revealedId,
         reward_player_name: revealedName,
@@ -1603,7 +2184,7 @@ class SupabaseService {
       success: true,
       rewardPlayerName: revealedName,
       rewardRole: revealedRole,
-      message: `Geheimnis enthüllt: ${revealedName} ist ${revealedRole}! (+${taskPoints} Punkte)`,
+      message: `Geheimnis aufgedeckt: ${revealedName} ist ein ${revealedRole}! Gib diese Information diskret an einen Geisterjäger weiter.`,
     };
   }
 

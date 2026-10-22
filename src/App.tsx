@@ -13,7 +13,9 @@ import {
   KillRecord,
   PartyTask,
   TaskCompletion,
-  PartyPhoto
+  PartyPhoto,
+  PlayerPhotoTask,
+  SpecialTaskAssignment
 } from './types/game';
 import { gameApi } from './utils/api';
 import { Smartphone, Monitor, Loader2, Sparkles, Database, AlertCircle, AlertTriangle, CheckCircle2, X } from 'lucide-react';
@@ -83,6 +85,8 @@ export default function App() {
   const [tasks, setTasks] = useState<PartyTask[]>([]);
   const [taskCompletions, setTaskCompletions] = useState<TaskCompletion[]>([]);
   const [photos, setPhotos] = useState<PartyPhoto[]>([]);
+  const [photoTasks, setPhotoTasks] = useState<PlayerPhotoTask[]>([]);
+  const [specialTasks, setSpecialTasks] = useState<SpecialTaskAssignment[]>([]);
   const [totalJoinedCount, setTotalJoinedCount] = useState<number>(0);
   const [isRegistering, setIsRegistering] = useState<boolean>(false);
 
@@ -99,6 +103,8 @@ export default function App() {
       setTasks(data.tasks || []);
       setTaskCompletions(data.taskCompletions || []);
       setPhotos(data.photos || []);
+      setPhotoTasks(data.photoTasks || []);
+      setSpecialTasks(data.specialTasks || []);
       setTotalJoinedCount(data.totalJoinedCount);
       setFetchError(null);
 
@@ -116,6 +122,21 @@ export default function App() {
       setIsInitializing(false);
     }
   }, [registeredPlayerId, adminCode, isAdminUnlocked]);
+
+  // Periodic game loop tick (checks pending deaths timeout, generates slot photo tasks & mini-games)
+  useEffect(() => {
+    if (gameState.status !== 'Läuft') return;
+
+    // Run tick on start/resume
+    gameApi.tickGame().catch(() => {});
+
+    // Periodic tick every 15 seconds
+    const interval = setInterval(() => {
+      gameApi.tickGame().catch(() => {});
+    }, 15000);
+
+    return () => clearInterval(interval);
+  }, [gameState.status]);
 
   // Initial fetch, Supabase Realtime subscription & 3-second fallback polling
   useEffect(() => {
@@ -287,6 +308,24 @@ export default function App() {
     }
   };
 
+  const handleAdminConfirmPendingDeath = async (victimId: string) => {
+    try {
+      await gameApi.adminConfirmKill(adminCode, victimId);
+      await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Bestätigung fehlgeschlagen');
+    }
+  };
+
+  const handleAdminRevivePendingDeath = async (playerId: string) => {
+    try {
+      await gameApi.adminRevivePlayer(adminCode, playerId);
+      await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Wiederbeleben fehlgeschlagen');
+    }
+  };
+
   const handleAdminDeletePhoto = async (photoId: string) => {
     try {
       await gameApi.deletePhoto(adminCode, photoId);
@@ -310,25 +349,29 @@ export default function App() {
     }
   };
 
-  const handleSelfReportDeath = async (killerRole: string) => {
+  const handleSelfReportDeath = async () => {
     if (!registeredPlayerId) return;
 
-    // 1. Sofortiger lokaler Optimistic Update (Spieler sieht sofort den "Du bist tot"-Screen!)
+    // 1. Sofortiger lokaler Optimistic Update (Spieler sieht sofort den "Warte auf Bestätigung durch den Täter"-Screen!)
     setPlayers((prev) =>
-      prev.map((p) => (p.id === registeredPlayerId ? { ...p, status: 'tot' as const } : p))
+      prev.map((p) =>
+        p.id === registeredPlayerId
+          ? { ...p, status: 'pending_death' as const, pendingDeathAt: new Date().toISOString() }
+          : p
+      )
     );
 
     try {
-      const res = await gameApi.reportSelfDeath(registeredPlayerId, killerRole);
+      const res = await gameApi.reportPendingDeath(registeredPlayerId);
       setSuccessToast(res.message);
       setTimeout(() => setSuccessToast(null), 5000);
       await fetchGameState();
     } catch (err: any) {
-      console.error('Fehler bei reportSelfDeath:', err);
+      console.error('Fehler bei reportPendingDeath:', err);
       // Fehler IMMER sichtbar ausgeben!
       setErrorMessage({
-        title: 'Fehler beim Als-Tot-Markieren',
-        detail: err?.message || 'Die Datenbank hat das Update verweigert. Bitte RLS-Policies und SQL-Fix prüfen.',
+        title: 'Fehler beim Als-Tot-Melden',
+        detail: err?.message || 'Die Datenbank hat das Update verweigert.',
         timestamp: Date.now(),
       });
       // Nach Fehler State wieder mit DB synchronisieren
@@ -457,6 +500,8 @@ export default function App() {
                   tasks={tasks}
                   taskCompletions={taskCompletions}
                   photos={photos}
+                  photoTasks={photoTasks}
+                  specialTasks={specialTasks}
                   activeTab={currentTab}
                   onTabChange={setCurrentTab}
                   onLogoutDevice={handleLogoutDevice}
@@ -486,6 +531,8 @@ export default function App() {
                   onConfirmKill={handleAdminConfirmKill}
                   onUndoKill={handleAdminUndoKill}
                   onDeletePhoto={handleAdminDeletePhoto}
+                  onAdminConfirmPendingDeath={handleAdminConfirmPendingDeath}
+                  onAdminRevivePendingDeath={handleAdminRevivePendingDeath}
                 />
               )}
             </main>

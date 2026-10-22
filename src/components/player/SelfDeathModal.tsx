@@ -67,57 +67,20 @@ export const SelfDeathModal: React.FC<SelfDeathModalProps> = ({
             Sicherheitsabfrage
           </span>
           <h3 className="text-xl font-serif font-black text-white">
-            Wirklich als tot markieren?
+            Wurdest du gerade getötet?
           </h3>
           <p className="text-xs text-zinc-300 leading-relaxed">
-            Hast du eine Berührung erhalten oder wurdest getötet? Als Toter scheidest du aus dem aktiven Spiel aus und wechselst in den <strong className="text-purple-300">Zuschauer-Modus im Totenreich</strong>.
+            Hast du eine Berührung am Arm oder an der Schulter mit dem Geflüster erhalten? Dein Status wechselt zu <strong className="text-rose-400">"Tod ausstehend"</strong>, und du wartest bis zu 4 Minuten auf die Bestätigung durch den Täter.
           </p>
-        </div>
-
-        {/* Optional Role Selection */}
-        <div className="text-left space-y-2 pt-1 border-t border-zinc-800">
-          <label className="text-[11px] font-bold text-zinc-300 block">
-            Durch welche Rolle wurdest du getötet? <span className="text-zinc-500 font-normal">(optional)</span>
-          </label>
-          <div className="space-y-1.5">
-            {KILLER_ROLE_OPTIONS.map((opt) => (
-              <label
-                key={opt.id}
-                onClick={() => setSelectedRole(opt.id)}
-                className={`flex items-center justify-between p-2.5 rounded-2xl border transition cursor-pointer ${
-                  selectedRole === opt.id
-                    ? 'bg-rose-950/60 border-rose-500 text-white shadow-sm'
-                    : 'bg-zinc-900/60 border-zinc-800 text-zinc-300 hover:border-zinc-700'
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <span className="text-base">{opt.emoji}</span>
-                  <div>
-                    <span className="text-xs font-bold block">{opt.label}</span>
-                    <span className="text-[10px] text-zinc-400 block">{opt.desc}</span>
-                  </div>
-                </div>
-                <div
-                  className={`w-4 h-4 rounded-full border flex items-center justify-center ${
-                    selectedRole === opt.id
-                      ? 'border-rose-500 bg-rose-600'
-                      : 'border-zinc-700 bg-zinc-900'
-                  }`}
-                >
-                  {selectedRole === opt.id && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
-                </div>
-              </label>
-            ))}
-          </div>
         </div>
 
         {/* Warning & Admin hint */}
-        <div className="p-2.5 rounded-2xl bg-zinc-900/80 border border-zinc-800 text-[10px] text-zinc-400 text-left space-y-1">
+        <div className="p-3 rounded-2xl bg-zinc-900/90 border border-zinc-800 text-[11px] text-zinc-300 text-left space-y-1">
           <p>
-            ℹ️ <strong className="text-zinc-200">Hinweis:</strong> Falls der Täter den Kill bereits gemeldet hat, wird dieser bestätigt. Andernfalls wird ein Eintrag mit Täter <em>"Unbekannt"</em> im Kill-Log angelegt.
+            ⏱️ <strong>4 Minuten Frist:</strong> Bestätigt der Täter den Kill in dieser Zeit nicht, wirst du automatisch wiederbelebt und bleibst im Spiel!
           </p>
-          <p className="text-emerald-400/90">
-            Der Spielleiter/Admin kann dich jederzeit wiederbeleben.
+          <p className="text-zinc-400 text-[10px]">
+            Während der Wartezeit kannst du keine Aktionen ausführen und bist vor weiteren Angriffen geschützt.
           </p>
         </div>
 

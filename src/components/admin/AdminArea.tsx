@@ -33,7 +33,8 @@ import {
   Maximize2,
   Pause,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  Clock
 } from 'lucide-react';
 import { downloadPhotosAsZip } from '../../utils/zipDownloader';
 import {
@@ -67,6 +68,8 @@ interface AdminAreaProps {
   onConfirmKill: (killId: string) => Promise<void>;
   onUndoKill: (killId: string) => Promise<void>;
   onDeletePhoto: (photoId: string) => Promise<void>;
+  onAdminConfirmPendingDeath?: (victimId: string) => Promise<void>;
+  onAdminRevivePendingDeath?: (playerId: string) => Promise<void>;
 }
 
 export const AdminArea: React.FC<AdminAreaProps> = ({
@@ -88,6 +91,8 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   onConfirmKill,
   onUndoKill,
   onDeletePhoto,
+  onAdminConfirmPendingDeath,
+  onAdminRevivePendingDeath,
 }) => {
   // Sub-tabs in Admin: 'control' | 'players' | 'kills' | 'gallery' | 'settings' | 'qrcode'
   const [activeTab, setActiveTab] = useState<'control' | 'players' | 'kills' | 'gallery' | 'settings' | 'qrcode'>('control');
@@ -123,6 +128,9 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
     werewolfCooldownMinutes: settings.werewolfCooldownMinutes || 2,
     hunterHitCooldownMinutes: settings.hunterHitCooldownMinutes || 15,
     hunterMissPenaltyMinutes: settings.hunterMissPenaltyMinutes || 30,
+    pendingDeathTimeoutMinutes: settings.pendingDeathTimeoutMinutes ?? 4,
+    unconfirmedKillAction: settings.unconfirmedKillAction ?? 'revive',
+    photoTaskIntervalMinutes: settings.photoTaskIntervalMinutes ?? 10,
     killConfirmationTimeoutMinutes: settings.killConfirmationTimeoutMinutes || 5,
     pointsPhotoTask: settings.pointsPhotoTask || 10,
     pointsSpecialTask: settings.pointsSpecialTask || 20,
@@ -168,6 +176,9 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
       werewolfCooldownMinutes: settings.werewolfCooldownMinutes || 2,
       hunterHitCooldownMinutes: settings.hunterHitCooldownMinutes || 15,
       hunterMissPenaltyMinutes: settings.hunterMissPenaltyMinutes || 30,
+      pendingDeathTimeoutMinutes: settings.pendingDeathTimeoutMinutes ?? 4,
+      unconfirmedKillAction: settings.unconfirmedKillAction ?? 'revive',
+      photoTaskIntervalMinutes: settings.photoTaskIntervalMinutes ?? 10,
       killConfirmationTimeoutMinutes: settings.killConfirmationTimeoutMinutes || 5,
       pointsPhotoTask: settings.pointsPhotoTask || 10,
       pointsSpecialTask: settings.pointsSpecialTask || 20,
@@ -240,6 +251,46 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   }, [players]);
 
   const activePlayers = useMemo(() => players.filter((p) => p.status !== 'entfernt'), [players]);
+
+  // Ausstehende Tode (Pending Deaths)
+  const pendingDeaths = useMemo(() => {
+    return players.filter(
+      (p) => p.status === 'pending_death' || p.status === 'tod_ausstehend'
+    );
+  }, [players]);
+
+  const [liveNow, setLiveNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setLiveNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const formatPendingRemaining = (pendingAt?: string | null) => {
+    if (!pendingAt) return '04:00';
+    const startMs = new Date(pendingAt).getTime();
+    const timeoutMin = formData.pendingDeathTimeoutMinutes || 4;
+    const expiresMs = startMs + timeoutMin * 60 * 1000;
+    const diffSec = Math.max(0, Math.floor((expiresMs - liveNow) / 1000));
+    const m = Math.floor(diffSec / 60);
+    const s = diffSec % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const handleAdminConfirmPending = async (victimId: string) => {
+    if (onAdminConfirmPendingDeath) {
+      await onAdminConfirmPendingDeath(victimId);
+    } else {
+      await gameApi.adminConfirmKill(adminCode, victimId);
+    }
+  };
+
+  const handleAdminRevivePending = async (playerId: string) => {
+    if (onAdminRevivePendingDeath) {
+      await onAdminRevivePendingDeath(playerId);
+    } else {
+      await gameApi.adminRevivePlayer(adminCode, playerId);
+    }
+  };
 
   // Target distribution for current active player count
   const targetCounts = useMemo(() => {
@@ -698,6 +749,84 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
                 {gameStatus === 'Läuft' && <span className="text-[10px] text-rose-400 font-normal">(Warnung)</span>}
               </button>
             </div>
+          </div>
+
+          {/* AUSSTEHENDE TODE (PENDING DEATHS) */}
+          <div className="p-5 rounded-3xl bg-zinc-900 border-2 border-rose-500/60 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="p-2 rounded-xl bg-rose-500/20 text-rose-400 animate-pulse">
+                  <Skull className="w-5 h-5" />
+                </span>
+                <div>
+                  <h4 className="font-bold text-white text-sm">Ausstehende Tode ({pendingDeaths.length})</h4>
+                  <p className="text-[11px] text-zinc-400">
+                    Opfer warten auf Täter-Bestätigung (Frist: {formData.pendingDeathTimeoutMinutes || 4} Min)
+                  </p>
+                </div>
+              </div>
+              <span className="px-2.5 py-0.5 rounded-full bg-rose-500/20 text-rose-300 font-mono text-xs font-bold">
+                {pendingDeaths.length} offen
+              </span>
+            </div>
+
+            {pendingDeaths.length === 0 ? (
+              <p className="text-xs text-zinc-500 italic py-2">Aktuell keine ausstehenden Tode vorhanden.</p>
+            ) : (
+              <div className="space-y-2 pt-1">
+                {pendingDeaths.map((p) => {
+                  const remaining = formatPendingRemaining(p.pendingDeathAt);
+                  return (
+                    <div
+                      key={p.id}
+                      className="p-3 rounded-2xl bg-zinc-950 border border-rose-500/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                    >
+                      <div className="flex items-center gap-3">
+                        <img
+                          src={p.photoUrl || '/placeholder.png'}
+                          alt={p.name}
+                          className="w-12 h-12 rounded-xl object-cover border border-zinc-700 shrink-0"
+                        />
+                        <div>
+                          <div className="text-sm font-bold text-white flex items-center gap-2">
+                            <span>{p.name}</span>
+                            <span className="px-2 py-0.5 rounded-md bg-zinc-800 text-[10px] text-zinc-300 font-mono">
+                              {p.role}
+                            </span>
+                          </div>
+                          <div className="text-xs text-zinc-400">
+                            Kostüm: <span className="text-zinc-200">{p.costumeName}</span>
+                          </div>
+                          <div className="text-xs font-mono font-bold text-amber-400 flex items-center gap-1 mt-0.5">
+                            <Clock className="w-3.5 h-3.5" />
+                            <span>Restzeit: {remaining}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleAdminConfirmPending(p.id)}
+                          className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs flex items-center gap-1 cursor-pointer shadow-sm transition active:scale-95"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          Kill bestätigen
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAdminRevivePending(p.id)}
+                          className="px-3 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs flex items-center gap-1 cursor-pointer shadow-sm transition active:scale-95"
+                        >
+                          <HeartPulse className="w-3.5 h-3.5" />
+                          Wiederbeleben
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           <div className="p-5 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3">
@@ -1361,21 +1490,59 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
             </div>
           </div>
 
-          {/* Download-Freischaltung für Fotos */}
-          <div className="pt-2 border-t border-zinc-800 space-y-2">
-            <label className="block text-xs font-bold text-zinc-300">
-              Foto-Download für Gäste freischalten:
-            </label>
-            <select
-              value={formData.photoDownloadUnlocked || 'ended'}
-              onChange={(e) => setFormData({ ...formData, photoDownloadUnlocked: e.target.value as 'ended' | 'always' })}
-              className="w-full px-3 py-2 rounded-xl bg-zinc-950 border border-zinc-700 text-white font-bold text-xs"
-            >
-              <option value="ended">Ab Spielende (Standard)</option>
-              <option value="always">Sofort während des Spiels</option>
-            </select>
-            <p className="text-[10px] text-zinc-400 leading-relaxed">
-              Standardmäßig können Gäste Fotos erst nach offiziellem Spielende herunterladen. Mit "Sofort" ist der Download und ZIP-Export ab sofort für alle aktiv.
+          {/* Neuer Kill-Ablauf & Fristen */}
+          <div className="pt-2 border-t border-zinc-800 space-y-2.5">
+            <span className="text-xs font-bold uppercase tracking-wider text-rose-400 block">
+              Neuer Kill-Ablauf & Fristen
+            </span>
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div>
+                <label className="block text-[11px] text-zinc-400 mb-1">Ausstehender Tod Frist (Min):</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="15"
+                  value={formData.pendingDeathTimeoutMinutes}
+                  onChange={(e) => setFormData({ ...formData, pendingDeathTimeoutMinutes: Number(e.target.value) })}
+                  className="w-full px-3 py-1.5 rounded-xl bg-zinc-950 border border-zinc-700 text-white font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-zinc-400 mb-1">Ablauf ohne Bestätigung:</label>
+                <select
+                  value={formData.unconfirmedKillAction || 'revive'}
+                  onChange={(e) => setFormData({ ...formData, unconfirmedKillAction: e.target.value as 'revive' | 'stay_dead' })}
+                  className="w-full px-3 py-1.5 rounded-xl bg-zinc-950 border border-zinc-700 text-white font-bold text-xs"
+                >
+                  <option value="revive">Wiederbeleben (Standard)</option>
+                  <option value="stay_dead">Als tot lassen</option>
+                </select>
+              </div>
+            </div>
+            <p className="text-[10px] text-zinc-400">
+              Wenn ein Opfer sich meldet, hat der Täter {formData.pendingDeathTimeoutMinutes} Minuten Zeit. Danach wird der Spieler entweder automatisch wiederbelebt oder scheidet als tot aus.
+            </p>
+          </div>
+
+          {/* Foto-Aufgaben Intervall */}
+          <div className="pt-2 border-t border-zinc-800 space-y-2.5">
+            <span className="text-xs font-bold uppercase tracking-wider text-[#ff6b00] block">
+              Foto-Aufgaben Intervall
+            </span>
+            <div className="text-xs">
+              <label className="block text-[11px] text-zinc-400 mb-1">Neue Foto-Aufgabe alle (Minuten, 5-15):</label>
+              <input
+                type="number"
+                min="5"
+                max="15"
+                value={formData.photoTaskIntervalMinutes}
+                onChange={(e) => setFormData({ ...formData, photoTaskIntervalMinutes: Number(e.target.value) })}
+                className="w-full px-3 py-1.5 rounded-xl bg-zinc-950 border border-zinc-700 text-white font-bold"
+              />
+            </div>
+            <p className="text-[10px] text-zinc-400">
+              Alle {formData.photoTaskIntervalMinutes} Minuten erhält jeder lebende Spieler automatisch eine neue Foto-Aufgabe (max. 3 gleichzeitig offen, Verfall nach 30 Minuten).
             </p>
           </div>
 

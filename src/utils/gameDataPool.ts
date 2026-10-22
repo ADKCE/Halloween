@@ -356,3 +356,111 @@ export const DEFAULT_QUIZ_QUESTIONS: QuizQuestion[] = [
     explanation: 'Dr. Frankenstein nutzte elektrische Energie und Blitzableiter für seine Schöpfung.',
   },
 ];
+
+// 40 Halloween Anagramm-Wörter
+export const HALLOWEEN_ANAGRAMS = [
+  { word: 'SKELETT', hint: 'Klapperndes Knochengestell' },
+  { word: 'VAMPIR', hint: 'Blutsauger der Nacht' },
+  { word: 'WERWOLF', hint: 'Heult den Vollmond an' },
+  { word: 'KÜRBIS', hint: 'Orange Herbstfrucht mit Fratze' },
+  { word: 'FLEDERMAUS', hint: 'Fliegt lautlos im Dunkeln' },
+  { word: 'TOTENKOPF', hint: 'Klassisches Piraten- & Giftsymbol' },
+  { word: 'SPINNE', hint: 'Acht Beine im Netz' },
+  { word: 'GEISTERHAUS', hint: 'Altes Gebäude voller Spuk' },
+  { word: 'HEXENKREIS', hint: 'Magischer Zirkel' },
+  { word: 'ZOMBIE', hint: 'Untoter Wandler' },
+  { word: 'GRUSELIG', hint: 'Echtes Gänsehaut-Gefühl' },
+  { word: 'VOLLMOND', hint: 'Erhellt die finstere Nacht' },
+  { word: 'EXORZISMUS', hint: 'Geisteraustreibung' },
+  { word: 'FRIEDHOF', hint: 'Ruhestätte unter Zypressen' },
+  { word: 'SARGFEE', hint: 'Mythische Gestalt des Grabes' },
+  { word: 'KNOCHEN', hint: 'Bestandteil des Skeletts' },
+  { word: 'SPINNWEBEN', hint: 'Klebrige Fäden in dunklen Ecken' },
+  { word: 'MITTERNACHT', hint: 'Die Geisterstunde schlägt 12' },
+  { word: 'BLUTDURST', hint: 'Heißhunger der Vampire' },
+  { word: 'SCHATTEN', hint: 'Folgt dir auf Schritt und Tritt' },
+  { word: 'DUNKELHEIT', hint: 'Wenn alles Licht erlischt' },
+  { word: 'SCHRECKEN', hint: 'Plötzliche Panik im Dunkeln' },
+  { word: 'PHANTOM', hint: 'Geisterhafte Erscheinung' },
+  { word: 'DRAKULA', hint: 'Berühmtester Graf aller Zeiten' },
+  { word: 'KOPFLOS', hint: 'Reiter ohne Haupt' },
+  { word: 'ALPTRAUM', hint: 'Böser Traum in der Nacht' },
+  { word: 'MONSTER', hint: 'Gruseliges Ungeheuer' },
+  { word: 'MUMIE', hint: 'In Leinenbinden gewickelt' },
+  { word: 'SCHREI', hint: 'Lauter Hilferuf in der Dunkelheit' },
+  { word: 'KETTENSÄGE', hint: 'Lautes Werkzeug aus Horrorfilmen' },
+  { word: 'KERZENSCHEIN', hint: 'Flackerndes warmes Licht' },
+  { word: 'KAPUZE', hint: 'Dunkle Kopfbedeckung der Gestalten' },
+  { word: 'FLUCH', hint: 'Böse Verwünschung' },
+  { word: 'DÄMON', hint: 'Wesen der Finsternis' },
+  { word: 'SPUK', hint: 'Unheimliches Treiben im Schloss' },
+  { word: 'GIFTBECHER', hint: 'Gefährlicher Trank' },
+  { word: 'GRABSTEIN', hint: 'Steinerne Inschrift' },
+  { word: 'LABYRINTH', hint: 'Verwirrspiel aus Hecken' },
+  { word: 'MYSTERIUM', hint: 'Ungelöstes Geheimnis' },
+  { word: 'HALLOWEEN', hint: 'Das Fest des 31. Oktober' },
+];
+
+export const SEQUENCE_SYMBOLS = ['🎃', '👻', '🦇', '💀', '🕷️'];
+
+export function generateScrambledWord(word: string): string {
+  const letters = word.split('');
+  let scrambled = '';
+  // Fisher-Yates shuffle until different
+  let attempts = 0;
+  do {
+    const arr = [...letters];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    scrambled = arr.join('');
+    attempts++;
+  } while (scrambled === word && attempts < 20);
+  return scrambled;
+}
+
+export function generateMathQuestions(): { expression: string; answer: number }[] {
+  const generators = [
+    // 1: Multiplikation mittlerer Schwierigkeit
+    () => {
+      const a = Math.floor(Math.random() * 9) + 12; // 12-20
+      const b = Math.floor(Math.random() * 6) + 4;  // 4-9
+      return { expression: `${a} × ${b}`, answer: a * b };
+    },
+    // 2: Division + Addition
+    () => {
+      const div = Math.floor(Math.random() * 5) + 3; // 3-7
+      const quotient = Math.floor(Math.random() * 15) + 10; // 10-24
+      const dividend = div * quotient;
+      const add = Math.floor(Math.random() * 25) + 11; // 11-35
+      return { expression: `${dividend} ÷ ${div} + ${add}`, answer: quotient + add };
+    },
+    // 3: Dreistellige Subtraktion
+    () => {
+      const x = Math.floor(Math.random() * 120) + 110; // 110-229
+      const y = Math.floor(Math.random() * 50) + 35;   // 35-84
+      return { expression: `${x} − ${y}`, answer: x - y };
+    },
+  ];
+
+  return generators.map((g) => g());
+}
+
+export function generateSequence(length = 5): string[] {
+  const seq: string[] = [];
+  for (let i = 0; i < length; i++) {
+    const randomIndex = Math.floor(Math.random() * SEQUENCE_SYMBOLS.length);
+    seq.push(SEQUENCE_SYMBOLS[randomIndex]);
+  }
+  return seq;
+}
+
+export function generateSecretCode(digits = 4): string {
+  let code = '';
+  for (let i = 0; i < digits; i++) {
+    code += Math.floor(Math.random() * 10).toString();
+  }
+  return code;
+}
+
