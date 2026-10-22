@@ -3,7 +3,7 @@ import { LoginScreen } from './components/auth/LoginScreen';
 import { PlayerArea } from './components/player/PlayerArea';
 import { AdminArea } from './components/admin/AdminArea';
 import { AdminAuthModal } from './components/admin/AdminAuthModal';
-import { MobileNavBar } from './components/navigation/MobileNavBar';
+import { MobileNavBar, MainNavTab } from './components/navigation/MobileNavBar';
 import { DebugPanel } from './components/debug/DebugPanel';
 import {
   Player,
@@ -38,7 +38,7 @@ export default function App() {
   });
 
   const [isAdminModalOpen, setIsAdminModalOpen] = useState(false);
-  const [currentTab, setCurrentTab] = useState<'player' | 'admin'>('player');
+  const [currentTab, setCurrentTab] = useState<MainNavTab>('actions');
   const [isMobileDeviceFrame, setIsMobileDeviceFrame] = useState(false);
   const [isInitializing, setIsInitializing] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -69,7 +69,7 @@ export default function App() {
       fullMoonDurationMinutes: 5,
       pointsPhotoTask: 10,
       pointsSpecialTask: 20,
-      pointsTaggedCoPlayer: 2,
+      photoDownloadUnlocked: 'ended',
       pointsEvilKill: 15,
       pointsExorcismSuccess: 25,
       specialTaskIntervalMinMinutes: 10,
@@ -296,6 +296,20 @@ export default function App() {
     }
   };
 
+  const handlePlayerDeletePhoto = async (photoId: string) => {
+    try {
+      await gameApi.deletePhoto({
+        photoId,
+        playerId: registeredPlayerId || undefined,
+        adminCode: isAdminUnlocked ? adminCode : undefined,
+      });
+      await fetchGameState();
+    } catch (err: any) {
+      alert(err?.message || 'Fehler beim Löschen des Fotos');
+      throw err;
+    }
+  };
+
   const handleSelfReportDeath = async (killerRole: string) => {
     if (!registeredPlayerId) return;
 
@@ -433,7 +447,7 @@ export default function App() {
           /* STEP 2 & 3: SPIELBEREICH / ADMIN */
           <div className="flex-1 flex flex-col justify-between">
             <main className="flex-1 p-4 pb-24 max-w-md w-full mx-auto">
-              {currentTab === 'player' ? (
+              {currentTab !== 'admin' ? (
                 <PlayerArea
                   player={currentPlayer}
                   players={players}
@@ -443,9 +457,14 @@ export default function App() {
                   tasks={tasks}
                   taskCompletions={taskCompletions}
                   photos={photos}
+                  activeTab={currentTab}
+                  onTabChange={setCurrentTab}
                   onLogoutDevice={handleLogoutDevice}
                   onRefreshState={fetchGameState}
                   onSelfReportDeath={handleSelfReportDeath}
+                  onDeletePhoto={handlePlayerDeletePhoto}
+                  onRequestAdminUnlock={() => setIsAdminModalOpen(true)}
+                  isAdminUnlocked={isAdminUnlocked}
                 />
               ) : (
                 <AdminArea
@@ -476,7 +495,7 @@ export default function App() {
               currentTab={currentTab}
               onTabChange={setCurrentTab}
               isAdminUnlocked={isAdminUnlocked}
-              onRequestAdminUnlock={() => setIsAdminModalOpen(true)}
+              photosCount={photos.length}
             />
           </div>
         )}

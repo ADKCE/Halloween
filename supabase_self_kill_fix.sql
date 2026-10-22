@@ -1,24 +1,29 @@
 -- ==============================================================================
--- FIX: Selbst als tot markieren ("Ich wurde getötet")
--- 1. Statuswert-Constraint & Nullable Killer für kills
--- 2. Vollständige Row-Level-Security (RLS) Policies für players & kills
--- 3. Atomare Postgres-Funktion mark_self_dead()
+-- VOLLSTÄNDIGER SQL-FIX: 
+-- 1. "Ich wurde getötet" (Selbstmeldung, Status-Constraint, Nullable Killer & RLS)
+-- 2. "Party-Galerie" (Photo-Entität ohne Markierungen, Lese- & Löschrechte)
+-- 3. PostgREST Schema Reload
 -- ==============================================================================
 
--- 1. Constraint auf players.status prüfen & sicherstellen ('tot' ist erlaubt)
-alter table public.players drop constraint if exists players_status_check;
-alter table public.players add constraint players_status_check check (status in ('lebendig', 'tot', 'entfernt', 'pausiert'));
+-- ------------------------------------------------------------------------------
+-- TEIL 1: SPIELER & KILLS FIX
+-- ------------------------------------------------------------------------------
 
--- 2. kills: killer_id und killer_name nullable machen (für Täter 'Unbekannt' / Selbstmeldungen)
+-- Status-Constraint auf players prüfen & sicherstellen ('tot' ist gültig)
+alter table public.players drop constraint if exists players_status_check;
+alter table public.players add constraint players_status_check 
+  check (status in ('lebendig', 'tot', 'entfernt', 'pausiert'));
+
+-- kills: killer_id und killer_name nullable machen (für Täter 'Unbekannt' / Selbstmeldungen)
 alter table public.kills alter column killer_id drop not null;
 alter table public.kills alter column killer_name drop not null;
 
--- Foreign Key auf killer_id: 'on delete set null' statt striktem FK-Fehler
+-- Foreign Key auf killer_id: 'on delete set null' statt FK-Fehler
 alter table public.kills drop constraint if exists kills_killer_id_fkey;
 alter table public.kills add constraint kills_killer_id_fkey 
   foreign key (killer_id) references public.players(id) on delete set null;
 
--- 3. Row-Level Security (RLS) & Rechte für anon und authenticated auf players & kills
+-- RLS auf players & kills sicherstellen
 alter table public.players enable row level security;
 drop policy if exists "Allow public all players" on public.players;
 drop policy if exists "Allow anon read players" on public.players;
@@ -41,7 +46,7 @@ grant all on table public.players to anon, authenticated;
 grant all on table public.kills to anon, authenticated;
 grant all on table public.game_state to anon, authenticated;
 
--- 4. Atomare RPC-Funktion: mark_self_dead
+-- Atomare Funktion: mark_self_dead
 create or replace function public.mark_self_dead(
   p_player_id text,
   p_killer_role text default 'Unbekannt'
@@ -55,13 +60,12 @@ declare
   v_open_kill record;
   v_result jsonb;
 begin
-  -- Opfer in players suchen
   select * into v_victim from public.players where id = p_player_id;
   if not found then
     return jsonb_build_object('success', false, 'error', 'Spieler nicht gefunden');
   end if;
 
-  -- 1. Spielerstatus auf 'tot' setzen
+  -- 1. Spielerstatus sofort auf 'tot' setzen
   update public.players
   set status = 'tot'
   where id = p_player_id;
@@ -133,5 +137,84 @@ $$;
 
 grant execute on function public.mark_self_dead(text, text) to anon, authenticated, service_role;
 
--- 5. PostgREST Schema-Cache sofort neu laden
+-- ------------------------------------------------------------------------------
+-- TEIL 2: GALERIE & PHOTO-ENTITÄT (KEINE PERSONEN-MARKIERUNG)
+-- ------------------------------------------------------------------------------
+
+-- Tabelle photos: Bild, Aufgabe, Zeitstempel, Fotograf (Spieler-ID). Keine Markierungsfelder!
+create table if not exists public.photos (
+  id uuid primary key default gen_random_uuid(),
+  photo_url text not null,
+  task_id text,
+  caption text,
+  player_id text references public.players(id) on delete set null,
+  photographer_name text not null default 'Gast',
+  created_at timestamptz not null default timezone('utc'::text, now())
+);
+
+-- Eventuelle alte Markierungsspalten entfernen
+alter table public.photos drop column if exists tagged_player_names;
+alter table public.task_completions drop column if exists tagged_player_ids;
+alter table public.task_completions drop column if exists tagged_player_names;
+
+create index if not exists idx_photos_created_at on public.photos (created_at desc);
+
+-- RLS für photos
+alter table public.photos enable row level security;
+drop policy if exists "Allow public all photos" on public.photos;
+drop policy if exists "Allow read photos" on public.photos;
+drop policy if exists "Allow insert photos" on public.photos;
+drop policy if exists "Allow delete photos" on public.photos;
+
+-- Alle angemeldeten Spieler dürfen alle Fotos lesen
+create policy "Allow read photos" on public.photos 
+  for select to public using (true);
+
+-- Foto-Upload für Aufgaben
+create policy "Allow insert photos" on public.photos 
+  for insert to public with check (true);
+
+-- Löschen über RLS oder definierte Server-Funktion
+create policy "Allow delete photos" on public.photos 
+  for delete to public using (true);
+
+grant all on table public.photos to anon, authenticated;
+
+-- Serverseitige Lösch-Prüfung: Nur Fotograf selbst oder Admin darf löschen
+create or replace function public.delete_photo(
+  p_photo_id uuid,
+  p_player_id text default null,
+  p_admin_code text default null
+)
+returns boolean
+language plpgsql
+security definer
+as $$
+declare
+  v_is_admin boolean := false;
+  v_photo record;
+begin
+  if p_admin_code is not null then
+    v_is_admin := public.check_admin_code(p_admin_code);
+  end if;
+
+  select * into v_photo from public.photos where id = p_photo_id;
+  if not found then
+    return false;
+  end if;
+
+  if v_is_admin or (p_player_id is not null and v_photo.player_id = p_player_id) then
+    delete from public.photos where id = p_photo_id;
+    return true;
+  end if;
+
+  raise exception 'Keine Berechtigung: Nur der Fotograf selbst oder der Admin darf dieses Foto löschen';
+end;
+$$;
+
+grant execute on function public.delete_photo(uuid, text, text) to anon, authenticated, service_role;
+
+-- ------------------------------------------------------------------------------
+-- TEIL 3: SCHEMA-CACHE AKTUALISIEREN
+-- ------------------------------------------------------------------------------
 notify pgrst, 'reload schema';

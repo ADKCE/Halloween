@@ -47,6 +47,7 @@ import { FullMoonBanner } from './FullMoonBanner';
 import { KillNotificationModal } from './KillNotificationModal';
 import { SelfDeathModal } from './SelfDeathModal';
 import { GameEndView } from './GameEndView';
+import { GalleryView } from './GalleryView';
 import { gameApi } from '../../utils/api';
 
 interface PlayerAreaProps {
@@ -58,9 +59,14 @@ interface PlayerAreaProps {
   tasks: PartyTask[];
   taskCompletions: TaskCompletion[];
   photos: PartyPhoto[];
+  activeTab: 'actions' | 'tasks' | 'ranking' | 'gallery' | 'profile';
+  onTabChange: (tab: 'actions' | 'tasks' | 'ranking' | 'gallery' | 'profile') => void;
   onLogoutDevice: () => void;
   onRefreshState: () => Promise<void>;
   onSelfReportDeath: (killerRole: string) => Promise<void>;
+  onDeletePhoto: (photoId: string) => Promise<void>;
+  onRequestAdminUnlock?: () => void;
+  isAdminUnlocked?: boolean;
 }
 
 export const PlayerArea: React.FC<PlayerAreaProps> = ({
@@ -72,13 +78,15 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   tasks,
   taskCompletions,
   photos,
+  activeTab,
+  onTabChange,
   onLogoutDevice,
   onRefreshState,
   onSelfReportDeath,
+  onDeletePhoto,
+  onRequestAdminUnlock,
+  isAdminUnlocked,
 }) => {
-  // Main Navigation Tabs: 1. "actions" (Aktionen) | 2. "tasks" (Aufgaben) | 3. "ranking" (Ranking) | 4. "profile" (Profil & Regeln)
-  const [activeTab, setActiveTab] = useState<'actions' | 'tasks' | 'ranking' | 'profile'>('actions');
-
   // Secret Role reveal toggle
   const [isRoleSecretRevealed, setIsRoleSecretRevealed] = useState(false);
 
@@ -258,17 +266,13 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
     return res;
   };
 
-  const handleCompletePhotoTask = async (
-    photoBlobOrUrl: Blob | File | string,
-    taggedPlayerIds: string[]
-  ) => {
+  const handleCompletePhotoTask = async (photoBlobOrUrl: Blob | File | string) => {
     if (!activeTaskModal) return;
     await gameApi.completePhotoTask({
       playerId: player.id,
       taskId: activeTaskModal.id,
       taskTitle: activeTaskModal.title,
       photoBlobOrUrl,
-      taggedPlayerIds,
     });
     setActiveTaskModal(null);
     await onRefreshState();
@@ -298,8 +302,76 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
     );
   }
 
-  // IF STILL IN LOBBY, SHOW LOBBY VIEW
+  // IF STILL IN LOBBY, HANDLE TABS OR SHOW LOBBY VIEW
   if (gameState.status === 'Lobby') {
+    if (activeTab === 'gallery') {
+      return (
+        <div className="space-y-4 animate-in fade-in pb-16">
+          <GalleryView
+            photos={photos}
+            currentPlayerId={player.id}
+            currentPlayerName={player.name}
+            isGameEnded={false}
+            downloadSetting={gameState.settings?.photoDownloadUnlocked || 'ended'}
+            isAdmin={Boolean(isAdminUnlocked)}
+            onDeletePhoto={onDeletePhoto}
+          />
+        </div>
+      );
+    }
+
+    if (activeTab === 'profile') {
+      return (
+        <div className="space-y-4 animate-in fade-in pb-16">
+          <div className="p-5 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3">
+            <span className="text-xs font-bold text-zinc-400 uppercase tracking-wider block">
+              Rollen-Zuteilung
+            </span>
+            <div className="p-4 rounded-2xl bg-zinc-950 border border-zinc-700 text-center space-y-2">
+              <span className="text-2xl font-serif font-black text-amber-400 block">Lobby-Phase</span>
+              <p className="text-xs text-zinc-400 max-w-xs mx-auto">
+                Deine Rolle wird beim Spielstart geheim zugeteilt.
+              </p>
+            </div>
+          </div>
+
+          <div className="p-5 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3 text-xs text-zinc-300">
+            <h4 className="font-serif font-bold text-white text-base">Spielregeln</h4>
+            <div className="space-y-2">
+              <div>
+                <span className="font-bold text-white block">1. Berühren & Flüstern:</span>
+                Zum Töten das Opfer kurz berühren und ins Ohr flüstern:{" "}
+                <span className="italic text-rose-400">"Du wurdest von einem [Rolle] getötet."</span>
+              </div>
+              <div>
+                <span className="font-bold text-white block">2. Punkteverteilung:</span>
+                Foto-Aufgabe: 10 Pkt • Spezialaufgabe: 20 Pkt • Böser Kill: 15 Pkt • Exorzismus: 25 Pkt.
+              </div>
+            </div>
+          </div>
+
+          {!isAdminUnlocked && onRequestAdminUnlock && (
+            <button
+              type="button"
+              onClick={onRequestAdminUnlock}
+              className="w-full py-2.5 rounded-2xl bg-zinc-950/80 border border-zinc-800 text-zinc-500 hover:text-zinc-300 font-medium text-xs flex items-center justify-center gap-2 cursor-pointer transition"
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span>Spielleiter-Login / Admin-Bereich</span>
+            </button>
+          )}
+
+          <button
+            onClick={onLogoutDevice}
+            className="w-full py-3 rounded-2xl bg-zinc-900 border border-zinc-800 text-zinc-400 hover:text-white font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition"
+          >
+            <LogOut className="w-4 h-4" />
+            Auf diesem Gerät abmelden
+          </button>
+        </div>
+      );
+    }
+
     return (
       <div className="space-y-5 animate-in fade-in pb-16">
         <div className="text-center p-6 rounded-3xl bg-gradient-to-b from-orange-950/40 via-zinc-950 to-zinc-950 border border-orange-500/30 space-y-2">
@@ -436,56 +508,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
         </div>
       )}
 
-      {/* 5. NAVIGATION TABS (untere Tab-Leiste nach Spielstart) */}
-      <div className="grid grid-cols-4 gap-1 p-1 rounded-2xl bg-zinc-900 border border-zinc-800 text-[11px] font-bold">
-        <button
-          onClick={() => setActiveTab('actions')}
-          className={`py-2 rounded-xl transition cursor-pointer flex flex-col items-center gap-0.5 ${
-            activeTab === 'actions'
-              ? 'bg-[#ff6b00] text-zinc-950 font-black shadow'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          <Zap className="w-4 h-4" />
-          <span>Aktionen</span>
-        </button>
 
-        <button
-          onClick={() => setActiveTab('tasks')}
-          className={`py-2 rounded-xl transition cursor-pointer flex flex-col items-center gap-0.5 ${
-            activeTab === 'tasks'
-              ? 'bg-[#ff6b00] text-zinc-950 font-black shadow'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          <Camera className="w-4 h-4" />
-          <span>Aufgaben</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('ranking')}
-          className={`py-2 rounded-xl transition cursor-pointer flex flex-col items-center gap-0.5 ${
-            activeTab === 'ranking'
-              ? 'bg-[#ff6b00] text-zinc-950 font-black shadow'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          <Trophy className="w-4 h-4" />
-          <span>Ranking</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('profile')}
-          className={`py-2 rounded-xl transition cursor-pointer flex flex-col items-center gap-0.5 ${
-            activeTab === 'profile'
-              ? 'bg-[#ff6b00] text-zinc-950 font-black shadow'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          <Users className="w-4 h-4" />
-          <span>Profil</span>
-        </button>
-      </div>
 
       {/* ======================================================== */}
       {/* TAB 1: AKTIONEN (Fähigkeiten der eigenen Rolle)            */}
@@ -745,7 +768,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                     Foto-Aufgabe {idx + 1}
                   </span>
                   <span className="text-xs font-mono font-bold text-[#ff6b00]">
-                    +{t.points} Pkt (+2 je Mitspieler)
+                    +{t.points} Pkt
                   </span>
                 </div>
 
@@ -785,24 +808,6 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                 </button>
               </div>
             ))}
-          </div>
-
-          {/* PARTY GALERIE TEASER */}
-          <div className="space-y-2 pt-2">
-            <h4 className="font-bold text-white text-xs">Neueste Party-Schnappschüsse ({photos.length})</h4>
-            <div className="grid grid-cols-3 gap-2">
-              {photos.slice(0, 6).map((ph) => (
-                <div
-                  key={ph.id}
-                  className="aspect-square rounded-2xl overflow-hidden border border-zinc-800 bg-zinc-900 relative group"
-                >
-                  <img src={ph.photoUrl} alt="Party Foto" className="w-full h-full object-cover" />
-                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition p-1.5 flex flex-col justify-end text-[9px] text-zinc-200">
-                    <span className="font-bold truncate">{ph.photographerName}</span>
-                  </div>
-                </div>
-              ))}
-            </div>
           </div>
         </div>
       )}
@@ -968,6 +973,21 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
       )}
 
       {/* ======================================================== */}
+      {/* TAB: GALERIE (Party-Galerie aller gelösten Foto-Aufgaben)  */}
+      {/* ======================================================== */}
+      {activeTab === 'gallery' && (
+        <GalleryView
+          photos={photos}
+          currentPlayerId={player.id}
+          currentPlayerName={player.name}
+          isGameEnded={false}
+          downloadSetting={gameState.settings?.photoDownloadUnlocked || 'ended'}
+          isAdmin={Boolean(isAdminUnlocked)}
+          onDeletePhoto={onDeletePhoto}
+        />
+      )}
+
+      {/* ======================================================== */}
       {/* TAB 4: PROFIL & REGELN (Profil, Rollenkarte, Regeln)     */}
       {/* ======================================================== */}
       {activeTab === 'profile' && (
@@ -1058,10 +1078,22 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
 
               <div>
                 <span className="font-bold text-white block">3. Punkteverteilung:</span>
-                Foto-Aufgabe: 10 Pkt • Markierter Gast: 2 Pkt • Spezialaufgabe: 20 Pkt • Böser Kill: 15 Pkt • Exorzismus: 25 Pkt.
+                Foto-Aufgabe: 10 Pkt • Spezialaufgabe: 20 Pkt • Böser Kill: 15 Pkt • Exorzismus: 25 Pkt.
               </div>
             </div>
           </div>
+
+          {/* Admin Unlock button if not yet unlocked */}
+          {!isAdminUnlocked && onRequestAdminUnlock && (
+            <button
+              type="button"
+              onClick={onRequestAdminUnlock}
+              className="w-full py-2.5 rounded-2xl bg-zinc-950/80 border border-zinc-800 text-zinc-500 hover:text-zinc-300 font-medium text-xs flex items-center justify-center gap-2 cursor-pointer transition"
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span>Spielleiter-Login / Admin-Bereich</span>
+            </button>
+          )}
 
           {/* Logout */}
           <button
@@ -1092,8 +1124,6 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
           onClose={() => setActiveTaskModal(null)}
           taskTitle={activeTaskModal.title}
           taskDescription={activeTaskModal.desc}
-          players={players}
-          currentPlayerId={player.id}
           onComplete={handleCompletePhotoTask}
         />
       )}
