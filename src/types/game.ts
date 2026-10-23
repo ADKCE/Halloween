@@ -20,6 +20,7 @@ export interface Player {
   cooldownUntil?: string;
   lastKillAt?: string;
   pendingDeathAt?: string | null;
+  isTest?: boolean;
   joinedAt: string;
 }
 
@@ -91,6 +92,8 @@ export interface GameState {
   activeFullMoon?: FullMoonEvent | null;
   lastSpecialTaskAt?: string | null;
   nextSpecialTaskIntervalMinutes?: number;
+  lastTickAt?: string | null;
+  winnerTeam?: TeamType | null;
   updatedAt?: string;
 }
 

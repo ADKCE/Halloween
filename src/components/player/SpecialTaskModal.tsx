@@ -49,6 +49,14 @@ export const SpecialTaskModal: React.FC<SpecialTaskModalProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [revealedResult, setRevealedResult] = useState<{ name: string; role: RoleType; message: string } | null>(null);
 
+  const [attemptsCount, setAttemptsCount] = useState<number>(() => {
+    if (typeof window === 'undefined') return 0;
+    const saved = sessionStorage.getItem(`st_attempts_${task.id}`);
+    return saved ? parseInt(saved, 10) : 0;
+  });
+
+  const startTimeRef = useRef<number>(Date.now());
+
   // Play audio alert on opening
   useEffect(() => {
     if (isOpen) {
@@ -68,26 +76,40 @@ export const SpecialTaskModal: React.FC<SpecialTaskModalProps> = ({
 
   const [secondsRemaining, setSecondsRemaining] = useState<number>(timeLimit);
 
+  // When player hits "Jetzt starten", reset start time
   useEffect(() => {
-    setSecondsRemaining(timeLimit);
-  }, [timeLimit, stage]);
+    if (stage === 'playing') {
+      startTimeRef.current = Date.now();
+    }
+  }, [stage]);
 
+  // Resilient timestamp-based timer (works across screen lock, backgrounding & tab switch)
   useEffect(() => {
     if (stage !== 'playing') return;
 
-    const timer = setInterval(() => {
-      setSecondsRemaining((prev) => {
-        if (prev <= 1) {
-          clearInterval(timer);
-          setStage('expired');
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
+    const updateTimer = () => {
+      const elapsed = Math.floor((Date.now() - startTimeRef.current) / 1000);
+      const remaining = Math.max(0, timeLimit - elapsed);
+      setSecondsRemaining(remaining);
+      if (remaining <= 0) {
+        setStage('expired');
+      }
+    };
 
-    return () => clearInterval(timer);
-  }, [stage]);
+    updateTimer();
+    const timer = setInterval(updateTimer, 500);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') updateTimer();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('focus', onVisibilityChange);
+
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('focus', onVisibilityChange);
+    };
+  }, [stage, timeLimit]);
 
   // ----------------------------------------------------------------------------
   // 1. KOPFRECHNEN STATE (3 questions in 60s)
@@ -264,6 +286,11 @@ export const SpecialTaskModal: React.FC<SpecialTaskModalProps> = ({
   // FINALIZE SUBMIT HELPER
   // ----------------------------------------------------------------------------
   const finalizeTask = async (answerPayload: any) => {
+    if (attemptsCount >= 2) {
+      setStage('expired');
+      return;
+    }
+
     setIsSubmitting(true);
     setErrorMessage(null);
 
@@ -284,7 +311,19 @@ export const SpecialTaskModal: React.FC<SpecialTaskModalProps> = ({
         setStage('success');
       }
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Leider falsch! Versuche es noch einmal.');
+      const newAttempts = attemptsCount + 1;
+      setAttemptsCount(newAttempts);
+      try {
+        sessionStorage.setItem(`st_attempts_${task.id}`, newAttempts.toString());
+      } catch {}
+
+      if (newAttempts >= 2) {
+        setErrorMessage('Leider auch beim 2. Versuch falsch. Die Spezialaufgabe ist verfallen!');
+        setStage('expired');
+      } else {
+        const errorDetail = err?.message || 'Leider falsch!';
+        setErrorMessage(`${errorDetail} (1. Fehlversuch – du hast noch genau 1 Versuch!)`);
+      }
     } finally {
       setIsSubmitting(false);
     }

@@ -70,6 +70,8 @@ interface AdminAreaProps {
   onDeletePhoto: (photoId: string) => Promise<void>;
   onAdminConfirmPendingDeath?: (victimId: string) => Promise<void>;
   onAdminRevivePendingDeath?: (playerId: string) => Promise<void>;
+  lastTickAt?: string | null;
+  onTriggerTick?: () => Promise<void>;
 }
 
 export const AdminArea: React.FC<AdminAreaProps> = ({
@@ -79,6 +81,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   adminCode,
   kills,
   photos,
+  lastTickAt,
   onStartGame,
   onReassignRoles,
   onAbortGame,
@@ -93,9 +96,52 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   onDeletePhoto,
   onAdminConfirmPendingDeath,
   onAdminRevivePendingDeath,
+  onTriggerTick,
 }) => {
   // Sub-tabs in Admin: 'control' | 'players' | 'kills' | 'gallery' | 'settings' | 'qrcode'
   const [activeTab, setActiveTab] = useState<'control' | 'players' | 'kills' | 'gallery' | 'settings' | 'qrcode'>('control');
+  const [tickSecondsAgo, setTickSecondsAgo] = useState<number | null>(null);
+  const [isTicking, setIsTicking] = useState(false);
+
+  // Live calculation of seconds since last tick
+  useEffect(() => {
+    const updateTick = () => {
+      if (!lastTickAt) {
+        setTickSecondsAgo(null);
+        return;
+      }
+      const diffSec = Math.max(0, Math.floor((Date.now() - new Date(lastTickAt).getTime()) / 1000));
+      setTickSecondsAgo(diffSec);
+    };
+    updateTick();
+    const interval = setInterval(updateTick, 1000);
+    return () => clearInterval(interval);
+  }, [lastTickAt]);
+
+  const handleManualTick = async () => {
+    setIsTicking(true);
+    try {
+      if (onTriggerTick) {
+        await onTriggerTick();
+      } else {
+        await gameApi.tickGame();
+      }
+    } finally {
+      setIsTicking(false);
+    }
+  };
+
+  const handleConfirmEndGame = async () => {
+    if (confirm('Möchtest du das Spiel wirklich beenden? Alle Rollen werden enthüllt und das Gewinner-Team ermittelt.')) {
+      await onEndGame();
+    }
+  };
+
+  const handleConfirmAbortGame = async () => {
+    if (confirm('Möchtest du das laufende Spiel wirklich abbrechen und zurück in die Lobby wechseln?')) {
+      await onAbortGame();
+    }
+  };
 
   // Search & Filters
   const [searchTerm, setSearchTerm] = useState('');
@@ -830,7 +876,37 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
           </div>
 
           <div className="p-5 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3">
-            <h3 className="font-serif font-bold text-base text-white">Spielsteuerung</h3>
+            <h3 className="font-serif font-bold text-base text-white">Spielsteuerung & Timer</h3>
+
+            {/* TICK MONITOR */}
+            <div className="p-3 rounded-2xl bg-zinc-950 border border-zinc-800 flex items-center justify-between text-xs font-mono">
+              <div className="flex items-center gap-2">
+                <div className={`w-2.5 h-2.5 rounded-full ${tickSecondsAgo !== null && tickSecondsAgo > 180 ? 'bg-rose-500 animate-ping' : 'bg-emerald-400 animate-pulse'}`} />
+                <span className="text-zinc-400">pg_cron Hintergrund-Tick:</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className={tickSecondsAgo !== null && tickSecondsAgo > 180 ? 'text-rose-400 font-bold' : 'text-emerald-300 font-bold'}>
+                  {tickSecondsAgo !== null ? `vor ${tickSecondsAgo}s` : 'Warte auf ersten Tick...'}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleManualTick}
+                  disabled={isTicking}
+                  className="px-2 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-[11px] font-sans flex items-center gap-1 cursor-pointer"
+                  title="Manuell tick_game() ausführen"
+                >
+                  <RotateCcw className={`w-3 h-3 ${isTicking ? 'animate-spin' : ''}`} />
+                  Jetzt ticken
+                </button>
+              </div>
+            </div>
+
+            {tickSecondsAgo !== null && tickSecondsAgo > 180 && gameStatus === 'Läuft' && (
+              <div className="p-3 rounded-2xl bg-amber-950/80 border border-amber-500/50 text-amber-200 text-xs flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>Warnung: Letzter Tick vor über 3 Minuten! Prüfe pg_cron oder klicke oben auf &quot;Jetzt ticken&quot;.</span>
+              </div>
+            )}
 
             <div className="space-y-2.5 pt-1">
               <button
@@ -847,7 +923,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
               </button>
 
               <button
-                onClick={onEndGame}
+                onClick={handleConfirmEndGame}
                 disabled={gameStatus !== 'Läuft'}
                 className={`w-full py-3 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition cursor-pointer ${
                   gameStatus !== 'Läuft'
@@ -860,7 +936,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
               </button>
 
               <button
-                onClick={onAbortGame}
+                onClick={handleConfirmAbortGame}
                 disabled={gameStatus !== 'Läuft'}
                 className={`w-full py-3 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition cursor-pointer ${
                   gameStatus !== 'Läuft'

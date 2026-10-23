@@ -298,6 +298,8 @@ class SupabaseService {
         adminCode: stateData?.admin_code || '1031',
         fullMoonTimes: stateData?.full_moon_times || [],
         activeFullMoon: stateData?.active_full_moon || null,
+        lastTickAt: stateData?.last_tick_at || null,
+        winnerTeam: stateData?.winner_team || null,
         updatedAt: stateData?.updated_at || undefined,
       };
 
@@ -315,21 +317,41 @@ class SupabaseService {
 
       this.dbPlayerCount = playersData ? playersData.length : 0;
 
-      // Find self
-      const selfPlayer = (playersData || []).find((p: any) => playerId && p.id === playerId);
-      const isSelfHunter = selfPlayer && selfPlayer.role === 'Geisterjäger';
+      // Secure role lookup via RPC to avoid exposing all roles to anon client
+      let mySecretRole: RoleType | null = null;
+      let mySecretTeam: TeamType | null = null;
+      let fellowHunterIds = new Set<string>();
+
+      if (playerId) {
+        try {
+          const { data: roleRes } = await client.rpc('get_my_role', { p_player_id: playerId });
+          if (roleRes && roleRes.role) {
+            mySecretRole = roleRes.role as RoleType;
+            mySecretTeam = roleRes.team as TeamType;
+          }
+        } catch {}
+
+        if (mySecretRole === 'Geisterjäger') {
+          try {
+            const { data: huntersRes } = await client.rpc('get_fellow_hunters', { p_player_id: playerId });
+            if (Array.isArray(huntersRes)) {
+              fellowHunterIds = new Set(huntersRes.map((h: any) => h.player_id));
+            }
+          } catch {}
+        }
+      }
 
       // Role secrecy rules:
       // - If game is 'Beendet' -> everyone sees all roles
       // - Admin -> sees all roles
-      // - Self -> sees own role
+      // - Self -> sees own role (via RPC or record)
       // - Hunter -> sees other Hunters' roles too
       // - Otherwise -> 'Unbekannt'
       const isGameEnded = gameState.status === 'Beendet';
 
       const mappedPlayers: Player[] = (playersData || []).map((p: any) => {
-        const isSelf = playerId && p.id === playerId;
-        const isHunterTeammate = isSelfHunter && p.role === 'Geisterjäger';
+        const isSelf = Boolean(playerId && p.id === playerId);
+        const isHunterTeammate = Boolean(fellowHunterIds.has(p.id));
         const rawRole = (p.role === 'unassigned' || !p.role) ? 'unassigned' : (p.role as RoleType);
         const rawTeam = (p.team || 'Gut') as TeamType;
 
@@ -342,9 +364,19 @@ class SupabaseService {
           resolvedTeam = 'Gut';
         } else {
           // Läuft oder Beendet
-          const canSeeRole = isGameEnded || isAdmin || isSelf || isHunterTeammate;
-          resolvedRole = canSeeRole ? rawRole : 'Unbekannt';
-          resolvedTeam = canSeeRole ? rawTeam : 'Gut';
+          if (isGameEnded || isAdmin) {
+            resolvedRole = rawRole;
+            resolvedTeam = rawTeam;
+          } else if (isSelf) {
+            resolvedRole = mySecretRole || rawRole;
+            resolvedTeam = mySecretTeam || rawTeam;
+          } else if (isHunterTeammate) {
+            resolvedRole = 'Geisterjäger';
+            resolvedTeam = 'Gut';
+          } else {
+            resolvedRole = 'Unbekannt';
+            resolvedTeam = 'Gut';
+          }
         }
 
         return {
@@ -361,6 +393,7 @@ class SupabaseService {
           cooldownUntil: p.cooldown_until || undefined,
           lastKillAt: p.last_kill_at || undefined,
           pendingDeathAt: p.pending_death_at || null,
+          isTest: Boolean(p.is_test),
           joinedAt: p.created_at,
         };
       });
@@ -737,6 +770,16 @@ class SupabaseService {
     const client = this.getClient();
     if (!client) throw new Error('Supabase nicht verfügbar');
 
+    // 0. Server-seitige atomare Postgres-Funktion RPC "start_game" versuchen
+    try {
+      const { data: rpcStart, error: rpcStartErr } = await client.rpc('start_game', {
+        p_admin_code: adminCode.trim(),
+      });
+      if (!rpcStartErr && rpcStart?.success) {
+        return;
+      }
+    } catch {}
+
     const { data: stateData } = await client.from('game_state').select('*').eq('id', 'main').single();
     const rawSettings = stateData?.settings || {};
     const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...rawSettings };
@@ -917,6 +960,18 @@ class SupabaseService {
 
     const client = this.getClient();
     if (!client) throw new Error('Supabase nicht verfügbar');
+
+    // 0. Server-seitige atomare Postgres RPC "admin_restart_game" versuchen
+    try {
+      const { data: rpcRes, error: rpcErr } = await client.rpc('admin_restart_game', {
+        p_admin_code: adminCode.trim(),
+        p_keep_players: keepPlayers,
+        p_keep_photos: true,
+      });
+      if (!rpcErr && rpcRes?.success) {
+        return;
+      }
+    } catch {}
 
     if (!keepPlayers) {
       await client.from('kills').delete().neq('killer_id', '__never__');
@@ -1187,6 +1242,37 @@ class SupabaseService {
   }> {
     const client = this.getClient();
     if (!client) throw new Error('Supabase nicht verfügbar');
+
+    // 0. Server-seitige atomare Postgres-Funktion RPC "exorcise" versuchen
+    try {
+      const { data: rpcRes, error: rpcErr } = await client.rpc('exorcise', {
+        p_hunter_id: hunterId,
+        p_target_id: targetId,
+      });
+
+      if (!rpcErr && rpcRes && rpcRes.success) {
+        const cdMin = rpcRes.cooldown_minutes || 15;
+        const cooldownUntil = new Date(Date.now() + cdMin * 60 * 1000).toISOString();
+        try {
+          sessionStorage.setItem(`cd_${hunterId}`, cooldownUntil);
+        } catch {}
+
+        return {
+          hit: Boolean(rpcRes.hit),
+          victimName: rpcRes.target_name || '',
+          victimRole: (rpcRes.target_role || 'Unbekannt') as RoleType,
+          message: rpcRes.message || '',
+          cooldownMinutes: cdMin,
+        };
+      } else if (rpcErr && rpcErr.message && !rpcErr.message.includes('function') && !rpcErr.message.includes('does not exist')) {
+        throw new Error(rpcErr.message);
+      }
+    } catch (err: any) {
+      if (err.message && !err.message.includes('function') && !err.message.includes('does not exist')) {
+        throw err;
+      }
+      console.warn('RPC exorcise nicht verfügbar, führe Client-Fallback aus:', err);
+    }
 
     const { data: stateData } = await client.from('game_state').select('*').eq('id', 'main').single();
     if (stateData?.status !== 'Läuft') throw new Error('Das Spiel läuft derzeit nicht!');
@@ -2123,7 +2209,24 @@ class SupabaseService {
       }
     }
 
-    // 2. Zufälligen lebenden BÖSEN Spieler finden, dessen Rolle aufgedeckt wird!
+    // 2. Vorherige Enthüllungen dieses Spielers abrufen, um Wiederholungen zu vermeiden
+    let alreadyRevealedIds = new Set<string>();
+    try {
+      const { data: pastRevealed } = await client
+        .from('special_tasks')
+        .select('reward_player_id')
+        .eq('player_id', params.playerId)
+        .eq('status', 'completed')
+        .not('reward_player_id', 'is', null);
+
+      if (pastRevealed && Array.isArray(pastRevealed)) {
+        pastRevealed.forEach((r: any) => {
+          if (r.reward_player_id) alreadyRevealedIds.add(r.reward_player_id);
+        });
+      }
+    } catch {}
+
+    // Zufälligen lebenden BÖSEN Spieler finden, dessen Rolle aufgedeckt wird!
     const { data: evilPlayers } = await client
       .from('players')
       .select('id, name, role')
@@ -2136,7 +2239,10 @@ class SupabaseService {
     let revealedId = '';
 
     if (evilPlayers && evilPlayers.length > 0) {
-      const randomEvil = evilPlayers[Math.floor(Math.random() * evilPlayers.length)];
+      // Unbekannte böse Spieler bevorzugen
+      const unrevealedEvil = evilPlayers.filter((ep: any) => !alreadyRevealedIds.has(ep.id));
+      const pool = unrevealedEvil.length > 0 ? unrevealedEvil : evilPlayers;
+      const randomEvil = pool[Math.floor(Math.random() * pool.length)];
       revealedId = randomEvil.id;
       revealedName = randomEvil.name;
       revealedRole = randomEvil.role as RoleType;

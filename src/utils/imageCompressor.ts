@@ -15,59 +15,78 @@ export async function compressImage(
   quality = 0.85
 ): Promise<CompressedImageResult> {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-
-    reader.onload = (readerEvent) => {
-      const img = new Image();
-
-      img.onload = () => {
-        let width = img.width;
-        let height = img.height;
-
-        if (width > maxWidth) {
-          height = Math.round((height * maxWidth) / width);
-          width = maxWidth;
-        }
-
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          const fallbackDataUrl = readerEvent.target?.result as string;
-          // create a basic blob fallback
-          fetch(fallbackDataUrl)
-            .then((r) => r.blob())
-            .then((blob) => resolve({ blob, dataUrl: fallbackDataUrl, width, height }))
-            .catch(reject);
-          return;
-        }
-
-        ctx.drawImage(img, 0, 0, width, height);
-
-        const dataUrl = canvas.toDataURL('image/jpeg', quality);
-
-        canvas.toBlob(
-          (blob) => {
-            if (!blob) {
-              reject(new Error('Konnte Bild nicht in Blob konvertieren'));
-              return;
-            }
-            resolve({ blob, dataUrl, width, height });
-          },
-          'image/jpeg',
-          quality
-        );
+    let objectUrl = '';
+    try {
+      objectUrl = URL.createObjectURL(file);
+    } catch {
+      // Fallback to FileReader if createObjectURL fails
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => processImage(img, '', resolve, reject, maxWidth, quality);
+        img.onerror = () => reject(new Error('Bild konnte nicht geladen werden'));
+        img.src = e.target?.result as string;
       };
+      reader.onerror = () => reject(new Error('Datei konnte nicht gelesen werden'));
+      reader.readAsDataURL(file);
+      return;
+    }
 
-      img.onerror = () => reject(new Error('Bild konnte nicht geladen werden'));
-      img.src = readerEvent.target?.result as string;
+    const img = new Image();
+    img.onload = () => {
+      processImage(img, objectUrl, resolve, reject, maxWidth, quality);
     };
-
-    reader.onerror = () => reject(new Error('Datei konnte nicht gelesen werden'));
-    reader.readAsDataURL(file);
+    img.onerror = () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      reject(new Error('Bild konnte nicht geladen werden'));
+    };
+    img.src = objectUrl;
   });
+}
+
+function processImage(
+  img: HTMLImageElement,
+  objectUrl: string,
+  resolve: (res: CompressedImageResult) => void,
+  reject: (err: Error) => void,
+  maxWidth: number,
+  quality: number
+) {
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+
+  let width = img.width;
+  let height = img.height;
+
+  if (width > maxWidth) {
+    height = Math.round((height * maxWidth) / width);
+    width = maxWidth;
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    reject(new Error('Canvas 2D Context nicht verfügbar'));
+    return;
+  }
+
+  ctx.drawImage(img, 0, 0, width, height);
+
+  const dataUrl = canvas.toDataURL('image/jpeg', quality);
+
+  canvas.toBlob(
+    (blob) => {
+      if (!blob) {
+        reject(new Error('Konnte Bild nicht in Blob konvertieren'));
+        return;
+      }
+      resolve({ blob, dataUrl, width, height });
+    },
+    'image/jpeg',
+    quality
+  );
 }
 
 /**

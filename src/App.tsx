@@ -108,10 +108,10 @@ export default function App() {
       setTotalJoinedCount(data.totalJoinedCount);
       setFetchError(null);
 
-      // Verify if stored player still exists in Supabase
+      // Verify if stored player still exists in Supabase and is not removed
       if (registeredPlayerId) {
         const found = data.players.find((p) => p.id === registeredPlayerId);
-        if (!found) {
+        if (!found || found.status === 'entfernt') {
           localStorage.removeItem(LOCAL_STORAGE_PLAYER_ID);
           setRegisteredPlayerId(null);
         }
@@ -123,6 +123,24 @@ export default function App() {
     }
   }, [registeredPlayerId, adminCode, isAdminUnlocked]);
 
+  // Immediate refetch when mobile screen is turned back on or tab focused
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        fetchGameState();
+        if (gameState.status === 'Läuft') {
+          gameApi.tickGame().catch(() => {});
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('focus', handleVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('focus', handleVisibility);
+    };
+  }, [fetchGameState, gameState.status]);
+
   // Periodic game loop tick (checks pending deaths timeout, generates slot photo tasks & mini-games)
   useEffect(() => {
     if (gameState.status !== 'Läuft') return;
@@ -130,20 +148,23 @@ export default function App() {
     // Run tick on start/resume
     gameApi.tickGame().catch(() => {});
 
-    // Periodic tick every 15 seconds
+    // Periodic tick every 20 seconds
     const interval = setInterval(() => {
       gameApi.tickGame().catch(() => {});
-    }, 15000);
+    }, 20000);
 
     return () => clearInterval(interval);
   }, [gameState.status]);
 
-  // Initial fetch, Supabase Realtime subscription & 3-second fallback polling
+  // Realtime subscription + gentle adaptive fallback polling (20s when Realtime connected, 5s when offline)
   useEffect(() => {
     fetchGameState();
 
     const unsubscribeRealtime = gameApi.subscribeToRealtime(fetchGameState);
-    const interval = setInterval(fetchGameState, 3000);
+    
+    // Check status: If connected, poll every 20s. If disconnected/error, poll every 5s.
+    const pollIntervalMs = gameApi.getStatus().realtimeStatus === 'CONNECTED' ? 20000 : 5000;
+    const interval = setInterval(fetchGameState, pollIntervalMs);
 
     return () => {
       clearInterval(interval);
@@ -554,13 +575,15 @@ export default function App() {
           onVerify={handleVerifyAdminCode}
         />
 
-        {/* DEBUG PANEL (Visible with ?debug=1 in URL) */}
-        <DebugPanel
-          registeredPlayerId={registeredPlayerId}
-          gameStatus={gameState.status}
-          totalJoinedCount={totalJoinedCount}
-          onRefresh={fetchGameState}
-        />
+        {/* DEBUG PANEL (Only accessible when Admin is unlocked & ?debug=1) */}
+        {isAdminUnlocked && (
+          <DebugPanel
+            registeredPlayerId={registeredPlayerId}
+            gameStatus={gameState.status}
+            totalJoinedCount={totalJoinedCount}
+            onRefresh={fetchGameState}
+          />
+        )}
       </div>
     </div>
   );

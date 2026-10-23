@@ -81,6 +81,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onRegister, isLoading 
           <input
             type="text"
             required
+            maxLength={40}
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="z.B. Sarah Vogel"
@@ -96,6 +97,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onRegister, isLoading 
           <input
             type="text"
             required
+            maxLength={40}
             value={costumeName}
             onChange={(e) => setCostumeName(e.target.value)}
             placeholder="z.B. Gräfin Dracula, Zombie-Braut"

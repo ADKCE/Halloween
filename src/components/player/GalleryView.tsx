@@ -428,7 +428,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               )}
             </div>
             <p className="text-[10px] text-zinc-500 text-center pt-1">
-              Tipp: Wische nach links oder rechts, um zwischen Fotos zu wechseln
+              Tipp: Wische nach links/rechts zum Blättern • Auf Smartphones: Foto gedrückt halten zum Speichern
             </p>
           </div>
         </div>
