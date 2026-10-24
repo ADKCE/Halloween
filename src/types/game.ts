@@ -94,6 +94,7 @@ export interface GameState {
   nextSpecialTaskIntervalMinutes?: number;
   lastTickAt?: string | null;
   winnerTeam?: TeamType | null;
+  resetEpoch?: number;
   updatedAt?: string;
 }
 
@@ -269,5 +270,24 @@ export interface PointsLogEntry {
   amount: number;
   refId: string;
   createdAt: string;
+}
+
+export interface ClientErrorEntry {
+  id: string;
+  createdAt: string;
+  playerId?: string | null;
+  message: string;
+  stack?: string | null;
+  source?: string | null;
+  userAgent?: string | null;
+}
+
+export interface TickLogEntry {
+  id: string;
+  tickAt: string;
+  durationMs?: number;
+  status: 'success' | 'error' | string;
+  details?: any;
+  errorMessage?: string | null;
 }
 

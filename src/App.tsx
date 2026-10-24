@@ -18,9 +18,12 @@ import {
   SpecialTaskAssignment
 } from './types/game';
 import { gameApi } from './utils/api';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
+import { initGlobalErrorLogging } from './utils/errorLogger';
 import { Smartphone, Monitor, Loader2, Sparkles, Database, AlertCircle, AlertTriangle, CheckCircle2, X } from 'lucide-react';
 
 const LOCAL_STORAGE_PLAYER_ID = 'halloween_party_player_id';
+const LOCAL_STORAGE_RESET_EPOCH = 'halloween_party_reset_epoch';
 const SESSION_STORAGE_ADMIN_CODE = 'halloween_party_admin_code';
 
 export default function App() {
@@ -108,6 +111,19 @@ export default function App() {
       setTotalJoinedCount(data.totalJoinedCount);
       setFetchError(null);
 
+      // Verify reset_epoch (erkennt Komplett-Reset und leert lokale Spieler-ID)
+      const serverEpoch = data.gameState.resetEpoch;
+      if (serverEpoch) {
+        const storedEpoch = localStorage.getItem(LOCAL_STORAGE_RESET_EPOCH);
+        if (storedEpoch && Number(storedEpoch) < serverEpoch) {
+          localStorage.setItem(LOCAL_STORAGE_RESET_EPOCH, String(serverEpoch));
+          localStorage.removeItem(LOCAL_STORAGE_PLAYER_ID);
+          setRegisteredPlayerId(null);
+        } else if (!storedEpoch) {
+          localStorage.setItem(LOCAL_STORAGE_RESET_EPOCH, String(serverEpoch));
+        }
+      }
+
       // Verify if stored player still exists in Supabase and is not removed
       if (registeredPlayerId) {
         const found = data.players.find((p) => p.id === registeredPlayerId);
@@ -122,6 +138,11 @@ export default function App() {
       setIsInitializing(false);
     }
   }, [registeredPlayerId, adminCode, isAdminUnlocked]);
+
+  // Global unhandled error logging init
+  useEffect(() => {
+    initGlobalErrorLogging(() => registeredPlayerId);
+  }, [registeredPlayerId]);
 
   // Immediate refetch when mobile screen is turned back on or tab focused
   useEffect(() => {
@@ -502,71 +523,136 @@ export default function App() {
             </div>
           </div>
         ) : !currentPlayer || !registeredPlayerId ? (
-          /* STEP 1: LOGIN-SCREEN */
-          <LoginScreen
-            onRegister={handleRegisterPlayer}
-            isLoading={isRegistering}
-          />
+          isAdminUnlocked && currentTab === 'admin' ? (
+            /* ADMIN DIREKT ANZEIGEN, AUCH OHNE EIGENEN SPIELER */
+            <div className="flex-1 flex flex-col justify-between">
+              <main className="flex-1 p-4 pb-24 max-w-md w-full mx-auto">
+                <ErrorBoundary tabName="Admin-Bereich">
+                  <AdminArea
+                    gameStatus={gameState.status}
+                    players={players}
+                    settings={gameState.settings}
+                    adminCode={adminCode}
+                    kills={kills}
+                    photos={photos}
+                    lastTickAt={gameState.lastTickAt}
+                    onStartGame={handleAdminStartGame}
+                    onReassignRoles={handleAdminReassignRoles}
+                    onAbortGame={handleAdminAbortGame}
+                    onEndGame={handleAdminEndGame}
+                    onRestartGame={handleAdminRestart}
+                    onPlayerAction={handleAdminPlayerAction}
+                    onUpdateSettings={handleAdminUpdateSettings}
+                    onTriggerFullMoon={handleTriggerFullMoon}
+                    onStopFullMoon={handleStopFullMoon}
+                    onConfirmKill={handleAdminConfirmKill}
+                    onUndoKill={handleAdminUndoKill}
+                    onDeletePhoto={handleAdminDeletePhoto}
+                    onAdminConfirmPendingDeath={handleAdminConfirmPendingDeath}
+                    onAdminRevivePendingDeath={handleAdminRevivePendingDeath}
+                    onRefreshState={fetchGameState}
+                    onToast={(msg, type) => {
+                      if (type === 'error') {
+                        setErrorMessage({ title: 'Admin-Fehler', detail: msg, timestamp: Date.now() });
+                      } else {
+                        setSuccessToast(msg);
+                        setTimeout(() => setSuccessToast(null), 4000);
+                      }
+                    }}
+                  />
+                </ErrorBoundary>
+              </main>
+              <MobileNavBar
+                currentTab={currentTab}
+                onTabChange={setCurrentTab}
+                isAdminUnlocked={isAdminUnlocked}
+                photosCount={photos.length}
+              />
+            </div>
+          ) : (
+            /* STEP 1: LOGIN-SCREEN */
+            <ErrorBoundary tabName="Login-Screen">
+              <LoginScreen
+                onRegister={handleRegisterPlayer}
+                isLoading={isRegistering}
+                onRequestAdminUnlock={() => setIsAdminModalOpen(true)}
+              />
+            </ErrorBoundary>
+          )
         ) : (
           /* STEP 2 & 3: SPIELBEREICH / ADMIN */
           <div className="flex-1 flex flex-col justify-between">
             <main className="flex-1 p-4 pb-24 max-w-md w-full mx-auto">
               {currentTab !== 'admin' ? (
-                <PlayerArea
-                  player={currentPlayer}
-                  players={players}
-                  gameState={gameState}
-                  totalJoinedCount={totalJoinedCount}
-                  kills={kills}
-                  tasks={tasks}
-                  taskCompletions={taskCompletions}
-                  photos={photos}
-                  photoTasks={photoTasks}
-                  specialTasks={specialTasks}
-                  activeTab={currentTab}
-                  onTabChange={setCurrentTab}
-                  onLogoutDevice={handleLogoutDevice}
-                  onRefreshState={fetchGameState}
-                  onSelfReportDeath={handleSelfReportDeath}
-                  onDeletePhoto={handlePlayerDeletePhoto}
-                  onRequestAdminUnlock={() => setIsAdminModalOpen(true)}
-                  isAdminUnlocked={isAdminUnlocked}
-                  onToast={(msg, type) => {
-                    if (type === 'error') {
-                      setErrorMessage({
-                        title: 'Fehler',
-                        detail: msg,
-                        timestamp: Date.now(),
-                      });
-                    } else {
-                      setSuccessToast(msg);
-                      setTimeout(() => setSuccessToast(null), 4000);
-                    }
-                  }}
-                />
+                <ErrorBoundary tabName="Spieler-Bereich">
+                  <PlayerArea
+                    player={currentPlayer}
+                    players={players}
+                    gameState={gameState}
+                    totalJoinedCount={totalJoinedCount}
+                    kills={kills}
+                    tasks={tasks}
+                    taskCompletions={taskCompletions}
+                    photos={photos}
+                    photoTasks={photoTasks}
+                    specialTasks={specialTasks}
+                    activeTab={currentTab}
+                    onTabChange={setCurrentTab}
+                    onLogoutDevice={handleLogoutDevice}
+                    onRefreshState={fetchGameState}
+                    onSelfReportDeath={handleSelfReportDeath}
+                    onDeletePhoto={handlePlayerDeletePhoto}
+                    onRequestAdminUnlock={() => setIsAdminModalOpen(true)}
+                    isAdminUnlocked={isAdminUnlocked}
+                    onToast={(msg, type) => {
+                      if (type === 'error') {
+                        setErrorMessage({
+                          title: 'Fehler',
+                          detail: msg,
+                          timestamp: Date.now(),
+                        });
+                      } else {
+                        setSuccessToast(msg);
+                        setTimeout(() => setSuccessToast(null), 4000);
+                      }
+                    }}
+                  />
+                </ErrorBoundary>
               ) : (
-                <AdminArea
-                  gameStatus={gameState.status}
-                  players={players}
-                  settings={gameState.settings}
-                  adminCode={adminCode}
-                  kills={kills}
-                  photos={photos}
-                  onStartGame={handleAdminStartGame}
-                  onReassignRoles={handleAdminReassignRoles}
-                  onAbortGame={handleAdminAbortGame}
-                  onEndGame={handleAdminEndGame}
-                  onRestartGame={handleAdminRestart}
-                  onPlayerAction={handleAdminPlayerAction}
-                  onUpdateSettings={handleAdminUpdateSettings}
-                  onTriggerFullMoon={handleTriggerFullMoon}
-                  onStopFullMoon={handleStopFullMoon}
-                  onConfirmKill={handleAdminConfirmKill}
-                  onUndoKill={handleAdminUndoKill}
-                  onDeletePhoto={handleAdminDeletePhoto}
-                  onAdminConfirmPendingDeath={handleAdminConfirmPendingDeath}
-                  onAdminRevivePendingDeath={handleAdminRevivePendingDeath}
-                />
+                <ErrorBoundary tabName="Admin-Bereich">
+                  <AdminArea
+                    gameStatus={gameState.status}
+                    players={players}
+                    settings={gameState.settings}
+                    adminCode={adminCode}
+                    kills={kills}
+                    photos={photos}
+                    lastTickAt={gameState.lastTickAt}
+                    onStartGame={handleAdminStartGame}
+                    onReassignRoles={handleAdminReassignRoles}
+                    onAbortGame={handleAdminAbortGame}
+                    onEndGame={handleAdminEndGame}
+                    onRestartGame={handleAdminRestart}
+                    onPlayerAction={handleAdminPlayerAction}
+                    onUpdateSettings={handleAdminUpdateSettings}
+                    onTriggerFullMoon={handleTriggerFullMoon}
+                    onStopFullMoon={handleStopFullMoon}
+                    onConfirmKill={handleAdminConfirmKill}
+                    onUndoKill={handleAdminUndoKill}
+                    onDeletePhoto={handleAdminDeletePhoto}
+                    onAdminConfirmPendingDeath={handleAdminConfirmPendingDeath}
+                    onAdminRevivePendingDeath={handleAdminRevivePendingDeath}
+                    onRefreshState={fetchGameState}
+                    onToast={(msg, type) => {
+                      if (type === 'error') {
+                        setErrorMessage({ title: 'Admin-Fehler', detail: msg, timestamp: Date.now() });
+                      } else {
+                        setSuccessToast(msg);
+                        setTimeout(() => setSuccessToast(null), 4000);
+                      }
+                    }}
+                  />
+                </ErrorBoundary>
               )}
             </main>
 

@@ -73,9 +73,10 @@ alter table public.game_state add column if not exists winner_team text default 
 alter table public.game_state add column if not exists last_special_task_at timestamptz default null;
 alter table public.game_state add column if not exists next_special_task_interval_minutes integer default 15;
 alter table public.game_state add column if not exists last_tick_at timestamptz default null;
+alter table public.game_state add column if not exists reset_epoch integer not null default 1;
 
-insert into public.game_state (id, status)
-values ('main', 'Lobby')
+insert into public.game_state (id, status, reset_epoch)
+values ('main', 'Lobby', 1)
 on conflict (id) do nothing;
 
 -- 4. TABELLE: players (Öffentliche Spielerdaten)
@@ -252,11 +253,31 @@ create table if not exists public.tick_log (
   id text primary key default gen_random_uuid()::text,
   tick_at timestamptz not null default now(),
   status text not null,
+  duration_ms integer default 0,
   details jsonb default '{}'::jsonb,
   error_message text
 );
 
+alter table public.tick_log add column if not exists duration_ms integer default 0;
 create index if not exists idx_tick_log_tick_at on public.tick_log (tick_at desc);
+
+-- 12b. TABELLE: client_errors (Unbehandelte Fehler & Crash-Berichte)
+create table if not exists public.client_errors (
+  id text primary key default gen_random_uuid()::text,
+  player_id text,
+  player_name text,
+  error_message text not null,
+  error_stack text,
+  source text,
+  user_agent text,
+  created_at timestamptz not null default timezone('utc'::text, now())
+);
+
+alter table public.client_errors add column if not exists player_name text;
+alter table public.client_errors add column if not exists error_stack text;
+alter table public.client_errors add column if not exists source text;
+alter table public.client_errors add column if not exists user_agent text;
+create index if not exists idx_client_errors_created_at on public.client_errors (created_at desc);
 
 -- ==============================================================================
 -- 13. STORAGE BUCKET: photos
@@ -282,6 +303,7 @@ alter table public.photos enable row level security;
 alter table public.task_completions enable row level security;
 alter table public.points_log enable row level security;
 alter table public.tick_log enable row level security;
+alter table public.client_errors enable row level security;
 
 -- game_state
 drop policy if exists "Public Read game_state" on public.game_state;
@@ -331,6 +353,12 @@ create policy "Public Read points_log" on public.points_log for select to public
 drop policy if exists "Public Read tick_log" on public.tick_log;
 create policy "Public Read tick_log" on public.tick_log for select to public using (true);
 
+-- client_errors
+drop policy if exists "Public Read client_errors" on public.client_errors;
+create policy "Public Read client_errors" on public.client_errors for select to public using (true);
+drop policy if exists "Public Insert client_errors" on public.client_errors;
+create policy "Public Insert client_errors" on public.client_errors for insert to public with check (true);
+
 -- GRANTS
 grant usage on schema public to anon, authenticated;
 grant select on public.game_state to anon, authenticated;
@@ -342,6 +370,7 @@ grant select, insert, delete on public.photos to anon, authenticated;
 grant select, insert on public.task_completions to anon, authenticated;
 grant select on public.points_log to anon, authenticated;
 grant select on public.tick_log to anon, authenticated;
+grant select, insert on public.client_errors to anon, authenticated;
 
 -- ==============================================================================
 -- 15. RPC: check_admin_code
@@ -1212,9 +1241,41 @@ $$;
 grant execute on function public.start_game(text) to anon, authenticated, service_role;
 
 -- ==============================================================================
--- 24. RPC: tick_game
+-- 23b. RPC: server_now, log_client_error, expire_pending_deaths
 -- ==============================================================================
-create or replace function public.tick_game()
+create or replace function public.server_now()
+returns timestamptz
+language sql
+security definer
+stable
+as $$
+  select now();
+$$;
+grant execute on function public.server_now() to anon, authenticated, service_role;
+
+create or replace function public.log_client_error(
+  p_error_message text,
+  p_player_id text default null,
+  p_player_name text default null,
+  p_error_stack text default null,
+  p_source text default null,
+  p_user_agent text default null
+)
+returns void
+language plpgsql
+security definer
+as $$
+begin
+  insert into public.client_errors (
+    player_id, player_name, error_message, error_stack, source, user_agent, created_at
+  ) values (
+    p_player_id, p_player_name, p_error_message, p_error_stack, p_source, p_user_agent, now()
+  );
+end;
+$$;
+grant execute on function public.log_client_error(text, text, text, text, text, text) to anon, authenticated, service_role;
+
+create or replace function public.expire_pending_deaths()
 returns jsonb
 language plpgsql
 security definer
@@ -1222,103 +1283,28 @@ as $$
 declare
   v_game_state record;
   v_settings jsonb;
-  v_now timestamptz := now();
-  v_elapsed_seconds numeric;
-  v_elapsed_minutes integer;
-  
-  -- Pending death
   v_pending_timeout_min integer := 4;
   v_unconfirmed_action text := 'revive';
-  v_expired_pending record;
+  v_now timestamptz := now();
   v_expired_count integer := 0;
-
-  -- Full Moon
-  v_moon_min_interval integer := 20;
-  v_moon_max_interval integer := 40;
-  v_moon_duration_min integer := 5;
-  v_moon_action text := 'none';
-
-  -- Photo tasks
-  v_photo_interval_min integer := 10;
-  v_current_slot integer := 0;
-  v_living_players record;
-  v_open_tasks_count integer;
-  v_last_target_id text;
-  v_random_target record;
-  v_second_target record;
-  v_task_type_int integer;
-  v_task_type text;
-  v_task_title text;
-  v_task_desc text;
-  v_created_photo_tasks integer := 0;
-  v_costume_pool text[];
-  v_random_costume text;
-  v_group_size integer;
-
-  -- Special tasks
-  v_last_special timestamptz;
-  v_special_interval_min integer := 15;
-  v_human_id text;
-  v_evil_target record;
-  v_special_type_int integer;
-  v_special_type text;
-  v_special_title text;
-  v_special_desc text;
-  v_special_data jsonb;
-  v_created_special_tasks integer := 0;
-
-  v_result jsonb;
+  v_expired_pending record;
 begin
   select * into v_game_state from public.game_state where id = 'main';
-  if not found or v_game_state.status != 'Läuft' or v_game_state.started_at is null then
-    return jsonb_build_object('status', 'idle', 'reason', 'Spiel läuft nicht');
+  if not found or v_game_state.status != 'Läuft' then
+    return jsonb_build_object('success', true, 'expired_count', 0, 'message', 'Spiel läuft nicht');
   end if;
 
   v_settings := coalesce(v_game_state.settings, '{}'::jsonb);
-  v_elapsed_seconds := extract(epoch from (v_now - v_game_state.started_at));
-  v_elapsed_minutes := floor(v_elapsed_seconds / 60);
-
-  -- A) VOLLMOND AUTOMATION
-  v_moon_min_interval := coalesce((v_settings->>'fullMoonMinIntervalMinutes')::integer, 20);
-  v_moon_max_interval := coalesce((v_settings->>'fullMoonMaxIntervalMinutes')::integer, 40);
-  v_moon_duration_min := coalesce((v_settings->>'fullMoonDurationMinutes')::integer, 5);
-
-  if v_game_state.active_full_moon is not null then
-    if v_now >= (v_game_state.active_full_moon->>'endsAt')::timestamptz then
-      update public.game_state
-      set active_full_moon = null,
-          next_full_moon_at = v_now + ((floor(random() * (v_moon_max_interval - v_moon_min_interval + 1)) + v_moon_min_interval) * interval '1 minute')
-      where id = 'main';
-      v_moon_action := 'ended';
-    end if;
-  else
-    if v_game_state.next_full_moon_at is null then
-      update public.game_state
-      set next_full_moon_at = v_now + ((floor(random() * (v_moon_max_interval - v_moon_min_interval + 1)) + v_moon_min_interval) * interval '1 minute')
-      where id = 'main';
-    elsif v_now >= v_game_state.next_full_moon_at then
-      update public.game_state
-      set active_full_moon = jsonb_build_object(
-            'id', 'fm_' || extract(epoch from v_now)::text,
-            'startsAt', v_now,
-            'endsAt', v_now + (v_moon_duration_min * interval '1 minute'),
-            'triggeredManually', false
-          ),
-          next_full_moon_at = null
-      where id = 'main';
-      v_moon_action := 'started';
-    end if;
-  end if;
-
-  -- B) PENDING DEATHS PRÜFEN (Timeout nach 4 Minuten)
   v_pending_timeout_min := coalesce((v_settings->>'pendingDeathTimeoutMinutes')::integer, 4);
   v_unconfirmed_action := coalesce(v_settings->>'unconfirmedKillAction', 'revive');
 
+  -- Lock expired pending deaths to prevent race conditions with confirm_kill
   for v_expired_pending in
     select * from public.players
     where status in ('pending_death', 'tod_ausstehend')
       and pending_death_at is not null
       and (v_now >= pending_death_at + (v_pending_timeout_min * interval '1 minute'))
+    for update skip locked
   loop
     if v_unconfirmed_action = 'stay_dead' then
       update public.players
@@ -1353,192 +1339,330 @@ begin
         'unconfirmed_timeout', false, v_now
       );
     end if;
+
     v_expired_count := v_expired_count + 1;
   end loop;
 
-  -- C) FOTO-AUFGABEN (Status = expired nach 30 Min, neue Slots erzeugen)
-  update public.player_photo_tasks
-  set status = 'expired'
-  where status = 'open' and v_now > expires_at;
+  return jsonb_build_object('success', true, 'expired_count', v_expired_count);
+end;
+$$;
+grant execute on function public.expire_pending_deaths() to anon, authenticated, service_role;
 
-  v_photo_interval_min := coalesce((v_settings->>'photoTaskIntervalMinutes')::integer, 10);
-  if v_photo_interval_min < 5 then v_photo_interval_min := 5; end if;
-  v_current_slot := floor(v_elapsed_minutes / v_photo_interval_min);
+-- ==============================================================================
+-- 24. RPC: tick_game (Mit isolierten Teil-Aufgaben & präzisem tick_log)
+-- ==============================================================================
+create or replace function public.tick_game()
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_start_time timestamptz := clock_timestamp();
+  v_now timestamptz := now();
+  v_game_state record;
+  v_settings jsonb;
+  v_elapsed_seconds numeric;
+  v_elapsed_minutes integer;
+  
+  -- Results tracking
+  v_sub_errors text[] := array[]::text[];
+  v_moon_action text := 'none';
+  v_expired_count integer := 0;
+  v_created_photo_tasks integer := 0;
+  v_created_special_tasks integer := 0;
+  v_duration_ms integer := 0;
+  v_result jsonb;
 
-  select array_agg(distinct costume_name) into v_costume_pool
-  from public.players
-  where status != 'entfernt';
+  -- Variables for Vollmond
+  v_moon_min_interval integer;
+  v_moon_max_interval integer;
+  v_moon_duration_min integer;
 
-  for v_living_players in
-    select * from public.players where status = 'lebendig' and pending_death_at is null
-  loop
-    select count(*) into v_open_tasks_count
-    from public.player_photo_tasks
-    where player_id = v_living_players.id and status = 'open';
+  -- Variables for Photo tasks
+  v_photo_interval_min integer;
+  v_current_slot integer;
+  v_living_players record;
+  v_open_tasks_count integer;
+  v_last_target_id text;
+  v_random_target record;
+  v_second_target record;
+  v_task_type_int integer;
+  v_task_type text;
+  v_task_title text;
+  v_task_desc text;
+  v_costume_pool text[];
+  v_random_costume text;
+  v_group_size integer;
 
-    if v_open_tasks_count < 3 then
-      if not exists (
-        select 1 from public.player_photo_tasks
-        where player_id = v_living_players.id and slot_number = v_current_slot
-      ) then
-        select target_player_id into v_last_target_id
-        from public.player_photo_tasks
-        where player_id = v_living_players.id
-        order by slot_number desc
-        limit 1;
+  -- Variables for Special tasks
+  v_last_special timestamptz;
+  v_special_interval_min integer;
+  v_human_id text;
+  v_special_type_int integer;
+  v_special_type text;
+  v_special_title text;
+  v_special_desc text;
+  v_special_data jsonb;
+begin
+  select * into v_game_state from public.game_state where id = 'main';
+  if not found or v_game_state.status != 'Läuft' or v_game_state.started_at is null then
+    v_duration_ms := round(extract(epoch from (clock_timestamp() - v_start_time)) * 1000);
+    return jsonb_build_object('status', 'idle', 'reason', 'Spiel läuft nicht', 'duration_ms', v_duration_ms);
+  end if;
 
-        select * into v_random_target
-        from public.players
-        where status = 'lebendig'
-          and pending_death_at is null
-          and id != v_living_players.id
-          and (id != coalesce(v_last_target_id, '') or (select count(*) from public.players where status = 'lebendig' and pending_death_at is null and id != v_living_players.id) <= 1)
-        order by random()
-        limit 1;
+  v_settings := coalesce(v_game_state.settings, '{}'::jsonb);
+  v_elapsed_seconds := extract(epoch from (v_now - v_game_state.started_at));
+  v_elapsed_minutes := floor(v_elapsed_seconds / 60);
 
-        v_task_type_int := floor(random() * 4) + 1;
+  -- SUB-TASK 1: VOLLMOND AUTOMATION (Isoliert)
+  begin
+    v_moon_min_interval := coalesce((v_settings->>'fullMoonMinIntervalMinutes')::integer, 20);
+    v_moon_max_interval := coalesce((v_settings->>'fullMoonMaxIntervalMinutes')::integer, 40);
+    v_moon_duration_min := coalesce((v_settings->>'fullMoonDurationMinutes')::integer, 5);
 
-        if v_task_type_int = 1 and v_random_target.id is not null then
-          v_task_type := 'specific_player';
-          v_task_title := 'Foto mit ' || v_random_target.name;
-          v_task_desc := 'Finde ' || v_random_target.name || ' (Kostüm: "' || v_random_target.costume_name || '") und knipst zusammen ein Foto!';
-        elsif v_task_type_int = 2 and array_length(v_costume_pool, 1) > 0 then
-          v_task_type := 'specific_costume';
-          v_random_costume := v_costume_pool[floor(random() * array_length(v_costume_pool, 1)) + 1];
-          v_task_title := 'Kostüm-Foto';
-          v_task_desc := 'Finde jemanden im Kostüm "' || coalesce(v_random_costume, 'Halloween-Kostüm') || '" und mach ein Foto!';
-        elsif v_task_type_int = 3 then
-          v_task_type := 'group';
-          v_group_size := floor(random() * 6) + 3;
-          v_task_title := 'Gruppenfoto (' || v_group_size || ' Personen)';
-          v_task_desc := 'Trommle mindestens ' || v_group_size || ' Partygäste für ein gruseliges Gruppenfoto zusammen!';
-        else
-          v_task_type := 'two_players';
-          select * into v_second_target
+    if v_game_state.active_full_moon is not null then
+      if v_now >= (v_game_state.active_full_moon->>'endsAt')::timestamptz then
+        update public.game_state
+        set active_full_moon = null,
+            next_full_moon_at = v_now + ((floor(random() * (v_moon_max_interval - v_moon_min_interval + 1)) + v_moon_min_interval) * interval '1 minute')
+        where id = 'main';
+        v_moon_action := 'ended';
+      end if;
+    else
+      if v_game_state.next_full_moon_at is null then
+        update public.game_state
+        set next_full_moon_at = v_now + ((floor(random() * (v_moon_max_interval - v_moon_min_interval + 1)) + v_moon_min_interval) * interval '1 minute')
+        where id = 'main';
+      elsif v_now >= v_game_state.next_full_moon_at then
+        update public.game_state
+        set active_full_moon = jsonb_build_object(
+              'id', 'fm_' || extract(epoch from v_now)::text,
+              'startsAt', v_now,
+              'endsAt', v_now + (v_moon_duration_min * interval '1 minute'),
+              'triggeredManually', false
+            ),
+            next_full_moon_at = null
+        where id = 'main';
+        v_moon_action := 'started';
+      end if;
+    end if;
+  exception when others then
+    v_sub_errors := array_append(v_sub_errors, 'moon: ' || SQLERRM);
+  end;
+
+  -- SUB-TASK 2: AUSSTEHENDE TODE ABLAUFEN LASSEN (Isoliert)
+  begin
+    declare
+      v_res_exp jsonb;
+    begin
+      v_res_exp := public.expire_pending_deaths();
+      v_expired_count := coalesce((v_res_exp->>'expired_count')::integer, 0);
+    end;
+  exception when others then
+    v_sub_errors := array_append(v_sub_errors, 'pending_deaths: ' || SQLERRM);
+  end;
+
+  -- SUB-TASK 3: FOTO-AUFGABEN VERTEILEN (Isoliert)
+  begin
+    update public.player_photo_tasks
+    set status = 'expired'
+    where status = 'open' and v_now > expires_at;
+
+    v_photo_interval_min := coalesce((v_settings->>'photoTaskIntervalMinutes')::integer, 10);
+    if v_photo_interval_min < 5 then v_photo_interval_min := 5; end if;
+    v_current_slot := floor(v_elapsed_minutes / v_photo_interval_min);
+
+    select array_agg(distinct costume_name) into v_costume_pool
+    from public.players
+    where status != 'entfernt' and costume_name is not null and trim(costume_name) != '';
+
+    for v_living_players in
+      select * from public.players where status = 'lebendig' and pending_death_at is null
+    loop
+      select count(*) into v_open_tasks_count
+      from public.player_photo_tasks
+      where player_id = v_living_players.id and status = 'open';
+
+      if v_open_tasks_count < 3 then
+        if not exists (
+          select 1 from public.player_photo_tasks
+          where player_id = v_living_players.id and slot_number = v_current_slot
+        ) then
+          select target_player_id into v_last_target_id
+          from public.player_photo_tasks
+          where player_id = v_living_players.id
+          order by slot_number desc
+          limit 1;
+
+          select * into v_random_target
           from public.players
           where status = 'lebendig'
             and pending_death_at is null
             and id != v_living_players.id
-            and id != coalesce(v_random_target.id, '')
+            and (id != coalesce(v_last_target_id, '') or (select count(*) from public.players where status = 'lebendig' and pending_death_at is null and id != v_living_players.id) <= 1)
           order by random()
           limit 1;
 
-          if v_second_target.id is not null and v_random_target.id is not null then
-            v_task_title := 'Foto mit 2 Gästen';
-            v_task_desc := 'Mache ein gemeinsames Foto mit ' || v_random_target.name || ' und ' || v_second_target.name || '!';
-          else
+          v_task_type_int := floor(random() * 4) + 1;
+
+          if v_task_type_int = 1 and v_random_target.id is not null then
+            v_task_type := 'specific_player';
+            v_task_title := 'Foto mit ' || v_random_target.name;
+            v_task_desc := 'Finde ' || v_random_target.name || ' (Kostüm: "' || v_random_target.costume_name || '") und knipst zusammen ein Foto!';
+          elsif v_task_type_int = 2 and v_costume_pool is not null and array_length(v_costume_pool, 1) > 0 then
+            v_task_type := 'specific_costume';
+            v_random_costume := v_costume_pool[floor(random() * array_length(v_costume_pool, 1)) + 1];
+            v_task_title := 'Kostüm-Foto';
+            v_task_desc := 'Finde jemanden im Kostüm "' || coalesce(v_random_costume, 'Halloween-Kostüm') || '" und mach ein Foto!';
+          elsif v_task_type_int = 3 then
             v_task_type := 'group';
-            v_group_size := 4;
-            v_task_title := 'Gruppenfoto (4 Personen)';
-            v_task_desc := 'Mache ein Gruppenfoto mit 4 Partygästen!';
+            v_group_size := floor(random() * 6) + 3;
+            v_task_title := 'Gruppenfoto (' || v_group_size || ' Personen)';
+            v_task_desc := 'Trommle mindestens ' || v_group_size || ' Partygäste für ein gruseliges Gruppenfoto zusammen!';
+          else
+            v_task_type := 'two_players';
+            select * into v_second_target
+            from public.players
+            where status = 'lebendig'
+              and pending_death_at is null
+              and id != v_living_players.id
+              and id != coalesce(v_random_target.id, '')
+            order by random()
+            limit 1;
+
+            if v_second_target.id is not null and v_random_target.id is not null then
+              v_task_title := 'Foto mit 2 Gästen';
+              v_task_desc := 'Mache ein gemeinsames Foto mit ' || v_random_target.name || ' und ' || v_second_target.name || '!';
+            else
+              v_task_type := 'group';
+              v_group_size := 4;
+              v_task_title := 'Gruppenfoto (4 Personen)';
+              v_task_desc := 'Mache ein Gruppenfoto mit 4 Partygästen!';
+            end if;
           end if;
+
+          insert into public.player_photo_tasks (
+            player_id, slot_number, title, description, task_type,
+            target_player_id, target_player_name, target_player_costume, target_player_photo,
+            target_second_player_id, target_second_player_name, target_second_player_costume, target_second_player_photo,
+            target_costume_name, group_count, points, status, created_at, expires_at
+          ) values (
+            v_living_players.id, v_current_slot, v_task_title, v_task_desc, v_task_type,
+            v_random_target.id, v_random_target.name, v_random_target.costume_name, v_random_target.photo_url,
+            v_second_target.id, v_second_target.name, v_second_target.costume_name, v_second_target.photo_url,
+            v_random_costume, v_group_size, 10, 'open', v_now, v_now + interval '30 minutes'
+          )
+          on conflict (player_id, slot_number) do nothing;
+
+          v_created_photo_tasks := v_created_photo_tasks + 1;
         end if;
-
-        insert into public.player_photo_tasks (
-          player_id, slot_number, title, description, task_type,
-          target_player_id, target_player_name, target_player_costume, target_player_photo,
-          target_second_player_id, target_second_player_name, target_second_player_costume, target_second_player_photo,
-          target_costume_name, group_count, points, status, created_at, expires_at
-        ) values (
-          v_living_players.id, v_current_slot, v_task_title, v_task_desc, v_task_type,
-          v_random_target.id, v_random_target.name, v_random_target.costume_name, v_random_target.photo_url,
-          v_second_target.id, v_second_target.name, v_second_target.costume_name, v_second_target.photo_url,
-          v_random_costume, v_group_size, 10, 'open', v_now, v_now + interval '30 minutes'
-        )
-        on conflict (player_id, slot_number) do nothing;
-
-        v_created_photo_tasks := v_created_photo_tasks + 1;
-      end if;
-    end if;
-  end loop;
-
-  -- D) SPEZIALAUFGABEN (Für lebende Menschen, alle 10-20 Min)
-  update public.special_tasks
-  set status = 'expired'
-  where status = 'pending' and v_now > expires_at;
-
-  v_last_special := v_game_state.last_special_task_at;
-  v_special_interval_min := coalesce(v_game_state.next_special_task_interval_minutes, 15);
-
-  if v_last_special is null or (v_now >= v_last_special + (v_special_interval_min * interval '1 minute')) then
-    for v_human_id in
-      select p.id
-      from public.players p
-      left join public.player_roles pr on pr.player_id = p.id
-      where p.status = 'lebendig'
-        and p.pending_death_at is null
-        and (coalesce(pr.role, p.role) = 'Mensch')
-    loop
-      if not exists (
-        select 1 from public.special_tasks
-        where player_id = v_human_id and status = 'pending' and expires_at > v_now
-      ) then
-        v_special_type_int := floor(random() * 5) + 1;
-        if v_special_type_int = 1 then
-          v_special_type := 'math';
-          v_special_title := 'Kopfrechnen unter Zeitdruck';
-          v_special_desc := 'Löse 3 Mathe-Aufgaben im Kopf innerhalb von 60 Sekunden!';
-          v_special_data := jsonb_build_object('timeLimitSeconds', 60);
-        elsif v_special_type_int = 2 then
-          v_special_type := 'anagram';
-          v_special_title := 'Halloween-Anagramm';
-          v_special_desc := 'Bringe die durcheinandergewürfelten Buchstaben in die richtige Reihenfolge!';
-          v_special_data := jsonb_build_object('timeLimitSeconds', 60);
-        elsif v_special_type_int = 3 then
-          v_special_type := 'sequence';
-          v_special_title := 'Merk-Sequenz';
-          v_special_desc := 'Präge dir die Halloween-Symbole ein und gib sie fehlerfrei wieder!';
-          v_special_data := jsonb_build_object('timeLimitSeconds', 60);
-        elsif v_special_type_int = 4 then
-          v_special_type := 'quiz';
-          v_special_title := 'Halloween-Horror-Quiz';
-          v_special_desc := 'Beantworte die Schätzfrage oder das Grusel-Rätsel!';
-          v_special_data := jsonb_build_object('timeLimitSeconds', 45);
-        else
-          v_special_type := 'code';
-          v_special_title := 'Geheimcode knacken';
-          v_special_desc := 'Entziffere den 4-stelligen Schloss-Code anhand der Hinweise!';
-          v_special_data := jsonb_build_object('timeLimitSeconds', 45);
-        end if;
-
-        insert into public.special_tasks (
-          player_id, type, title, description, points, task_data, status, created_at, expires_at
-        ) values (
-          v_human_id, v_special_type, v_special_title, v_special_desc, 20, v_special_data, 'pending', v_now, v_now + interval '10 minutes'
-        );
-
-        v_created_special_tasks := v_created_special_tasks + 1;
       end if;
     end loop;
+  exception when others then
+    v_sub_errors := array_append(v_sub_errors, 'photo_tasks: ' || SQLERRM);
+  end;
 
-    update public.game_state
-    set last_special_task_at = v_now,
-        next_special_task_interval_minutes = floor(random() * 11) + 10
-    where id = 'main';
-  end if;
+  -- SUB-TASK 4: SPEZIALAUFGABEN VERTEILEN (Isoliert)
+  begin
+    update public.special_tasks
+    set status = 'expired'
+    where status = 'pending' and v_now > expires_at;
+
+    v_last_special := v_game_state.last_special_task_at;
+    v_special_interval_min := coalesce(v_game_state.next_special_task_interval_minutes, 15);
+
+    if v_last_special is null or (v_now >= v_last_special + (v_special_interval_min * interval '1 minute')) then
+      for v_human_id in
+        select p.id
+        from public.players p
+        left join public.player_roles pr on pr.player_id = p.id
+        where p.status = 'lebendig'
+          and p.pending_death_at is null
+          and (coalesce(pr.role, p.role) = 'Mensch')
+      loop
+        if not exists (
+          select 1 from public.special_tasks
+          where player_id = v_human_id and status = 'pending' and expires_at > v_now
+        ) then
+          v_special_type_int := floor(random() * 5) + 1;
+          if v_special_type_int = 1 then
+            v_special_type := 'math';
+            v_special_title := 'Kopfrechnen unter Zeitdruck';
+            v_special_desc := 'Löse 3 Mathe-Aufgaben im Kopf innerhalb von 60 Sekunden!';
+            v_special_data := jsonb_build_object('timeLimitSeconds', 60);
+          elsif v_special_type_int = 2 then
+            v_special_type := 'anagram';
+            v_special_title := 'Halloween-Anagramm';
+            v_special_desc := 'Bringe die durcheinandergewürfelten Buchstaben in die richtige Reihenfolge!';
+            v_special_data := jsonb_build_object('timeLimitSeconds', 60);
+          elsif v_special_type_int = 3 then
+            v_special_type := 'sequence';
+            v_special_title := 'Merk-Sequenz';
+            v_special_desc := 'Präge dir die Halloween-Symbole ein und gib sie fehlerfrei wieder!';
+            v_special_data := jsonb_build_object('timeLimitSeconds', 60);
+          elsif v_special_type_int = 4 then
+            v_special_type := 'quiz';
+            v_special_title := 'Halloween-Horror-Quiz';
+            v_special_desc := 'Beantworte die Schätzfrage oder das Grusel-Rätsel!';
+            v_special_data := jsonb_build_object('timeLimitSeconds', 45);
+          else
+            v_special_type := 'code';
+            v_special_title := 'Geheimcode knacken';
+            v_special_desc := 'Entziffere den 4-stelligen Schloss-Code anhand der Hinweise!';
+            v_special_data := jsonb_build_object('timeLimitSeconds', 45);
+          end if;
+
+          insert into public.special_tasks (
+            player_id, type, title, description, points, task_data, status, created_at, expires_at
+          ) values (
+            v_human_id, v_special_type, v_special_title, v_special_desc, 20, v_special_data, 'pending', v_now, v_now + interval '10 minutes'
+          );
+
+          v_created_special_tasks := v_created_special_tasks + 1;
+        end if;
+      end loop;
+
+      update public.game_state
+      set last_special_task_at = v_now,
+          next_special_task_interval_minutes = floor(random() * 11) + 10
+      where id = 'main';
+    end if;
+  exception when others then
+    v_sub_errors := array_append(v_sub_errors, 'special_tasks: ' || SQLERRM);
+  end;
 
   update public.game_state
   set last_tick_at = v_now,
       updated_at = v_now
   where id = 'main';
 
+  v_duration_ms := round(extract(epoch from (clock_timestamp() - v_start_time)) * 1000);
+
   v_result := jsonb_build_object(
-    'status', 'success',
+    'status', case when array_length(v_sub_errors, 1) > 0 then 'partial_error' else 'success' end,
     'tick_at', v_now,
+    'duration_ms', v_duration_ms,
     'moon_action', v_moon_action,
     'expired_pending_count', v_expired_count,
     'created_photo_tasks', v_created_photo_tasks,
-    'created_special_tasks', v_created_special_tasks
+    'created_special_tasks', v_created_special_tasks,
+    'sub_errors', to_jsonb(v_sub_errors)
   );
 
-  insert into public.tick_log (status, details)
-  values ('success', v_result);
+  insert into public.tick_log (status, duration_ms, details, error_message)
+  values (
+    case when array_length(v_sub_errors, 1) > 0 then 'partial_error' else 'success' end,
+    v_duration_ms,
+    v_result,
+    case when array_length(v_sub_errors, 1) > 0 then array_to_string(v_sub_errors, '; ') else null end
+  );
 
   return v_result;
 exception when others then
-  insert into public.tick_log (status, error_message)
-  values ('error', SQLERRM);
-  return jsonb_build_object('status', 'error', 'error', SQLERRM);
+  v_duration_ms := round(extract(epoch from (clock_timestamp() - v_start_time)) * 1000);
+  insert into public.tick_log (status, duration_ms, error_message)
+  values ('error', v_duration_ms, SQLERRM);
+  return jsonb_build_object('status', 'error', 'duration_ms', v_duration_ms, 'error', SQLERRM);
 end;
 $$;
 grant execute on function public.tick_game() to anon, authenticated, service_role;
@@ -1626,6 +1750,112 @@ end;
 $$;
 grant execute on function public.admin_revive_player(text, text) to anon, authenticated, service_role;
 
+create or replace function public.admin_clear_pending_deaths(p_admin_code text)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_cleared_count integer := 0;
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  update public.players
+  set status = 'lebendig',
+      pending_death_at = null,
+      updated_at = now()
+  where status in ('pending_death', 'tod_ausstehend') or pending_death_at is not null;
+
+  get diagnostics v_cleared_count = row_count;
+
+  return jsonb_build_object('success', true, 'cleared_count', v_cleared_count, 'message', v_cleared_count || ' ausstehende Tode aufgehoben.');
+end;
+$$;
+grant execute on function public.admin_clear_pending_deaths(text) to anon, authenticated, service_role;
+
+create or replace function public.admin_set_player_status(
+  p_admin_code text,
+  p_player_id text,
+  p_new_status text
+)
+returns jsonb
+language plpgsql
+security definer
+as $$
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  if p_new_status not in ('lebendig', 'tot', 'pending_death', 'entfernt') then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Status: ' || coalesce(p_new_status, 'null'));
+  end if;
+
+  update public.players
+  set status = p_new_status,
+      pending_death_at = case when p_new_status = 'pending_death' then coalesce(pending_death_at, now()) else null end,
+      updated_at = now()
+  where id = p_player_id;
+
+  return jsonb_build_object('success', true, 'message', 'Spieler-Status auf "' || p_new_status || '" gesetzt.');
+end;
+$$;
+grant execute on function public.admin_set_player_status(text, text, text) to anon, authenticated, service_role;
+
+create or replace function public.admin_repair_game_state(p_admin_code text)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_now timestamptz := now();
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  insert into public.game_state (id, status, reset_epoch)
+  values ('main', 'Lobby', 1)
+  on conflict (id) do update
+  set updated_at = v_now;
+
+  update public.game_state
+  set status = case when status in ('Lobby', 'Läuft', 'Beendet') then status else 'Lobby' end,
+      reset_epoch = coalesce(reset_epoch, 1),
+      updated_at = v_now
+  where id = 'main';
+
+  return jsonb_build_object('success', true, 'message', 'Spielstatus erfolgreich geprüft und repariert.');
+end;
+$$;
+grant execute on function public.admin_repair_game_state(text) to anon, authenticated, service_role;
+
+create or replace function public.admin_reset_all_cooldowns(p_admin_code text)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_affected integer := 0;
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  update public.players
+  set cooldown_until = null,
+      last_kill_at = null,
+      updated_at = now();
+
+  get diagnostics v_affected = row_count;
+
+  return jsonb_build_object('success', true, 'affected_players', v_affected, 'message', 'Cooldowns für ' || v_affected || ' Spieler zurückgesetzt.');
+end;
+$$;
+grant execute on function public.admin_reset_all_cooldowns(text) to anon, authenticated, service_role;
+
 create or replace function public.admin_restart_game(
   p_admin_code text,
   p_keep_players boolean default true,
@@ -1680,6 +1910,7 @@ begin
       winner_team = null,
       last_special_task_at = null,
       last_tick_at = null,
+      reset_epoch = coalesce(reset_epoch, 0) + 1,
       updated_at = v_now
   where id = 'main';
 
@@ -1687,6 +1918,73 @@ begin
 end;
 $$;
 grant execute on function public.admin_restart_game(text, boolean, boolean) to anon, authenticated, service_role;
+
+-- ==============================================================================
+-- 25b. RPC: reset_game_full (Kompletter Hard-Reset aller Spielerdaten)
+-- ==============================================================================
+create or replace function public.reset_game_full(p_admin_code text)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_now timestamptz := now();
+  v_new_epoch integer := 1;
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  -- 1. Tabellen mit Spielerdaten und Spielverlauf leeren
+  delete from public.points_log;
+  delete from public.kills;
+  delete from public.player_photo_tasks;
+  delete from public.special_tasks;
+  delete from public.task_completions;
+  delete from public.player_roles;
+  delete from public.players;
+  delete from public.photos;
+  delete from public.client_errors;
+  delete from public.tick_log;
+
+  -- Optionale Tabellen bereinigen falls vorhanden
+  if exists (select 1 from information_schema.tables where table_schema = 'public' and table_name = 'notifications') then
+    execute 'delete from public.notifications;';
+  end if;
+  if exists (select 1 from information_schema.tables where table_schema = 'public' and table_name = 'push_subscriptions') then
+    execute 'delete from public.push_subscriptions;';
+  end if;
+
+  -- Storage Bucket photos leeren (falls Schema-Rechte vorliegen)
+  begin
+    delete from storage.objects where bucket_id = 'photos';
+  exception when others then
+    null;
+  end;
+
+  -- 2. game_state zurücksetzen und reset_epoch inkrementieren
+  update public.game_state
+  set status = 'Lobby',
+      started_at = null,
+      ended_at = null,
+      active_full_moon = null,
+      next_full_moon_at = null,
+      winner_team = null,
+      last_special_task_at = null,
+      last_tick_at = null,
+      reset_epoch = coalesce(reset_epoch, 0) + 1,
+      updated_at = v_now
+  where id = 'main'
+  returning reset_epoch into v_new_epoch;
+
+  return jsonb_build_object(
+    'success', true,
+    'message', 'Kompletter Reset erfolgreich. Alle Spieler wurden gelöscht.',
+    'reset_epoch', v_new_epoch
+  );
+end;
+$$;
+grant execute on function public.reset_game_full(text) to anon, authenticated, service_role;
 
 -- ==============================================================================
 -- 26. CRON JOB: tick_game() jede Minute
@@ -1721,6 +2019,8 @@ begin
   alter publication supabase_realtime add table public.photos;
   alter publication supabase_realtime add table public.special_tasks;
   alter publication supabase_realtime add table public.points_log;
+  alter publication supabase_realtime add table public.client_errors;
+  alter publication supabase_realtime add table public.tick_log;
 exception when others then null;
 end;
 $$;

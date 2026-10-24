@@ -1,13 +1,14 @@
 import React, { useState } from 'react';
-import { Camera, Image as ImageIcon, Sparkles, AlertCircle, Loader2, ArrowRight } from 'lucide-react';
+import { Camera, Image as ImageIcon, Sparkles, AlertCircle, Loader2, ArrowRight, Lock } from 'lucide-react';
 import { compressImageToMax800px } from '../../utils/imageCompressor';
 
 interface LoginScreenProps {
   onRegister: (playerData: { name: string; costumeName: string; photoUrl: string }) => Promise<void>;
   isLoading: boolean;
+  onRequestAdminUnlock?: () => void;
 }
 
-export const LoginScreen: React.FC<LoginScreenProps> = ({ onRegister, isLoading }) => {
+export const LoginScreen: React.FC<LoginScreenProps> = ({ onRegister, isLoading, onRequestAdminUnlock }) => {
   const [name, setName] = useState('');
   const [costumeName, setCostumeName] = useState('');
   const [photoUrl, setPhotoUrl] = useState('');
@@ -197,9 +198,22 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onRegister, isLoading 
         </div>
       </form>
 
-      {/* Footer Notice */}
-      <div className="pt-4 pb-2 text-center text-[11px] text-zinc-500">
-        Alle 3 Angaben sind Pflicht. Dein Gerät merkt sich deinen Login automatisch.
+      {/* Footer Notice & Admin Entry */}
+      <div className="pt-4 pb-2 text-center space-y-2">
+        <p className="text-[11px] text-zinc-500">
+          Alle 3 Angaben sind Pflicht. Dein Gerät merkt sich deinen Login automatisch.
+        </p>
+
+        {onRequestAdminUnlock && (
+          <button
+            type="button"
+            onClick={onRequestAdminUnlock}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-zinc-900 border border-zinc-800 hover:border-zinc-700 text-zinc-400 hover:text-amber-400 text-xs font-semibold transition cursor-pointer"
+          >
+            <Lock className="w-3.5 h-3.5" />
+            <span>Spielleiter / Admin-Login</span>
+          </button>
+        )}
       </div>
     </div>
   );

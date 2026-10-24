@@ -433,6 +433,9 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
       <PendingDeathScreen
         player={player}
         timeoutMinutes={gameState.settings?.pendingDeathTimeoutMinutes || 4}
+        onRefreshState={onRefreshState}
+        onRequestAdminUnlock={onRequestAdminUnlock}
+        isAdminUnlocked={isAdminUnlocked}
       />
     );
   }

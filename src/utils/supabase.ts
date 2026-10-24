@@ -300,6 +300,7 @@ class SupabaseService {
         activeFullMoon: stateData?.active_full_moon || null,
         lastTickAt: stateData?.last_tick_at || null,
         winnerTeam: stateData?.winner_team || null,
+        resetEpoch: stateData?.reset_epoch ?? 1,
         updatedAt: stateData?.updated_at || undefined,
       };
 
@@ -2503,6 +2504,277 @@ class SupabaseService {
       this.lastError = err?.message;
       return () => {};
     }
+  }
+
+  // --- SERVER TIME ---
+  public async getServerNow(): Promise<string> {
+    const client = this.getClient();
+    if (!client) return new Date().toISOString();
+    try {
+      const { data, error } = await client.rpc('server_now');
+      if (!error && data) return data;
+    } catch {}
+    return new Date().toISOString();
+  }
+
+  // --- EXPIRE PENDING DEATHS (IDEMPOTENT RPC & FALLBACK) ---
+  public async expirePendingDeaths(): Promise<{ success: boolean; message: string; expiredCount: number }> {
+    const client = this.getClient();
+    if (!client) return { success: false, message: 'Supabase nicht verfügbar', expiredCount: 0 };
+
+    try {
+      const { data, error } = await client.rpc('expire_pending_deaths');
+      if (!error && data) {
+        return {
+          success: Boolean(data.success),
+          message: data.message || 'Prüfung abgeschlossen',
+          expiredCount: data.expired_count || 0,
+        };
+      }
+    } catch (err: any) {
+      console.warn('RPC expire_pending_deaths error, falling back:', err);
+    }
+
+    return await this.fallbackExpirePendingDeaths();
+  }
+
+  private async fallbackExpirePendingDeaths(): Promise<{ success: boolean; message: string; expiredCount: number }> {
+    const client = this.getClient();
+    if (!client) return { success: false, message: 'Supabase offline', expiredCount: 0 };
+
+    try {
+      const { data: stateData } = await client.from('game_state').select('settings').eq('id', 'main').single();
+      const settings = stateData?.settings || {};
+      const timeoutMin = settings.pendingDeathTimeoutMinutes ?? 4;
+      const unconfirmedAction = settings.unconfirmedKillAction ?? 'revive';
+      const now = Date.now();
+
+      const { data: pendingPlayers } = await client
+        .from('players')
+        .select('*')
+        .in('status', ['pending_death', 'tod_ausstehend']);
+
+      let expiredCount = 0;
+      if (pendingPlayers && pendingPlayers.length > 0) {
+        for (const p of pendingPlayers) {
+          if (!p.pending_death_at) continue;
+          const pendingTime = new Date(p.pending_death_at).getTime();
+          if (now - pendingTime >= timeoutMin * 60 * 1000) {
+            const newStatus = unconfirmedAction === 'stay_dead' ? 'tot' : 'lebendig';
+            await client.from('players').update({ status: newStatus, pending_death_at: null }).eq('id', p.id);
+
+            await client.from('kills').insert([
+              {
+                killer_id: null,
+                victim_id: p.id,
+                killer_name: 'Nicht bestätigt',
+                victim_name: p.name,
+                victim_role: p.role,
+                reason: 'unconfirmed_timeout',
+                confirmed: true,
+                confirmed_at: new Date().toISOString(),
+              },
+            ]);
+            expiredCount++;
+          }
+        }
+      }
+
+      return {
+        success: true,
+        message: expiredCount > 0 ? `${expiredCount} ausstehende Tode abgelaufen & verarbeitet.` : 'Keine abgelaufenen Tode gefunden.',
+        expiredCount,
+      };
+    } catch (err: any) {
+      return { success: false, message: err?.message || 'Fehler beim Prüfen ausstehender Tode', expiredCount: 0 };
+    }
+  }
+
+  // --- CLIENT ERROR LOGGING ---
+  public async logClientError(entry: any): Promise<void> {
+    const client = this.getClient();
+    if (!client) return;
+
+    try {
+      await client.rpc('log_client_error', {
+        p_player_id: entry.player_id || null,
+        p_message: entry.message || '',
+        p_stack: entry.stack || null,
+        p_source: entry.source || null,
+        p_user_agent: entry.user_agent || null,
+      });
+    } catch {
+      try {
+        await client.from('client_errors').insert([entry]);
+      } catch {}
+    }
+  }
+
+  public async getClientErrors(limit = 50): Promise<any[]> {
+    const client = this.getClient();
+    if (!client) return [];
+    try {
+      const { data, error } = await client
+        .from('client_errors')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(limit);
+      if (!error && data) return data;
+    } catch {}
+    return [];
+  }
+
+  public async getTickLogs(limit = 20): Promise<any[]> {
+    const client = this.getClient();
+    if (!client) return [];
+    try {
+      const { data, error } = await client
+        .from('tick_log')
+        .select('*')
+        .order('tick_at', { ascending: false })
+        .limit(limit);
+      if (!error && data) return data;
+    } catch {}
+    return [];
+  }
+
+  // --- EMERGENCY ADMIN ACTIONS ---
+  public async adminClearPendingDeaths(adminCode: string): Promise<{ success: boolean; message: string }> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    try {
+      const { data, error } = await client.rpc('admin_clear_pending_deaths', { p_admin_code: adminCode.trim() });
+      if (!error && data?.success) return data;
+    } catch {}
+
+    const { error: updErr } = await client
+      .from('players')
+      .update({ status: 'lebendig', pending_death_at: null })
+      .in('status', ['pending_death', 'tod_ausstehend']);
+
+    if (updErr) throw new Error(`Fehler beim Zurücksetzen: ${updErr.message}`);
+    return { success: true, message: 'Alle ausstehenden Tode wurden auf lebendig zurückgesetzt.' };
+  }
+
+  public async adminSetPlayerStatus(adminCode: string, playerId: string, newStatus: string): Promise<void> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    const { error } = await client
+      .from('players')
+      .update({
+        status: newStatus,
+        pending_death_at: newStatus === 'pending_death' ? new Date().toISOString() : null,
+      })
+      .eq('id', playerId);
+
+    if (error) throw new Error(`Status-Update fehlgeschlagen: ${error.message}`);
+  }
+
+  public async adminRepairGameState(adminCode: string): Promise<{ success: boolean; message: string }> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    try {
+      const { data, error } = await client.rpc('admin_repair_game_state', { p_admin_code: adminCode.trim() });
+      if (!error && data?.success) return data;
+    } catch {}
+
+    const { data: st } = await client.from('game_state').select('*').eq('id', 'main').maybeSingle();
+    if (!st) {
+      await client.from('game_state').insert([{ id: 'main', status: 'Lobby', settings: DEFAULT_GAME_SETTINGS }]);
+    } else {
+      await client.from('game_state').update({
+        status: st.status || 'Lobby',
+        updated_at: new Date().toISOString(),
+      }).eq('id', 'main');
+    }
+
+    return { success: true, message: 'Spielstatus erfolgreich repariert.' };
+  }
+
+  public async adminResetAllCooldowns(adminCode: string): Promise<void> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    const { error } = await client
+      .from('players')
+      .update({ cooldown_until: null })
+      .neq('id', '__never__');
+
+    if (error) throw new Error(`Cooldown-Reset fehlgeschlagen: ${error.message}`);
+  }
+
+  public async resetGameFull(adminCode: string): Promise<{ success: boolean; message: string; newResetEpoch: number }> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    // 1. Serverseitige atomare Postgres-Funktion RPC "reset_game_full"
+    try {
+      const { data, error } = await client.rpc('reset_game_full', { p_admin_code: adminCode.trim() });
+      if (!error && data?.success) {
+        return {
+          success: true,
+          message: data.message || 'Komplett-Reset erfolgreich durchgeführt.',
+          newResetEpoch: data.reset_epoch || Date.now(),
+        };
+      }
+    } catch (err: any) {
+      console.warn('RPC reset_game_full error, using multi-table fallback:', err);
+    }
+
+    // 2. Client-seitiger Voll-Reset Fallback
+    const nextEpoch = Date.now();
+
+    // Lösche Tabellen
+    await client.from('kills').delete().neq('victim_id', '__never__');
+    await client.from('player_photo_tasks').delete().neq('player_id', '__never__');
+    await client.from('special_tasks').delete().neq('player_id', '__never__');
+    await client.from('task_completions').delete().neq('player_id', '__never__');
+    await client.from('photos').delete().neq('photo_url', '__never__');
+    await client.from('points_log').delete().neq('ref_id', '__never__');
+    await client.from('client_errors').delete().neq('id', '__never__');
+    await client.from('tick_log').delete().neq('id', '__never__');
+    await client.from('player_roles').delete().neq('player_id', '__never__');
+    await client.from('players').delete().neq('id', '__never__');
+
+    // Reset game_state
+    await client
+      .from('game_state')
+      .update({
+        status: 'Lobby',
+        started_at: null,
+        ended_at: null,
+        active_full_moon: null,
+        next_full_moon_at: null,
+        winner_team: null,
+        last_special_task_at: null,
+        reset_epoch: nextEpoch,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', 'main');
+
+    return {
+      success: true,
+      message: 'Alle Spielerdaten, Aufgaben, Kills und Logs wurden komplett gelöscht. Spiel ist in der Lobby.',
+      newResetEpoch: nextEpoch,
+    };
   }
 }
 

@@ -157,6 +157,46 @@ class GameApiClient {
     return supabaseService.getNextFullMoon(gameState);
   }
 
+  async getServerNow(): Promise<string> {
+    return supabaseService.getServerNow();
+  }
+
+  async expirePendingDeaths(): Promise<{ success: boolean; message: string; expiredCount: number }> {
+    return supabaseService.expirePendingDeaths();
+  }
+
+  async logClientError(entry: any): Promise<void> {
+    return supabaseService.logClientError(entry);
+  }
+
+  async getClientErrors(limit?: number): Promise<any[]> {
+    return supabaseService.getClientErrors(limit);
+  }
+
+  async getTickLogs(limit?: number): Promise<any[]> {
+    return supabaseService.getTickLogs(limit);
+  }
+
+  async adminClearPendingDeaths(adminCode: string): Promise<{ success: boolean; message: string }> {
+    return supabaseService.adminClearPendingDeaths(adminCode);
+  }
+
+  async adminSetPlayerStatus(adminCode: string, playerId: string, newStatus: string): Promise<void> {
+    return supabaseService.adminSetPlayerStatus(adminCode, playerId, newStatus);
+  }
+
+  async adminRepairGameState(adminCode: string): Promise<{ success: boolean; message: string }> {
+    return supabaseService.adminRepairGameState(adminCode);
+  }
+
+  async adminResetAllCooldowns(adminCode: string): Promise<void> {
+    return supabaseService.adminResetAllCooldowns(adminCode);
+  }
+
+  async resetGameFull(adminCode: string): Promise<{ success: boolean; message: string; newResetEpoch: number }> {
+    return supabaseService.resetGameFull(adminCode);
+  }
+
   public subscribeToRealtime(callback: () => void): () => void {
     return supabaseService.subscribeToRealtime(callback);
   }

@@ -49,6 +49,8 @@ import {
 import { gameApi } from '../../utils/api';
 import { calculateRoleDistribution, RoleCounts } from '../../utils/roleDistribution';
 import { PointsLogModal } from './PointsLogModal';
+import { EmergencyPanel } from './EmergencyPanel';
+import { LogsPanel } from './LogsPanel';
 
 interface AdminAreaProps {
   gameStatus: GameStatus;
@@ -73,6 +75,8 @@ interface AdminAreaProps {
   onAdminRevivePendingDeath?: (playerId: string) => Promise<void>;
   lastTickAt?: string | null;
   onTriggerTick?: () => Promise<void>;
+  onRefreshState?: () => Promise<void>;
+  onToast?: (msg: string, type: 'success' | 'error') => void;
 }
 
 export const AdminArea: React.FC<AdminAreaProps> = ({
@@ -98,9 +102,11 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   onAdminConfirmPendingDeath,
   onAdminRevivePendingDeath,
   onTriggerTick,
+  onRefreshState,
+  onToast,
 }) => {
-  // Sub-tabs in Admin: 'control' | 'players' | 'kills' | 'gallery' | 'settings' | 'qrcode'
-  const [activeTab, setActiveTab] = useState<'control' | 'players' | 'kills' | 'gallery' | 'settings' | 'qrcode'>('control');
+  // Sub-tabs in Admin: 'control' | 'players' | 'kills' | 'gallery' | 'settings' | 'qrcode' | 'emergency' | 'logs'
+  const [activeTab, setActiveTab] = useState<'control' | 'players' | 'kills' | 'gallery' | 'settings' | 'qrcode' | 'emergency' | 'logs'>('control');
   const [tickSecondsAgo, setTickSecondsAgo] = useState<number | null>(null);
   const [isTicking, setIsTicking] = useState(false);
 
@@ -452,8 +458,9 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
         </div>
 
         {/* Sub-Navigation */}
-        <div className="grid grid-cols-6 gap-1 p-1 bg-zinc-950 rounded-2xl border border-zinc-800 text-[10px] font-bold text-center">
+        <div className="grid grid-cols-4 sm:grid-cols-8 gap-1 p-1 bg-zinc-950 rounded-2xl border border-zinc-800 text-[10px] font-bold text-center">
           <button
+            type="button"
             onClick={() => setActiveTab('control')}
             className={`py-2 rounded-xl transition cursor-pointer ${
               activeTab === 'control' ? 'bg-[#ff6b00] text-zinc-950 font-black' : 'text-zinc-400 hover:text-white'
@@ -462,6 +469,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
             Steuerung
           </button>
           <button
+            type="button"
             onClick={() => setActiveTab('players')}
             className={`py-2 rounded-xl transition cursor-pointer ${
               activeTab === 'players' ? 'bg-[#ff6b00] text-zinc-950 font-black' : 'text-zinc-400 hover:text-white'
@@ -470,6 +478,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
             Gäste
           </button>
           <button
+            type="button"
             onClick={() => setActiveTab('kills')}
             className={`py-2 rounded-xl transition cursor-pointer relative ${
               activeTab === 'kills' ? 'bg-[#ff6b00] text-zinc-950 font-black' : 'text-zinc-400 hover:text-white'
@@ -481,6 +490,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
             )}
           </button>
           <button
+            type="button"
             onClick={() => setActiveTab('gallery')}
             className={`py-2 rounded-xl transition cursor-pointer ${
               activeTab === 'gallery' ? 'bg-[#ff6b00] text-zinc-950 font-black' : 'text-zinc-400 hover:text-white'
@@ -489,6 +499,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
             Galerie
           </button>
           <button
+            type="button"
             onClick={() => setActiveTab('settings')}
             className={`py-2 rounded-xl transition cursor-pointer ${
               activeTab === 'settings' ? 'bg-[#ff6b00] text-zinc-950 font-black' : 'text-zinc-400 hover:text-white'
@@ -497,6 +508,30 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
             Optionen
           </button>
           <button
+            type="button"
+            onClick={() => setActiveTab('emergency')}
+            className={`py-2 rounded-xl transition cursor-pointer relative ${
+              activeTab === 'emergency' ? 'bg-rose-600 text-white font-black' : 'text-rose-400 hover:text-white'
+            }`}
+          >
+            Notfall
+            {pendingDeaths.length > 0 && (
+              <span className="absolute -top-1 -right-1 px-1 min-w-[14px] h-3.5 rounded-full bg-rose-500 text-white text-[9px] font-bold flex items-center justify-center leading-none animate-pulse">
+                {pendingDeaths.length}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('logs')}
+            className={`py-2 rounded-xl transition cursor-pointer ${
+              activeTab === 'logs' ? 'bg-[#ff6b00] text-zinc-950 font-black' : 'text-zinc-400 hover:text-white'
+            }`}
+          >
+            Logs
+          </button>
+          <button
+            type="button"
             onClick={() => setActiveTab('qrcode')}
             className={`py-2 rounded-xl transition cursor-pointer ${
               activeTab === 'qrcode' ? 'bg-[#ff6b00] text-zinc-950 font-black' : 'text-zinc-400 hover:text-white'
@@ -550,6 +585,56 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
             <span className="font-bold text-xs text-purple-300">{stats.livingGhosts}</span>
           </div>
         </div>
+      </div>
+
+      {/* TICK GAME MONITOR CARD (ANFORDERUNG 4) */}
+      <div
+        className={`p-4 rounded-3xl border shadow-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+          tickSecondsAgo === null || tickSecondsAgo > 180
+            ? 'bg-rose-950/40 border-rose-500/80 text-rose-200'
+            : 'bg-zinc-900 border-zinc-800 text-zinc-200'
+        }`}
+      >
+        <div className="flex items-start gap-2.5 min-w-0">
+          <Clock
+            className={`w-5 h-5 shrink-0 mt-0.5 ${
+              tickSecondsAgo === null || tickSecondsAgo > 180 ? 'text-rose-400 animate-pulse' : 'text-purple-400'
+            }`}
+          />
+          <div className="min-w-0 space-y-0.5">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-bold text-xs text-white">Automatischer Spiel-Ticker:</span>
+              <span
+                className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full ${
+                  tickSecondsAgo === null || tickSecondsAgo > 180
+                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                    : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
+                }`}
+              >
+                {tickSecondsAgo !== null ? `vor ${tickSecondsAgo}s` : 'Nie gelaufen'}
+              </span>
+            </div>
+            {tickSecondsAgo === null || tickSecondsAgo > 180 ? (
+              <p className="text-[10px] text-rose-300 font-medium">
+                Warnung: Länger als 3 Minuten nichts gelaufen! pg_cron in Supabase prüfen oder manuell ticken.
+              </p>
+            ) : (
+              <p className="text-[10px] text-zinc-400">
+                Prüft ausstehende Tode (4-Minuten-Frist), Fotoaufgaben-Slots und Vollmond-Ereignisse.
+              </p>
+            )}
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={handleManualTick}
+          disabled={isTicking}
+          className="px-3.5 py-2 rounded-xl bg-gradient-to-r from-purple-700 to-indigo-700 hover:from-purple-600 hover:to-indigo-600 text-white font-bold text-xs flex items-center justify-center gap-1.5 shrink-0 transition cursor-pointer shadow-md disabled:opacity-50"
+        >
+          <RotateCcw className={`w-3.5 h-3.5 ${isTicking ? 'animate-spin' : ''}`} />
+          <span>{isTicking ? 'Tickt...' : 'Tick jetzt ausführen'}</span>
+        </button>
       </div>
 
       {/* UNCONFIRMED KILLS WARNING BANNER */}
@@ -1672,6 +1757,25 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
             {typeof window !== 'undefined' ? window.location.origin + window.location.pathname : ''}
           </p>
         </div>
+      )}
+
+      {/* ======================================================== */}
+      {/* TAB 7: NOTFALL- & WARTUNGS-PANEL (ANFORDERUNG 5 & 7)      */}
+      {/* ======================================================== */}
+      {activeTab === 'emergency' && (
+        <EmergencyPanel
+          adminCode={adminCode}
+          players={players}
+          onRefreshState={onRefreshState || (async () => {})}
+          onToast={onToast}
+        />
+      )}
+
+      {/* ======================================================== */}
+      {/* TAB 8: FEHLER- & TICK-LOGS (ANFORDERUNG 2 & 4)            */}
+      {/* ======================================================== */}
+      {activeTab === 'logs' && (
+        <LogsPanel adminCode={adminCode} />
       )}
 
       {/* RESTART MODAL */}
