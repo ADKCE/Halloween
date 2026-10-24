@@ -2043,17 +2043,42 @@ class SupabaseService {
     taskTitle: string;
     photoBlobOrUrl: Blob | File | string;
     slotNumber?: number;
-  }): Promise<{ pointsAwarded: number }> {
+  }): Promise<{ pointsAwarded: number; newTotalPoints?: number }> {
     const client = this.getClient();
     if (!client) throw new Error('Supabase nicht verfügbar');
 
+    const uploadedPhotoUrl = await this.uploadPhoto(params.photoBlobOrUrl, 'task');
+
+    // 0. Server-seitige atomare Postgres-Funktion RPC "complete_task"
+    try {
+      const { data: rpcRes, error: rpcErr } = await client.rpc('complete_task', {
+        p_task_id: params.taskId,
+        p_player_id: params.playerId,
+        p_photo_url: uploadedPhotoUrl || '',
+        p_task_title: params.taskTitle || 'Foto-Aufgabe',
+      });
+
+      if (!rpcErr && rpcRes) {
+        if (!rpcRes.success) {
+          throw new Error(rpcRes.error || 'Aufgabe konnte nicht abgeschlossen werden');
+        }
+        return {
+          pointsAwarded: rpcRes.points_awarded ?? 10,
+          newTotalPoints: rpcRes.new_total_points,
+        };
+      } else if (rpcErr && rpcErr.message && !rpcErr.message.includes('function') && !rpcErr.message.includes('does not exist')) {
+        throw new Error(rpcErr.message);
+      }
+    } catch (err: any) {
+      if (err.message && !err.message.includes('function') && !err.message.includes('does not exist')) {
+        throw err;
+      }
+      console.warn('RPC complete_task nicht verfügbar, führe Client-Fallback aus:', err);
+    }
+
+    // Client-seitiger Fallback (mit points_log Absicherung)
     const { data: stateData } = await client.from('game_state').select('settings').eq('id', 'main').single();
     const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...(stateData?.settings || {}) };
-
-    const { data: player } = await client.from('players').select('*').eq('id', params.playerId).single();
-    if (!player) throw new Error('Spieler nicht gefunden');
-
-    const uploadedPhotoUrl = await this.uploadPhoto(params.photoBlobOrUrl, 'task');
     const taskPoints = settings.pointsPhotoTask || 10;
 
     // 1. Task in player_photo_tasks als abgeschlossen markieren
@@ -2070,41 +2095,89 @@ class SupabaseService {
       }
     } catch {}
 
-    // 2. Insert completion (keine Personen-Tags)
-    await client.from('task_completions').insert([
-      {
-        task_id: params.taskId,
-        player_id: player.id,
-        player_name: player.name,
-        photo_url: uploadedPhotoUrl || null,
-        points_awarded: taskPoints,
-      },
-    ]);
+    // 2. In points_log buchen mit Unique-Constraint gegen doppelte Punkte
+    try {
+      await client.from('points_log').insert([
+        {
+          player_id: params.playerId,
+          reason: 'photo_task',
+          amount: taskPoints,
+          ref_id: params.taskId,
+        },
+      ]);
+    } catch {}
 
-    // 3. Award player points (+10 Pkt)
+    // 3. Insert completion
+    try {
+      await client.from('task_completions').insert([
+        {
+          task_id: params.taskId,
+          task_title: params.taskTitle || 'Foto-Aufgabe',
+          player_id: params.playerId,
+          player_name: (await client.from('players').select('name').eq('id', params.playerId).single()).data?.name || 'Gast',
+          photo_url: uploadedPhotoUrl || null,
+          points_awarded: taskPoints,
+        },
+      ]);
+    } catch {}
+
+    // 4. Spieler-Punkte als Summe aus points_log berechnen
+    const { data: pLog } = await client.from('points_log').select('amount').eq('player_id', params.playerId);
+    let newPoints = taskPoints;
+    if (pLog && Array.isArray(pLog) && pLog.length > 0) {
+      newPoints = pLog.reduce((sum: number, entry: any) => sum + (Number(entry.amount) || 0), 0);
+    }
+
+    const { data: player } = await client.from('players').select('tasks_completed_count').eq('id', params.playerId).single();
     await this.safeUpdatePlayer(
-      player.id,
+      params.playerId,
       {
-        points: (player.points || 0) + taskPoints,
-        tasks_completed_count: (player.tasks_completed_count || 0) + 1,
+        points: newPoints,
+        tasks_completed_count: (player?.tasks_completed_count || 0) + 1,
       },
       ['points']
     );
 
-    // 4. In die zentrale Galerie einfügen (Aufgabe, Uhrzeit, Fotograf - keine Rollen!)
+    // 5. In die zentrale Galerie einfügen
     if (uploadedPhotoUrl) {
-      await client.from('photos').insert([
-        {
-          photo_url: uploadedPhotoUrl,
-          task_id: params.taskId,
-          caption: params.taskTitle,
-          player_id: player.id,
-          photographer_name: player.name,
-        },
-      ]);
+      try {
+        await client.from('photos').insert([
+          {
+            photo_url: uploadedPhotoUrl,
+            task_id: params.taskId,
+            caption: params.taskTitle,
+            player_id: params.playerId,
+            photographer_name: (await client.from('players').select('name').eq('id', params.playerId).single()).data?.name || 'Gast',
+          },
+        ]);
+      } catch {}
     }
 
-    return { pointsAwarded: taskPoints };
+    return { pointsAwarded: taskPoints, newTotalPoints: newPoints };
+  }
+
+  // --- POINTS LOG QUERY (für Admin-Ansicht) ---
+  public async getPointsLog(playerId?: string): Promise<any[]> {
+    const client = this.getClient();
+    if (!client) return [];
+    try {
+      let query = client.from('points_log').select('*').order('created_at', { ascending: false });
+      if (playerId) {
+        query = query.eq('player_id', playerId);
+      }
+      const { data, error } = await query.limit(100);
+      if (error || !data) return [];
+      return data.map((d: any) => ({
+        id: d.id,
+        playerId: d.player_id,
+        reason: d.reason,
+        amount: d.amount,
+        refId: d.ref_id,
+        createdAt: d.created_at,
+      }));
+    } catch {
+      return [];
+    }
   }
 
   // --- SPECIAL TASKS FOR HUMANS (Kopfrechnen, Anagramm, Merk-Sequenz, Quiz, Geheimcode) ---
@@ -2265,14 +2338,32 @@ class SupabaseService {
     const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...(stateData?.settings || {}) };
     const taskPoints = settings.pointsSpecialTask || 20;
 
-    // Punkte gutschreiben
-    const { data: player } = await client.from('players').select('points').eq('id', params.playerId).single();
-    if (player) {
-      await client
-        .from('players')
-        .update({ points: (player.points || 0) + taskPoints })
-        .eq('id', params.playerId);
+    // In points_log buchen (mit Unique Constraint gegen doppelte Punkte)
+    try {
+      await client.from('points_log').insert([
+        {
+          player_id: params.playerId,
+          reason: 'special_task',
+          amount: taskPoints,
+          ref_id: params.specialTaskId,
+        },
+      ]);
+    } catch {}
+
+    // Punkte aus points_log synchronisieren
+    const { data: pLog } = await client.from('points_log').select('amount').eq('player_id', params.playerId);
+    let newPoints = taskPoints;
+    if (pLog && Array.isArray(pLog) && pLog.length > 0) {
+      newPoints = pLog.reduce((sum: number, entry: any) => sum + (Number(entry.amount) || 0), 0);
+    } else {
+      const { data: player } = await client.from('players').select('points').eq('id', params.playerId).single();
+      newPoints = (player?.points || 0) + taskPoints;
     }
+
+    await client
+      .from('players')
+      .update({ points: newPoints })
+      .eq('id', params.playerId);
 
     // Aufgabe als abgeschlossen markieren
     await client

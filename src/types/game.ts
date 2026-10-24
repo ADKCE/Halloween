@@ -262,3 +262,12 @@ export interface QuizQuestion {
   explanation?: string;
 }
 
+export interface PointsLogEntry {
+  id: string;
+  playerId: string;
+  reason: 'photo_task' | 'special_task' | 'evil_kill' | 'exorcism' | string;
+  amount: number;
+  refId: string;
+  createdAt: string;
+}
+

@@ -48,6 +48,7 @@ import {
 } from '../../types/game';
 import { gameApi } from '../../utils/api';
 import { calculateRoleDistribution, RoleCounts } from '../../utils/roleDistribution';
+import { PointsLogModal } from './PointsLogModal';
 
 interface AdminAreaProps {
   gameStatus: GameStatus;
@@ -188,6 +189,8 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   const [settingsNotice, setSettingsNotice] = useState('');
   const [qrDataUrl, setQrDataUrl] = useState('');
   const [previewPlayer, setPreviewPlayer] = useState<Player | null>(null);
+  const [pointsLogPlayer, setPointsLogPlayer] = useState<Player | null>(null);
+  const [isPointsLogOpen, setIsPointsLogOpen] = useState(false);
 
   // Diashow State for Beamer
   const [isDiashowRunning, setIsDiashowRunning] = useState(false);
@@ -1051,8 +1054,22 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
                       <span className="text-[10px] text-zinc-400">({p.role})</span>
                     </div>
                     <div className="text-[11px] text-[#ff6b00]">{p.costumeName}</div>
-                    <div className="text-[10px] text-zinc-500 font-mono">
-                      {p.points} Pkt • Status: {p.status}
+                    <div className="flex items-center gap-2 pt-0.5">
+                      <span className="text-[10px] text-zinc-500 font-mono">
+                        {p.points} Pkt • Status: {p.status}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPointsLogPlayer(p);
+                          setIsPointsLogOpen(true);
+                        }}
+                        className="px-2 py-0.5 rounded-md bg-purple-950/80 hover:bg-purple-900 border border-purple-500/40 text-purple-300 text-[10px] font-bold cursor-pointer transition flex items-center gap-1"
+                        title="Detaillierte Punkte-Historie anzeigen"
+                      >
+                        <Award className="w-2.5 h-2.5 text-amber-400" />
+                        Punkte-Log
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -1903,6 +1920,16 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
           </div>
         </div>
       )}
+
+      {/* POINTS LOG MODAL */}
+      <PointsLogModal
+        isOpen={isPointsLogOpen}
+        onClose={() => {
+          setIsPointsLogOpen(false);
+          setPointsLogPlayer(null);
+        }}
+        player={pointsLogPlayer}
+      />
     </div>
   );
 };

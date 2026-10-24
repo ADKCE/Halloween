@@ -138,6 +138,10 @@ class GameApiClient {
     return supabaseService.completeSpecialTask(params);
   }
 
+  async getPointsLog(playerId?: string): Promise<any[]> {
+    return supabaseService.getPointsLog(playerId);
+  }
+
   async deletePhoto(options: { photoId: string; playerId?: string; adminCode?: string } | string, photoIdParam?: string): Promise<void> {
     if (typeof options === 'string') {
       return supabaseService.deletePhoto({ adminCode: options, photoId: photoIdParam || '' });

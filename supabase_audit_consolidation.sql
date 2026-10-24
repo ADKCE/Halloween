@@ -1,14 +1,15 @@
 -- ==============================================================================
--- HALLOWEEN PARTY SPIEL - KONSOLIDIERTES AUDIT-SCHEMA & SICHERHEITS-UPGRADE
--- Vollständig idempotent (mehrfach ausführbar, IF NOT EXISTS / CREATE OR REPLACE)
--- Behebt Rollen-Leaks, Admin-Code-Leaks, Race Conditions, Fullmoon in tick_game()
+-- HALLOWEEN PARTY SPIEL - MASTER AUDIT & DATENBANK-KONSOLIDIERUNG
+-- Vollständig idempotent (mehrfach ausführbar, CREATE TABLE IF NOT EXISTS,
+-- ADD COLUMN IF NOT EXISTS, CREATE OR REPLACE FUNCTION).
+-- Am Ende: NOTIFY pgrst, 'reload schema';
 -- ==============================================================================
 
 -- 1. EXTENSIONS
 create extension if not exists "uuid-ossp";
 create extension if not exists "pg_cron";
 
--- 2. SICHERER ADMIN-CODE STORE (Separat vor öffentlichem Select geschützt)
+-- 2. SICHERER ADMIN-CODE STORE (Vor anonymem Zugriff geschützt)
 create table if not exists public.admin_secrets (
   id text primary key default 'main',
   admin_code text not null default '1031',
@@ -81,8 +82,8 @@ on conflict (id) do nothing;
 create table if not exists public.players (
   id text primary key,
   name text not null,
-  costume_name text not null,
-  photo_url text not null,
+  costume_name text not null default '',
+  photo_url text not null default '',
   role text default 'unassigned',
   team text not null default 'Gut',
   status text not null default 'lebendig',
@@ -93,27 +94,31 @@ create table if not exists public.players (
   cooldown_until timestamptz,
   pending_death_at timestamptz,
   is_test boolean not null default false,
-  created_at timestamptz not null default timezone('utc'::text, now())
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  updated_at timestamptz not null default timezone('utc'::text, now())
 );
+
+-- Sicherstellen aller Spalten (insbes. pending_death_at!)
+alter table public.players add column if not exists pending_death_at timestamptz;
+alter table public.players add column if not exists is_test boolean not null default false;
+alter table public.players add column if not exists cooldown_until timestamptz;
+alter table public.players add column if not exists last_kill_at timestamptz;
+alter table public.players add column if not exists kills_count integer not null default 0;
+alter table public.players add column if not exists tasks_completed_count integer not null default 0;
+alter table public.players add column if not exists updated_at timestamptz not null default timezone('utc'::text, now());
 
 alter table public.players drop constraint if exists players_status_check;
 alter table public.players add constraint players_status_check 
   check (status in ('lebendig', 'tot', 'pending_death', 'tod_ausstehend', 'entfernt', 'pausiert'));
 
-alter table public.players add column if not exists is_test boolean not null default false;
-alter table public.players add column if not exists pending_death_at timestamptz;
-alter table public.players add column if not exists cooldown_until timestamptz;
-alter table public.players add column if not exists last_kill_at timestamptz;
-alter table public.players add column if not exists kills_count integer not null default 0;
-alter table public.players add column if not exists tasks_completed_count integer not null default 0;
-
 create index if not exists idx_players_points on public.players (points desc);
 create index if not exists idx_players_created_at on public.players (created_at asc);
 create index if not exists idx_players_status on public.players (status);
 create index if not exists idx_players_is_test on public.players (is_test);
+create index if not exists idx_players_pending_death on public.players (pending_death_at);
 
 -- 5. TABELLE: player_roles (STRENG VERTRAULICHE ROLLENTABELLE)
--- Kein Public-Select! Verhindert Rollen-Leaks über Network-Tab und Anon-Keys!
+-- Verhindert Rollen-Leaks über Network-Tab und Anon-Keys!
 create table if not exists public.player_roles (
   player_id text primary key references public.players(id) on delete cascade,
   role text not null,
@@ -125,9 +130,22 @@ alter table public.player_roles enable row level security;
 drop policy if exists "No public access to player_roles" on public.player_roles;
 create policy "No public access to player_roles" on public.player_roles for all to public using (false);
 
--- 6. TABELLE: kills (Kill-Protokoll)
+-- 6. TABELLE: points_log (ANFORDERUNG 3: ZENTRALE PUNKTEBUCHUNG MIT UNIQUE CONSTRAINT)
+create table if not exists public.points_log (
+  id text primary key default gen_random_uuid()::text,
+  player_id text not null references public.players(id) on delete cascade,
+  reason text not null, -- 'photo_task', 'special_task', 'evil_kill', 'exorcism'
+  amount integer not null,
+  ref_id text not null,
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  constraint uq_points_log_reason_ref unique (reason, ref_id)
+);
+
+create index if not exists idx_points_log_player on public.points_log (player_id, created_at desc);
+
+-- 7. TABELLE: kills (Kill-Protokoll)
 create table if not exists public.kills (
-  id uuid primary key default gen_random_uuid(),
+  id text primary key default gen_random_uuid()::text,
   killer_id text references public.players(id) on delete set null,
   victim_id text not null references public.players(id) on delete cascade,
   killer_name text,
@@ -148,9 +166,9 @@ create index if not exists idx_kills_created_at on public.kills (created_at desc
 create index if not exists idx_kills_victim_id on public.kills (victim_id);
 create index if not exists idx_kills_killer_id on public.kills (killer_id);
 
--- 7. TABELLE: player_photo_tasks (Foto-Aufgaben pro Spieler & Slot)
+-- 8. TABELLE: player_photo_tasks (Foto-Aufgaben pro Spieler & Slot)
 create table if not exists public.player_photo_tasks (
-  id uuid primary key default gen_random_uuid(),
+  id text primary key default gen_random_uuid()::text,
   player_id text not null references public.players(id) on delete cascade,
   slot_number integer not null,
   title text not null,
@@ -178,9 +196,9 @@ create table if not exists public.player_photo_tasks (
 create index if not exists idx_player_photo_tasks_player_status on public.player_photo_tasks (player_id, status);
 create index if not exists idx_player_photo_tasks_expires on public.player_photo_tasks (expires_at);
 
--- 8. TABELLE: special_tasks (Mini-Spiele für Menschen)
+-- 9. TABELLE: special_tasks (Mini-Spiele für Menschen)
 create table if not exists public.special_tasks (
-  id uuid primary key default gen_random_uuid(),
+  id text primary key default gen_random_uuid()::text,
   player_id text not null references public.players(id) on delete cascade,
   type text not null check (type in ('math', 'anagram', 'sequence', 'quiz', 'code')),
   title text not null,
@@ -200,9 +218,9 @@ create table if not exists public.special_tasks (
 alter table public.special_tasks add column if not exists attempts integer not null default 0;
 create index if not exists idx_special_tasks_player_status on public.special_tasks (player_id, status);
 
--- 9. TABELLE: photos (Party-Galerie, KEINE Personen-Markierungen!)
+-- 10. TABELLE: photos (Party-Galerie, KEINE Personen-Tags)
 create table if not exists public.photos (
-  id uuid primary key default gen_random_uuid(),
+  id text primary key default gen_random_uuid()::text,
   photo_url text not null,
   task_id text,
   caption text,
@@ -211,14 +229,14 @@ create table if not exists public.photos (
   created_at timestamptz not null default timezone('utc'::text, now())
 );
 
--- Säubere alte Markierungsspalten
 alter table public.photos drop column if exists tagged_player_names;
 create index if not exists idx_photos_created_at on public.photos (created_at desc);
 
--- 10. TABELLE: task_completions
+-- 11. TABELLE: task_completions
 create table if not exists public.task_completions (
-  id uuid primary key default gen_random_uuid(),
+  id text primary key default gen_random_uuid()::text,
   task_id text not null,
+  task_title text not null default '',
   player_id text not null references public.players(id) on delete cascade,
   player_name text not null,
   photo_url text,
@@ -226,9 +244,12 @@ create table if not exists public.task_completions (
   completed_at timestamptz not null default timezone('utc'::text, now())
 );
 
--- 11. TABELLE: tick_log (Protokoll aller Ausführungen von tick_game)
+alter table public.task_completions add column if not exists task_title text not null default '';
+create index if not exists idx_task_completions_player on public.task_completions (player_id, completed_at desc);
+
+-- 12. TABELLE: tick_log (Protokoll der pg_cron Ausführungen)
 create table if not exists public.tick_log (
-  id uuid primary key default gen_random_uuid(),
+  id text primary key default gen_random_uuid()::text,
   tick_at timestamptz not null default now(),
   status text not null,
   details jsonb default '{}'::jsonb,
@@ -238,19 +259,19 @@ create table if not exists public.tick_log (
 create index if not exists idx_tick_log_tick_at on public.tick_log (tick_at desc);
 
 -- ==============================================================================
--- 12. STORAGE BUCKET: photos
+-- 13. STORAGE BUCKET: photos
 -- ==============================================================================
 do $$
 begin
   insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-  values ('photos', 'photos', true, 10485760, array['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+  values ('photos', 'photos', true, 15728640, array['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
   on conflict (id) do update set public = true;
 exception when others then null;
 end;
 $$;
 
 -- ==============================================================================
--- 13. RLS POLICIES (Abgesichert gegen Manipulation durch Anon-Nutzer)
+-- 14. RLS POLICIES
 -- ==============================================================================
 alter table public.game_state enable row level security;
 alter table public.players enable row level security;
@@ -259,16 +280,16 @@ alter table public.player_photo_tasks enable row level security;
 alter table public.special_tasks enable row level security;
 alter table public.photos enable row level security;
 alter table public.task_completions enable row level security;
+alter table public.points_log enable row level security;
 alter table public.tick_log enable row level security;
 
--- game_state: Public Read, Write nur via Security-Definer RPCs
+-- game_state
 drop policy if exists "Public Read game_state" on public.game_state;
 create policy "Public Read game_state" on public.game_state for select to public using (true);
-
 drop policy if exists "No direct write game_state" on public.game_state;
 create policy "No direct write game_state" on public.game_state for all to public using (false);
 
--- players: Public Read (Maskierte Rollen), Insert für Registrierung, Update/Delete nur via RPC
+-- players
 drop policy if exists "Public Read players" on public.players;
 create policy "Public Read players" on public.players for select to public using (true);
 
@@ -280,24 +301,21 @@ create policy "Public Insert players" on public.players for insert to public wit
 drop policy if exists "Allow update players self" on public.players;
 create policy "Allow update players self" on public.players for update to public using (true) with check (true);
 
--- kills: Public Read, Write nur via Security-Definer RPCs
+-- kills
 drop policy if exists "Public Read kills" on public.kills;
 create policy "Public Read kills" on public.kills for select to public using (true);
-
 drop policy if exists "No direct write kills" on public.kills;
 create policy "No direct write kills" on public.kills for insert to public with check (false);
 
--- photos: Public Read & Insert
+-- photos
 drop policy if exists "Public Read photos" on public.photos;
 create policy "Public Read photos" on public.photos for select to public using (true);
-
 drop policy if exists "Public Insert photos" on public.photos;
 create policy "Public Insert photos" on public.photos for insert to public with check (true);
-
 drop policy if exists "Public Delete photos" on public.photos;
 create policy "Public Delete photos" on public.photos for delete to public using (true);
 
--- photo tasks & special tasks & completions
+-- tasks & completions & points_log
 drop policy if exists "Public all player_photo_tasks" on public.player_photo_tasks;
 create policy "Public all player_photo_tasks" on public.player_photo_tasks for all to public using (true) with check (true);
 
@@ -307,10 +325,13 @@ create policy "Public all special_tasks" on public.special_tasks for all to publ
 drop policy if exists "Public all task_completions" on public.task_completions;
 create policy "Public all task_completions" on public.task_completions for all to public using (true) with check (true);
 
+drop policy if exists "Public Read points_log" on public.points_log;
+create policy "Public Read points_log" on public.points_log for select to public using (true);
+
 drop policy if exists "Public Read tick_log" on public.tick_log;
 create policy "Public Read tick_log" on public.tick_log for select to public using (true);
 
--- Rechte an anon und authenticated vergeben
+-- GRANTS
 grant usage on schema public to anon, authenticated;
 grant select on public.game_state to anon, authenticated;
 grant select, insert, update on public.players to anon, authenticated;
@@ -319,10 +340,11 @@ grant all on public.player_photo_tasks to anon, authenticated;
 grant all on public.special_tasks to anon, authenticated;
 grant select, insert, delete on public.photos to anon, authenticated;
 grant select, insert on public.task_completions to anon, authenticated;
+grant select on public.points_log to anon, authenticated;
 grant select on public.tick_log to anon, authenticated;
 
 -- ==============================================================================
--- 14. RPC: check_admin_code
+-- 15. RPC: check_admin_code
 -- ==============================================================================
 create or replace function public.check_admin_code(input_code text)
 returns boolean
@@ -337,16 +359,15 @@ begin
   end if;
   select admin_code into v_correct from public.admin_secrets where id = 'main';
   if v_correct is null then
-    return input_code = '1031';
+    return trim(input_code) = '1031';
   end if;
   return v_correct = trim(input_code);
 end;
 $$;
-
 grant execute on function public.check_admin_code(text) to anon, authenticated, service_role;
 
 -- ==============================================================================
--- 15. RPC: get_my_role & get_fellow_hunters (STRENG GESICHERTE ROLLEN-ABFRAGEN)
+-- 16. RPC: get_my_role & get_fellow_hunters
 -- ==============================================================================
 create or replace function public.get_my_role(p_player_id text)
 returns jsonb
@@ -354,271 +375,75 @@ language plpgsql
 security definer
 as $$
 declare
-  v_game_status text;
   v_role record;
+  v_game_state record;
+  v_player record;
 begin
-  select status into v_game_status from public.game_state where id = 'main';
-  if v_game_status = 'Lobby' then
-    return jsonb_build_object('role', 'unassigned', 'team', 'Gut');
+  select * into v_game_state from public.game_state where id = 'main';
+  
+  if v_game_state.status = 'Beendet' then
+    select role, team into v_role from public.player_roles where player_id = p_player_id;
+    if not found then
+      select role, team into v_role from public.players where id = p_player_id;
+    end if;
+    return jsonb_build_object('role', coalesce(v_role.role, 'Unbekannt'), 'team', coalesce(v_role.team, 'Gut'));
+  end if;
+
+  select * into v_player from public.players where id = p_player_id;
+  if not found then
+    return jsonb_build_object('role', 'Unbekannt', 'team', 'Gut');
+  end if;
+
+  if v_player.status = 'tot' then
+    select role, team into v_role from public.player_roles where player_id = p_player_id;
+    if not found then
+      select role, team into v_role from public.players where id = p_player_id;
+    end if;
+    return jsonb_build_object('role', coalesce(v_role.role, 'Unbekannt'), 'team', coalesce(v_role.team, 'Gut'));
   end if;
 
   select role, team into v_role from public.player_roles where player_id = p_player_id;
   if not found then
-    -- Fallback auf players Tabelle
     select role, team into v_role from public.players where id = p_player_id;
   end if;
 
   return jsonb_build_object(
-    'role', coalesce(v_role.role, 'Mensch'),
+    'role', coalesce(v_role.role, 'unassigned'),
     'team', coalesce(v_role.team, 'Gut')
   );
 end;
 $$;
-
 grant execute on function public.get_my_role(text) to anon, authenticated, service_role;
 
 create or replace function public.get_fellow_hunters(p_player_id text)
-returns jsonb
+returns table (
+  player_id text
+)
 language plpgsql
 security definer
 as $$
 declare
-  v_role text;
-  v_hunters text[];
+  v_caller_role text;
 begin
-  select role into v_role from public.player_roles where player_id = p_player_id;
-  if v_role is null then
-    select role into v_role from public.players where id = p_player_id;
+  select role into v_caller_role from public.player_roles where player_roles.player_id = p_player_id;
+  if v_caller_role is null then
+    select role into v_caller_role from public.players where players.id = p_player_id;
   end if;
 
-  if v_role != 'Geisterjäger' then
-    return '[]'::jsonb;
+  if v_caller_role != 'Geisterjäger' then
+    return;
   end if;
 
-  select array_agg(player_id) into v_hunters
-  from public.player_roles
-  where role = 'Geisterjäger' and player_id != p_player_id;
-
-  if v_hunters is null then
-    select array_agg(id) into v_hunters
-    from public.players
-    where role = 'Geisterjäger' and id != p_player_id and status != 'entfernt';
-  end if;
-
-  return to_jsonb(coalesce(v_hunters, array[]::text[]));
+  return query
+  select pr.player_id
+  from public.player_roles pr
+  where pr.role = 'Geisterjäger';
 end;
 $$;
-
 grant execute on function public.get_fellow_hunters(text) to anon, authenticated, service_role;
 
 -- ==============================================================================
--- 16. RPC: assign_roles (Serverseitige exakte Rollenverteilung)
--- ==============================================================================
-create or replace function public.assign_roles()
-returns jsonb
-language plpgsql
-security definer
-as $$
-declare
-  v_settings jsonb;
-  v_vampire_pct numeric := 6;
-  v_werewolf_pct numeric := 4;
-  v_ghost_pct numeric := 4;
-  v_hunter_pct numeric := 10;
-  
-  v_total integer;
-  v_vampires integer := 0;
-  v_werewolves integer := 0;
-  v_ghosts integer := 0;
-  v_hunters integer := 0;
-  v_humans integer := 0;
-  v_min_humans integer;
-  v_max_special integer;
-  v_special_sum integer;
-  
-  v_deck text[] := array[]::text[];
-  v_player_ids text[] := array[]::text[];
-  v_i integer;
-  v_assigned_role text;
-  v_assigned_team text;
-  v_result jsonb;
-begin
-  select settings into v_settings from public.game_state where id = 'main';
-  if v_settings is not null then
-    if (v_settings->>'vampirePercent') is not null then
-      v_vampire_pct := (v_settings->>'vampirePercent')::numeric;
-    end if;
-    if (v_settings->>'werewolfPercent') is not null then
-      v_werewolf_pct := (v_settings->>'werewolfPercent')::numeric;
-    end if;
-    if (v_settings->>'ghostPercent') is not null then
-      v_ghost_pct := (v_settings->>'ghostPercent')::numeric;
-    end if;
-    if (v_settings->>'hunterPercent') is not null then
-      v_hunter_pct := (v_settings->>'hunterPercent')::numeric;
-    end if;
-  end if;
-
-  select array_agg(id order by random())
-  into v_player_ids
-  from public.players
-  where status != 'entfernt';
-
-  v_total := coalesce(array_length(v_player_ids, 1), 0);
-  if v_total = 0 then
-    return jsonb_build_object('success', false, 'message', 'Keine aktiven Spieler vorhanden');
-  end if;
-
-  if v_total = 1 then
-    v_humans := 1;
-  elsif v_total = 2 then
-    v_vampires := 1;
-    v_hunters := 1;
-  elsif v_total = 3 then
-    v_vampires := 1;
-    v_hunters := 1;
-    v_humans := 1;
-  elsif v_total = 4 then
-    v_vampires := 1;
-    v_werewolves := 1;
-    v_hunters := 1;
-    v_humans := 1;
-  elsif v_total = 5 then
-    v_vampires := 1;
-    v_werewolves := 1;
-    v_ghosts := 1;
-    v_hunters := 1;
-    v_humans := 1;
-  else
-    -- ab 6 Spielern: Mindestens 40% Menschen
-    v_min_humans := greatest(1, floor(v_total * 0.40)::integer);
-    v_max_special := greatest(0, v_total - v_min_humans);
-
-    v_vampires := greatest(1, round(v_total * v_vampire_pct / 100.0)::integer);
-    v_werewolves := greatest(1, round(v_total * v_werewolf_pct / 100.0)::integer);
-    v_ghosts := greatest(1, round(v_total * v_ghost_pct / 100.0)::integer);
-    v_hunters := greatest(1, round(v_total * v_hunter_pct / 100.0)::integer);
-
-    v_special_sum := v_vampires + v_werewolves + v_ghosts + v_hunters;
-    while v_special_sum > v_max_special loop
-      if v_hunters > 1 then v_hunters := v_hunters - 1;
-      elsif v_vampires > 1 then v_vampires := v_vampires - 1;
-      elsif v_werewolves > 1 then v_werewolves := v_werewolves - 1;
-      elsif v_ghosts > 1 then v_ghosts := v_ghosts - 1;
-      else exit;
-      end if;
-      v_special_sum := v_vampires + v_werewolves + v_ghosts + v_hunters;
-    end loop;
-
-    v_humans := greatest(0, v_total - (v_vampires + v_werewolves + v_ghosts + v_hunters));
-  end if;
-
-  for v_i in 1..v_vampires loop v_deck := array_append(v_deck, 'Vampir'); end loop;
-  for v_i in 1..v_werewolves loop v_deck := array_append(v_deck, 'Werwolf'); end loop;
-  for v_i in 1..v_ghosts loop v_deck := array_append(v_deck, 'Geist'); end loop;
-  for v_i in 1..v_hunters loop v_deck := array_append(v_deck, 'Geisterjäger'); end loop;
-  for v_i in 1..v_humans loop v_deck := array_append(v_deck, 'Mensch'); end loop;
-
-  while array_length(v_deck, 1) < v_total loop
-    v_deck := array_append(v_deck, 'Mensch');
-  end loop;
-
-  -- In player_roles UND players (abgesichert) speichern
-  for v_i in 1..v_total loop
-    v_assigned_role := v_deck[v_i];
-    v_assigned_team := case when v_assigned_role in ('Vampir', 'Werwolf', 'Geist') then 'Böse' else 'Gut' end;
-
-    insert into public.player_roles (player_id, role, team, updated_at)
-    values (v_player_ids[v_i], v_assigned_role, v_assigned_team, now())
-    on conflict (player_id) do update set
-      role = excluded.role,
-      team = excluded.team,
-      updated_at = now();
-
-    update public.players
-    set role = v_assigned_role,
-        team = v_assigned_team,
-        status = 'lebendig',
-        pending_death_at = null
-    where id = v_player_ids[v_i];
-  end loop;
-
-  v_result := jsonb_build_object(
-    'success', true,
-    'total', v_total,
-    'vampires', v_vampires,
-    'werewolves', v_werewolves,
-    'ghosts', v_ghosts,
-    'hunters', v_hunters,
-    'humans', v_humans
-  );
-
-  return v_result;
-end;
-$$;
-
-grant execute on function public.assign_roles() to anon, authenticated, service_role;
-
--- ==============================================================================
--- 17. RPC: start_game (Atomarer Spielstart mit Schutz gegen Doppel-Klick)
--- ==============================================================================
-create or replace function public.start_game(p_admin_code text)
-returns jsonb
-language plpgsql
-security definer
-as $$
-declare
-  v_state record;
-  v_active_count integer;
-  v_now timestamptz := now();
-  v_res jsonb;
-begin
-  if not public.check_admin_code(p_admin_code) then
-    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
-  end if;
-
-  select * into v_state from public.game_state where id = 'main' for update;
-  if not found then
-    return jsonb_build_object('success', false, 'error', 'Spielzustand nicht gefunden');
-  end if;
-
-  if v_state.status = 'Läuft' then
-    return jsonb_build_object('success', true, 'message', 'Spiel läuft bereits.');
-  end if;
-
-  select count(*) into v_active_count from public.players where status != 'entfernt';
-  if v_active_count = 0 then
-    return jsonb_build_object('success', false, 'error', 'Mindestens 1 Spieler muss beigetreten sein.');
-  end if;
-
-  -- Rollen zuweisen
-  v_res := public.assign_roles();
-
-  -- Spielzustand auf Läuft setzen
-  update public.game_state
-  set status = 'Läuft',
-      started_at = v_now,
-      ended_at = null,
-      winner_team = null,
-      active_full_moon = null,
-      next_full_moon_at = v_now + ((floor(random() * 21) + 20) * interval '1 minute'),
-      last_special_task_at = v_now,
-      next_special_task_interval_minutes = 15,
-      last_tick_at = v_now,
-      updated_at = v_now
-  where id = 'main';
-
-  -- Sofort Slot 0 Foto-Aufgaben erzeugen
-  perform public.tick_game();
-
-  return jsonb_build_object('success', true, 'message', 'Spiel erfolgreich gestartet!');
-end;
-$$;
-
-grant execute on function public.start_game(text) to anon, authenticated, service_role;
-
--- ==============================================================================
--- 18. RPC: report_pending_death (Opfer meldet Tod)
+-- 17. RPC: mark_self_dead & report_pending_death
 -- ==============================================================================
 create or replace function public.report_pending_death(p_player_id text)
 returns jsonb
@@ -627,6 +452,7 @@ security definer
 as $$
 declare
   v_player record;
+  v_now timestamptz := now();
 begin
   select * into v_player from public.players where id = p_player_id for update;
   if not found then
@@ -639,7 +465,8 @@ begin
 
   update public.players
   set status = 'pending_death',
-      pending_death_at = now()
+      pending_death_at = v_now,
+      updated_at = v_now
   where id = p_player_id;
 
   return jsonb_build_object(
@@ -648,11 +475,222 @@ begin
   );
 end;
 $$;
-
 grant execute on function public.report_pending_death(text) to anon, authenticated, service_role;
 
+create or replace function public.mark_self_dead(p_player_id text)
+returns jsonb
+language plpgsql
+security definer
+as $$
+begin
+  return public.report_pending_death(p_player_id);
+end;
+$$;
+grant execute on function public.mark_self_dead(text) to anon, authenticated, service_role;
+
 -- ==============================================================================
--- 19. RPC: confirm_kill (Täter bestätigt Kill)
+-- 18. RPC: complete_task (ANFORDERUNG 2: ATOMARER AUFGABENABSCHLUSS MIT PUNKTE-LOG)
+-- ==============================================================================
+create or replace function public.complete_task(
+  p_task_id text,
+  p_player_id text,
+  p_photo_url text,
+  p_task_title text default null
+)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_task record;
+  v_player record;
+  v_now timestamptz := now();
+  v_points integer := 10;
+  v_title text;
+  v_new_points integer;
+begin
+  -- 1. Spieler sperren & prüfen
+  select * into v_player
+  from public.players
+  where id = p_player_id
+  for update;
+
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'Spieler nicht gefunden');
+  end if;
+
+  if v_player.status != 'lebendig' then
+    return jsonb_build_object('success', false, 'error', 'Nur lebende Spieler können Aufgaben abschließen');
+  end if;
+
+  -- 2. Aufgabe in player_photo_tasks sperren
+  select * into v_task
+  from public.player_photo_tasks
+  where id = p_task_id
+  for update;
+
+  if found then
+    if v_task.player_id != p_player_id then
+      return jsonb_build_object('success', false, 'error', 'Diese Aufgabe gehört einem anderen Spieler');
+    end if;
+
+    if v_task.status = 'completed' then
+      -- Bereits erledigt: Idempotenter Erfolg ohne doppelte Punkte
+      return jsonb_build_object(
+        'success', true,
+        'message', 'Aufgabe war bereits erledigt',
+        'already_completed', true,
+        'points_awarded', 0,
+        'new_total_points', v_player.points
+      );
+    end if;
+
+    if v_task.expires_at is not null and v_task.expires_at < v_now then
+      update public.player_photo_tasks
+      set status = 'expired'
+      where id = v_task.id;
+      return jsonb_build_object('success', false, 'error', 'Die Frist für diese Aufgabe ist abgelaufen!');
+    end if;
+
+    v_points := coalesce(v_task.points, 10);
+    v_title := v_task.title;
+
+    update public.player_photo_tasks
+    set status = 'completed',
+        completed_at = v_now,
+        photo_url = p_photo_url
+    where id = v_task.id;
+  else
+    -- Fallback für synthetische ID (z.B. initial_slot_0_...)
+    v_title := coalesce(p_task_title, 'Foto-Aufgabe');
+    begin
+      insert into public.player_photo_tasks (
+        id, player_id, slot_number, title, description, task_type,
+        points, status, created_at, expires_at, completed_at, photo_url
+      ) values (
+        p_task_id, p_player_id, 0, v_title, v_title, 'group',
+        v_points, 'completed', v_now, v_now + interval '30 minutes', v_now, p_photo_url
+      );
+    exception when others then
+      null;
+    end;
+  end if;
+
+  -- 3. Punkte atomar in points_log eintragen (Unique-Constraint uq_points_log_reason_ref verhindert Doppelklicks!)
+  insert into public.points_log (player_id, reason, amount, ref_id, created_at)
+  values (p_player_id, 'photo_task', v_points, p_task_id, v_now)
+  on conflict (reason, ref_id) do nothing;
+
+  -- 4. Spielerpunkte als Summe aus points_log berechnen
+  select coalesce(sum(amount), 0) into v_new_points
+  from public.points_log
+  where player_id = p_player_id;
+
+  update public.players
+  set points = v_new_points,
+      tasks_completed_count = coalesce(tasks_completed_count, 0) + 1,
+      updated_at = v_now
+  where id = p_player_id;
+
+  -- 5. task_completions eintragen
+  insert into public.task_completions (
+    task_id, task_title, player_id, player_name, photo_url, points_awarded, completed_at
+  ) values (
+    p_task_id, v_title, p_player_id, v_player.name, p_photo_url, v_points, v_now
+  );
+
+  -- 6. In die Party-Galerie eintragen
+  if p_photo_url is not null and p_photo_url != '' then
+    insert into public.photos (
+      photo_url, task_id, caption, player_id, photographer_name, created_at
+    ) values (
+      p_photo_url, p_task_id, v_title, p_player_id, v_player.name, v_now
+    );
+  end if;
+
+  return jsonb_build_object(
+    'success', true,
+    'message', 'Aufgabe erfolgreich abgeschlossen!',
+    'points_awarded', v_points,
+    'new_total_points', v_new_points,
+    'task_id', p_task_id
+  );
+end;
+$$;
+grant execute on function public.complete_task(text, text, text, text) to anon, authenticated, service_role;
+
+-- ==============================================================================
+-- 19. RPC: reveal_random_role (ANFORDERUNG 1: Zufällige böse Rolle aufdecken)
+-- ==============================================================================
+create or replace function public.reveal_random_role(p_player_id text)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_evil_target record;
+  v_revealed_name text := 'Ein dunkler Schatten';
+  v_revealed_role text := 'Vampir';
+  v_revealed_id text := '';
+  v_past_revealed text[];
+begin
+  -- Vorherige Enthüllungen dieses Spielers ermitteln, um Dopplungen zu vermeiden
+  select array_agg(distinct reward_player_id) into v_past_revealed
+  from public.special_tasks
+  where player_id = p_player_id and status = 'completed' and reward_player_id is not null;
+
+  -- 1. Unbekannte lebende Böse suchen
+  select p.id, p.name, pr.role into v_evil_target
+  from public.players p
+  join public.player_roles pr on pr.player_id = p.id
+  where p.id != p_player_id
+    and p.status = 'lebendig'
+    and pr.role in ('Vampir', 'Werwolf', 'Geist')
+    and (v_past_revealed is null or not (p.id = any(v_past_revealed)))
+  order by random()
+  limit 1;
+
+  -- 2. Falls alle schon bekannt, beliebigen bösen lebenden Spieler wählen
+  if v_evil_target.id is null then
+    select p.id, p.name, pr.role into v_evil_target
+    from public.players p
+    join public.player_roles pr on pr.player_id = p.id
+    where p.id != p_player_id
+      and p.status = 'lebendig'
+      and pr.role in ('Vampir', 'Werwolf', 'Geist')
+    order by random()
+    limit 1;
+  end if;
+
+  -- 3. Fallback: beliebiger lebender Spieler falls keine Bösen mehr leben
+  if v_evil_target.id is null then
+    select p.id, p.name, coalesce(pr.role, p.role) as role into v_evil_target
+    from public.players p
+    left join public.player_roles pr on pr.player_id = p.id
+    where p.id != p_player_id
+      and p.status = 'lebendig'
+    order by random()
+    limit 1;
+  end if;
+
+  if v_evil_target.id is not null then
+    v_revealed_id := v_evil_target.id;
+    v_revealed_name := v_evil_target.name;
+    v_revealed_role := v_evil_target.role;
+  end if;
+
+  return jsonb_build_object(
+    'success', true,
+    'reward_player_id', v_revealed_id,
+    'reward_player_name', v_revealed_name,
+    'reward_role', v_revealed_role
+  );
+end;
+$$;
+grant execute on function public.reveal_random_role(text) to anon, authenticated, service_role;
+
+-- ==============================================================================
+-- 20. RPC: confirm_kill (Täter bestätigt Kill + Punkte-Log)
 -- ==============================================================================
 create or replace function public.confirm_kill(
   p_killer_id text,
@@ -677,20 +715,19 @@ declare
   v_killer_team text;
   v_victim_role text;
   v_victim_team text;
+  v_kill_id text := gen_random_uuid()::text;
+  v_new_points integer;
 begin
-  -- Selbst-Kill Sperre
   if p_killer_id = p_victim_id then
     return jsonb_build_object('success', false, 'error', 'Du kannst dich nicht selbst töten!');
   end if;
 
-  -- 1. Game State & Settings
   select * into v_game_state from public.game_state where id = 'main';
   if not found or v_game_state.status != 'Läuft' then
     return jsonb_build_object('success', false, 'error', 'Das Spiel läuft derzeit nicht');
   end if;
   v_settings := coalesce(v_game_state.settings, '{}'::jsonb);
 
-  -- 2. Täter prüfen
   select * into v_killer from public.players where id = p_killer_id;
   if not found then
     return jsonb_build_object('success', false, 'error', 'Täter nicht gefunden');
@@ -700,7 +737,6 @@ begin
     return jsonb_build_object('success', false, 'error', 'Nur lebende Spieler können Kills bestätigen');
   end if;
 
-  -- Rollen aus geschützter Tabelle holen
   select role, team into v_killer_role, v_killer_team from public.player_roles where player_id = p_killer_id;
   if v_killer_role is null then
     v_killer_role := v_killer.role;
@@ -711,18 +747,18 @@ begin
     return jsonb_build_object('success', false, 'error', 'Nur böse Rollen (Vampir, Werwolf, Geist) können Kills bestätigen');
   end if;
 
-  -- 3. Schonfrist prüfen
+  -- Schonfrist
   v_grace_minutes := coalesce((v_settings->>'gracePeriodMinutes')::integer, 15);
   if v_game_state.started_at is not null and (v_now < v_game_state.started_at + (v_grace_minutes * interval '1 minute')) then
     return jsonb_build_object('success', false, 'error', 'Schonfrist ist noch aktiv! Töten noch nicht erlaubt.');
   end if;
 
-  -- 4. Cooldown des Täters prüfen
+  -- Cooldown
   if v_killer.cooldown_until is not null and v_killer.cooldown_until > v_now then
     return jsonb_build_object('success', false, 'error', 'Dein Cooldown ist noch nicht abgelaufen!');
   end if;
 
-  -- 5. Werwolf-Regel: Nur bei Vollmond
+  -- Werwolf Vollmond
   if v_killer_role = 'Werwolf' then
     if v_game_state.active_full_moon is not null and (v_game_state.active_full_moon->>'endsAt')::timestamptz > v_now then
       v_is_full_moon := true;
@@ -732,12 +768,12 @@ begin
     end if;
   end if;
 
-  -- 6. Geister-Regel: Allein-Checkbox Pflicht
+  -- Geist Allein-Pflicht
   if v_killer_role = 'Geist' and not p_ghost_solo then
     return jsonb_build_object('success', false, 'error', 'Als Geist musst du bestätigen, dass du mit dem Opfer allein im Raum warst!');
   end if;
 
-  -- 7. Opfer prüfen & atomar sperren
+  -- Opfer atomar sperren
   select * into v_victim from public.players where id = p_victim_id for update;
   if not found then
     return jsonb_build_object('success', false, 'error', 'Opfer nicht gefunden');
@@ -753,12 +789,11 @@ begin
     v_victim_team := v_victim.team;
   end if;
 
-  -- Verhindere Teammate-Kills unter Bösen
   if v_victim_team = 'Böse' then
     return jsonb_build_object('success', false, 'error', 'Du kannst keine Mitstreiter deines eigenen bösen Teams töten!');
   end if;
 
-  -- 8. Cooldown berechnen
+  -- Cooldown berechnen
   if v_killer_role = 'Vampir' then
     v_cooldown_minutes := coalesce((v_settings->>'vampireCooldownMinutes')::integer, 6);
   elsif v_killer_role = 'Werwolf' then
@@ -770,44 +805,55 @@ begin
   end if;
   v_cooldown_until := v_now + (v_cooldown_minutes * interval '1 minute');
 
-  -- 9. Opfer endgültig tot
+  -- Opfer endgültig tot
   update public.players
   set status = 'tot',
-      pending_death_at = null
+      pending_death_at = null,
+      updated_at = v_now
   where id = p_victim_id;
 
-  -- 10. Täter Punkte & Cooldown
-  update public.players
-  set points = points + 15,
-      kills_count = kills_count + 1,
-      last_kill_at = v_now,
-      cooldown_until = v_cooldown_until
-  where id = p_killer_id;
-
-  -- 11. Kill-Eintrag
+  -- Kill-Eintrag
   insert into public.kills (
-    killer_id, victim_id, killer_name, victim_name,
+    id, killer_id, victim_id, killer_name, victim_name,
     killer_role, victim_role, killer_team, victim_team,
     reason, ghost_solo_confirmed, confirmed, confirmed_at, created_at
   ) values (
-    v_killer.id, v_victim.id, v_killer.name, v_victim.name,
+    v_kill_id, v_killer.id, v_victim.id, v_killer.name, v_victim.name,
     v_killer_role, v_victim_role, 'Böse', v_victim_team,
     'kill', p_ghost_solo, true, v_now, v_now
   );
+
+  -- Punkte in points_log buchen
+  insert into public.points_log (player_id, reason, amount, ref_id, created_at)
+  values (p_killer_id, 'evil_kill', 15, v_kill_id, v_now)
+  on conflict (reason, ref_id) do nothing;
+
+  select coalesce(sum(amount), 0) into v_new_points
+  from public.points_log
+  where player_id = p_killer_id;
+
+  -- Täter Punkte & Cooldown
+  update public.players
+  set points = v_new_points,
+      kills_count = kills_count + 1,
+      last_kill_at = v_now,
+      cooldown_until = v_cooldown_until,
+      updated_at = v_now
+  where id = p_killer_id;
 
   return jsonb_build_object(
     'success', true,
     'message', 'Kill erfolgreich bestätigt! +15 Punkte.',
     'victimName', v_victim.name,
-    'cooldownUntil', v_cooldown_until
+    'cooldownUntil', v_cooldown_until,
+    'new_total_points', v_new_points
   );
 end;
 $$;
-
 grant execute on function public.confirm_kill(text, text, boolean) to anon, authenticated, service_role;
 
 -- ==============================================================================
--- 20. RPC: exorcise (Geisterjäger Exorzismus - 100% serverseitig)
+-- 21. RPC: exorcise (Geisterjäger Exorzismus + Punkte-Log)
 -- ==============================================================================
 create or replace function public.exorcise(
   p_hunter_id text,
@@ -830,6 +876,8 @@ declare
   v_cooldown_until timestamptz;
   v_is_evil boolean := false;
   v_now timestamptz := now();
+  v_kill_id text := gen_random_uuid()::text;
+  v_new_points integer;
 begin
   if p_hunter_id = p_target_id then
     return jsonb_build_object('success', false, 'error', 'Du kannst dich nicht selbst exorzieren!');
@@ -887,30 +935,40 @@ begin
   v_is_evil := (v_target_team = 'Böse') or (v_target_role in ('Vampir', 'Werwolf', 'Geist'));
 
   if v_is_evil then
-    -- Treffer! Ziel tot, +25 Pkt, 15 Min Cooldown
+    -- Treffer!
     v_cooldown_minutes := coalesce((v_settings->>'hunterHitCooldownMinutes')::integer, 15);
     v_cooldown_until := v_now + (v_cooldown_minutes * interval '1 minute');
 
     update public.players
     set status = 'tot',
-        pending_death_at = null
+        pending_death_at = null,
+        updated_at = v_now
     where id = p_target_id;
 
-    update public.players
-    set points = points + coalesce((v_settings->>'pointsExorcismSuccess')::integer, 25),
-        kills_count = kills_count + 1,
-        cooldown_until = v_cooldown_until
-    where id = p_hunter_id;
-
     insert into public.kills (
-      killer_id, victim_id, killer_name, victim_name,
+      id, killer_id, victim_id, killer_name, victim_name,
       killer_role, victim_role, killer_team, victim_team,
       reason, exorcism_hit, confirmed, confirmed_at, created_at
     ) values (
-      v_hunter.id, v_target.id, v_hunter.name, v_target.name,
+      v_kill_id, v_hunter.id, v_target.id, v_hunter.name, v_target.name,
       'Geisterjäger', v_target_role, 'Gut', 'Böse',
       'exorcism', true, true, v_now, v_now
     );
+
+    insert into public.points_log (player_id, reason, amount, ref_id, created_at)
+    values (p_hunter_id, 'exorcism', coalesce((v_settings->>'pointsExorcismSuccess')::integer, 25), v_kill_id, v_now)
+    on conflict (reason, ref_id) do nothing;
+
+    select coalesce(sum(amount), 0) into v_new_points
+    from public.points_log
+    where player_id = p_hunter_id;
+
+    update public.players
+    set points = v_new_points,
+        kills_count = kills_count + 1,
+        cooldown_until = v_cooldown_until,
+        updated_at = v_now
+    where id = p_hunter_id;
 
     return jsonb_build_object(
       'success', true,
@@ -922,20 +980,21 @@ begin
       'message', 'Treffer! ' || v_target.name || ' war ein ' || v_target_role || ' und wurde gebannt! (+25 Punkte)'
     );
   else
-    -- Fehlschuss! Ziel bleibt am Leben, Jäger 30 Min gesperrt
+    -- Fehlschuss!
     v_cooldown_minutes := coalesce((v_settings->>'hunterMissPenaltyMinutes')::integer, 30);
     v_cooldown_until := v_now + (v_cooldown_minutes * interval '1 minute');
 
     update public.players
-    set cooldown_until = v_cooldown_until
+    set cooldown_until = v_cooldown_until,
+        updated_at = v_now
     where id = p_hunter_id;
 
     insert into public.kills (
-      killer_id, victim_id, killer_name, victim_name,
+      id, killer_id, victim_id, killer_name, victim_name,
       killer_role, victim_role, killer_team, victim_team,
       reason, exorcism_hit, confirmed, confirmed_at, created_at
     ) values (
-      v_hunter.id, v_target.id, v_hunter.name, v_target.name,
+      v_kill_id, v_hunter.id, v_target.id, v_hunter.name, v_target.name,
       'Geisterjäger', 'Unschuldig', 'Gut', 'Gut',
       'exorcism', false, true, v_now, v_now
     );
@@ -952,154 +1011,208 @@ begin
   end if;
 end;
 $$;
-
 grant execute on function public.exorcise(text, text) to anon, authenticated, service_role;
 
 -- ==============================================================================
--- 21. RPC: admin_confirm_kill, admin_revive_player, admin_restart_game
+-- 22. RPC: assign_roles (Rollenverteilung)
 -- ==============================================================================
-create or replace function public.admin_confirm_kill(
-  p_admin_code text,
-  p_victim_id text,
-  p_killer_id text default null
-)
+create or replace function public.assign_roles()
 returns jsonb
 language plpgsql
 security definer
 as $$
 declare
-  v_victim record;
-  v_killer record;
-  v_now timestamptz := now();
+  v_player_ids text[];
+  v_total integer := 0;
+  v_vampires integer := 0;
+  v_werewolves integer := 0;
+  v_ghosts integer := 0;
+  v_hunters integer := 0;
+  v_humans integer := 0;
+  v_min_humans integer := 0;
+  v_max_special integer := 0;
+  v_special_sum integer := 0;
+  v_deck text[] := array[]::text[];
+  v_i integer;
+  v_assigned_role text;
+  v_assigned_team text;
+  v_settings jsonb;
+  v_vampire_pct numeric := 6;
+  v_werewolf_pct numeric := 4;
+  v_ghost_pct numeric := 4;
+  v_hunter_pct numeric := 10;
+  v_result jsonb;
 begin
-  if not public.check_admin_code(p_admin_code) then
-    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  select settings into v_settings from public.game_state where id = 'main';
+  if v_settings is not null then
+    if (v_settings->>'vampirePercent') is not null then
+      v_vampire_pct := (v_settings->>'vampirePercent')::numeric;
+    end if;
+    if (v_settings->>'werewolfPercent') is not null then
+      v_werewolf_pct := (v_settings->>'werewolfPercent')::numeric;
+    end if;
+    if (v_settings->>'ghostPercent') is not null then
+      v_ghost_pct := (v_settings->>'ghostPercent')::numeric;
+    end if;
+    if (v_settings->>'hunterPercent') is not null then
+      v_hunter_pct := (v_settings->>'hunterPercent')::numeric;
+    end if;
   end if;
 
-  select * into v_victim from public.players where id = p_victim_id for update;
-  if not found then
-    return jsonb_build_object('success', false, 'error', 'Opfer nicht gefunden');
+  select array_agg(id order by random())
+  into v_player_ids
+  from public.players
+  where status != 'entfernt';
+
+  v_total := coalesce(array_length(v_player_ids, 1), 0);
+  if v_total = 0 then
+    return jsonb_build_object('success', false, 'message', 'Keine aktiven Spieler vorhanden');
   end if;
 
-  update public.players
-  set status = 'tot',
-      pending_death_at = null
-  where id = p_victim_id;
+  if v_total = 1 then
+    v_humans := 1;
+  elsif v_total = 2 then
+    v_vampires := 1;
+    v_hunters := 1;
+  elsif v_total = 3 then
+    v_vampires := 1;
+    v_hunters := 1;
+    v_humans := 1;
+  elsif v_total = 4 then
+    v_vampires := 1;
+    v_werewolves := 1;
+    v_hunters := 1;
+    v_humans := 1;
+  elsif v_total = 5 then
+    v_vampires := 1;
+    v_werewolves := 1;
+    v_ghosts := 1;
+    v_hunters := 1;
+    v_humans := 1;
+  else
+    v_min_humans := greatest(1, floor(v_total * 0.40)::integer);
+    v_max_special := greatest(0, v_total - v_min_humans);
 
-  if p_killer_id is not null then
-    select * into v_killer from public.players where id = p_killer_id;
+    v_vampires := greatest(1, round(v_total * v_vampire_pct / 100.0)::integer);
+    v_werewolves := greatest(1, round(v_total * v_werewolf_pct / 100.0)::integer);
+    v_ghosts := greatest(1, round(v_total * v_ghost_pct / 100.0)::integer);
+    v_hunters := greatest(1, round(v_total * v_hunter_pct / 100.0)::integer);
+
+    v_special_sum := v_vampires + v_werewolves + v_ghosts + v_hunters;
+    while v_special_sum > v_max_special loop
+      if v_hunters > 1 then v_hunters := v_hunters - 1;
+      elsif v_vampires > 1 then v_vampires := v_vampires - 1;
+      elsif v_werewolves > 1 then v_werewolves := v_werewolves - 1;
+      elsif v_ghosts > 1 then v_ghosts := v_ghosts - 1;
+      else exit;
+      end if;
+      v_special_sum := v_vampires + v_werewolves + v_ghosts + v_hunters;
+    end loop;
+
+    v_humans := greatest(0, v_total - (v_vampires + v_werewolves + v_ghosts + v_hunters));
   end if;
 
-  insert into public.kills (
-    killer_id, victim_id, killer_name, victim_name,
-    killer_role, victim_role, reason, confirmed, confirmed_at, created_at
-  ) values (
-    case when v_killer.id is not null then v_killer.id else null end,
-    v_victim.id,
-    case when v_killer.name is not null then v_killer.name else 'Admin-Bestätigung' end,
-    v_victim.name,
-    case when v_killer.role is not null then v_killer.role else 'Unbekannt' end,
-    v_victim.role,
-    'admin_confirmed',
-    true,
-    v_now,
-    v_now
+  for v_i in 1..v_vampires loop v_deck := array_append(v_deck, 'Vampir'); end loop;
+  for v_i in 1..v_werewolves loop v_deck := array_append(v_deck, 'Werwolf'); end loop;
+  for v_i in 1..v_ghosts loop v_deck := array_append(v_deck, 'Geist'); end loop;
+  for v_i in 1..v_hunters loop v_deck := array_append(v_deck, 'Geisterjäger'); end loop;
+  for v_i in 1..v_humans loop v_deck := array_append(v_deck, 'Mensch'); end loop;
+
+  while array_length(v_deck, 1) < v_total loop
+    v_deck := array_append(v_deck, 'Mensch');
+  end loop;
+
+  for v_i in 1..v_total loop
+    v_assigned_role := v_deck[v_i];
+    v_assigned_team := case when v_assigned_role in ('Vampir', 'Werwolf', 'Geist') then 'Böse' else 'Gut' end;
+
+    insert into public.player_roles (player_id, role, team, updated_at)
+    values (v_player_ids[v_i], v_assigned_role, v_assigned_team, now())
+    on conflict (player_id) do update set
+      role = excluded.role,
+      team = excluded.team,
+      updated_at = now();
+
+    update public.players
+    set role = v_assigned_role,
+        team = v_assigned_team,
+        status = 'lebendig',
+        pending_death_at = null,
+        updated_at = now()
+    where id = v_player_ids[v_i];
+  end loop;
+
+  v_result := jsonb_build_object(
+    'success', true,
+    'total', v_total,
+    'vampires', v_vampires,
+    'werewolves', v_werewolves,
+    'ghosts', v_ghosts,
+    'hunters', v_hunters,
+    'humans', v_humans
   );
 
-  return jsonb_build_object('success', true, 'message', 'Kill vom Admin bestätigt.');
+  return v_result;
 end;
 $$;
+grant execute on function public.assign_roles() to anon, authenticated, service_role;
 
-grant execute on function public.admin_confirm_kill(text, text, text) to anon, authenticated, service_role;
-
-create or replace function public.admin_revive_player(
-  p_admin_code text,
-  p_player_id text
-)
-returns jsonb
-language plpgsql
-security definer
-as $$
-begin
-  if not public.check_admin_code(p_admin_code) then
-    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
-  end if;
-
-  update public.players
-  set status = 'lebendig',
-      pending_death_at = null
-  where id = p_player_id;
-
-  return jsonb_build_object('success', true, 'message', 'Spieler erfolgreich wiederbelebt.');
-end;
-$$;
-
-grant execute on function public.admin_revive_player(text, text) to anon, authenticated, service_role;
-
-create or replace function public.admin_restart_game(
-  p_admin_code text,
-  p_keep_players boolean default true,
-  p_keep_photos boolean default true
-)
+-- ==============================================================================
+-- 23. RPC: start_game
+-- ==============================================================================
+create or replace function public.start_game(p_admin_code text)
 returns jsonb
 language plpgsql
 security definer
 as $$
 declare
+  v_state record;
+  v_active_count integer;
   v_now timestamptz := now();
+  v_res jsonb;
 begin
   if not public.check_admin_code(p_admin_code) then
     return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
   end if;
 
-  -- Kills und Aufgaben immer leeren
-  delete from public.kills;
-  delete from public.player_photo_tasks;
-  delete from public.special_tasks;
-  delete from public.task_completions;
-
-  if not p_keep_photos then
-    delete from public.photos;
+  select * into v_state from public.game_state where id = 'main' for update;
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'Spielzustand nicht gefunden');
   end if;
 
-  if not p_keep_players then
-    delete from public.player_roles;
-    delete from public.players;
-  else
-    update public.players
-    set status = 'lebendig',
-        points = 0,
-        kills_count = 0,
-        tasks_completed_count = 0,
-        cooldown_until = null,
-        last_kill_at = null,
-        pending_death_at = null,
-        role = 'unassigned',
-        team = 'Gut';
-
-    delete from public.player_roles;
+  if v_state.status = 'Läuft' then
+    return jsonb_build_object('success', true, 'message', 'Spiel läuft bereits.');
   end if;
+
+  select count(*) into v_active_count from public.players where status != 'entfernt';
+  if v_active_count = 0 then
+    return jsonb_build_object('success', false, 'error', 'Mindestens 1 Spieler muss beigetreten sein.');
+  end if;
+
+  v_res := public.assign_roles();
 
   update public.game_state
-  set status = 'Lobby',
-      started_at = null,
+  set status = 'Läuft',
+      started_at = v_now,
       ended_at = null,
-      active_full_moon = null,
-      next_full_moon_at = null,
       winner_team = null,
-      last_special_task_at = null,
-      last_tick_at = null,
+      active_full_moon = null,
+      next_full_moon_at = v_now + ((floor(random() * 21) + 20) * interval '1 minute'),
+      last_special_task_at = v_now,
+      next_special_task_interval_minutes = 15,
+      last_tick_at = v_now,
       updated_at = v_now
   where id = 'main';
 
-  return jsonb_build_object('success', true, 'message', 'Spiel erfolgreich neugestartet!');
+  perform public.tick_game();
+
+  return jsonb_build_object('success', true, 'message', 'Spiel erfolgreich gestartet!');
 end;
 $$;
-
-grant execute on function public.admin_restart_game(text, boolean, boolean) to anon, authenticated, service_role;
+grant execute on function public.start_game(text) to anon, authenticated, service_role;
 
 -- ==============================================================================
--- 22. RPC: tick_game (Vollständige Automation, Vollmond, Fotos, Spezialaufgaben)
+-- 24. RPC: tick_game
 -- ==============================================================================
 create or replace function public.tick_game()
 returns jsonb
@@ -1165,14 +1278,11 @@ begin
   v_elapsed_seconds := extract(epoch from (v_now - v_game_state.started_at));
   v_elapsed_minutes := floor(v_elapsed_seconds / 60);
 
-  -- ----------------------------------------------------------------------------
-  -- A) VOLLMOND AUTOMATION (Alle 20-40 Min, Dauer 5 Min)
-  -- ----------------------------------------------------------------------------
+  -- A) VOLLMOND AUTOMATION
   v_moon_min_interval := coalesce((v_settings->>'fullMoonMinIntervalMinutes')::integer, 20);
   v_moon_max_interval := coalesce((v_settings->>'fullMoonMaxIntervalMinutes')::integer, 40);
   v_moon_duration_min := coalesce((v_settings->>'fullMoonDurationMinutes')::integer, 5);
 
-  -- 1. Prüfen ob aktiver Vollmond abgelaufen ist
   if v_game_state.active_full_moon is not null then
     if v_now >= (v_game_state.active_full_moon->>'endsAt')::timestamptz then
       update public.game_state
@@ -1182,7 +1292,6 @@ begin
       v_moon_action := 'ended';
     end if;
   else
-    -- 2. Prüfen ob neuer Vollmond gestartet werden soll
     if v_game_state.next_full_moon_at is null then
       update public.game_state
       set next_full_moon_at = v_now + ((floor(random() * (v_moon_max_interval - v_moon_min_interval + 1)) + v_moon_min_interval) * interval '1 minute')
@@ -1201,9 +1310,7 @@ begin
     end if;
   end if;
 
-  -- ----------------------------------------------------------------------------
   -- B) PENDING DEATHS PRÜFEN (Timeout nach 4 Minuten)
-  -- ----------------------------------------------------------------------------
   v_pending_timeout_min := coalesce((v_settings->>'pendingDeathTimeoutMinutes')::integer, 4);
   v_unconfirmed_action := coalesce(v_settings->>'unconfirmedKillAction', 'revive');
 
@@ -1216,7 +1323,8 @@ begin
     if v_unconfirmed_action = 'stay_dead' then
       update public.players
       set status = 'tot',
-          pending_death_at = null
+          pending_death_at = null,
+          updated_at = v_now
       where id = v_expired_pending.id;
 
       insert into public.kills (
@@ -1231,7 +1339,8 @@ begin
     else
       update public.players
       set status = 'lebendig',
-          pending_death_at = null
+          pending_death_at = null,
+          updated_at = v_now
       where id = v_expired_pending.id;
 
       insert into public.kills (
@@ -1247,9 +1356,7 @@ begin
     v_expired_count := v_expired_count + 1;
   end loop;
 
-  -- ----------------------------------------------------------------------------
-  -- C) FOTO-AUFGABEN (Alle 10 Min, max 3 offen, 30 Min Verfall, kein Target-Doppel)
-  -- ----------------------------------------------------------------------------
+  -- C) FOTO-AUFGABEN (Status = expired nach 30 Min, neue Slots erzeugen)
   update public.player_photo_tasks
   set status = 'expired'
   where status = 'open' and v_now > expires_at;
@@ -1274,14 +1381,12 @@ begin
         select 1 from public.player_photo_tasks
         where player_id = v_living_players.id and slot_number = v_current_slot
       ) then
-        -- Letztes Ziel ermitteln
         select target_player_id into v_last_target_id
         from public.player_photo_tasks
         where player_id = v_living_players.id
         order by slot_number desc
         limit 1;
 
-        -- Ziel suchen: lebendig, nicht selbst, nicht im ausstehenden Tod, nicht zweimal dieselbe Person hintereinander
         select * into v_random_target
         from public.players
         where status = 'lebendig'
@@ -1347,9 +1452,7 @@ begin
     end if;
   end loop;
 
-  -- ----------------------------------------------------------------------------
-  -- D) SPEZIALAUFGABEN (Nur lebende Menschen, alle 10-20 Min, 10 Min Frist)
-  -- ----------------------------------------------------------------------------
+  -- D) SPEZIALAUFGABEN (Für lebende Menschen, alle 10-20 Min)
   update public.special_tasks
   set status = 'expired'
   where status = 'pending' and v_now > expires_at;
@@ -1359,76 +1462,53 @@ begin
 
   if v_last_special is null or (v_now >= v_last_special + (v_special_interval_min * interval '1 minute')) then
     for v_human_id in
-      select id from public.players
-      where (role = 'Mensch' or team = 'Gut')
-        and status = 'lebendig'
-        and pending_death_at is null
-        and id not in (select player_id from public.special_tasks where status = 'pending')
-      order by random()
-      limit (floor(random() * 2) + 1)
+      select p.id
+      from public.players p
+      left join public.player_roles pr on pr.player_id = p.id
+      where p.status = 'lebendig'
+        and p.pending_death_at is null
+        and (coalesce(pr.role, p.role) = 'Mensch')
     loop
-      v_special_type_int := floor(random() * 5) + 1;
+      if not exists (
+        select 1 from public.special_tasks
+        where player_id = v_human_id and status = 'pending' and expires_at > v_now
+      ) then
+        v_special_type_int := floor(random() * 5) + 1;
+        if v_special_type_int = 1 then
+          v_special_type := 'math';
+          v_special_title := 'Kopfrechnen unter Zeitdruck';
+          v_special_desc := 'Löse 3 Mathe-Aufgaben im Kopf innerhalb von 60 Sekunden!';
+          v_special_data := jsonb_build_object('timeLimitSeconds', 60);
+        elsif v_special_type_int = 2 then
+          v_special_type := 'anagram';
+          v_special_title := 'Halloween-Anagramm';
+          v_special_desc := 'Bringe die durcheinandergewürfelten Buchstaben in die richtige Reihenfolge!';
+          v_special_data := jsonb_build_object('timeLimitSeconds', 60);
+        elsif v_special_type_int = 3 then
+          v_special_type := 'sequence';
+          v_special_title := 'Merk-Sequenz';
+          v_special_desc := 'Präge dir die Halloween-Symbole ein und gib sie fehlerfrei wieder!';
+          v_special_data := jsonb_build_object('timeLimitSeconds', 60);
+        elsif v_special_type_int = 4 then
+          v_special_type := 'quiz';
+          v_special_title := 'Halloween-Horror-Quiz';
+          v_special_desc := 'Beantworte die Schätzfrage oder das Grusel-Rätsel!';
+          v_special_data := jsonb_build_object('timeLimitSeconds', 45);
+        else
+          v_special_type := 'code';
+          v_special_title := 'Geheimcode knacken';
+          v_special_desc := 'Entziffere den 4-stelligen Schloss-Code anhand der Hinweise!';
+          v_special_data := jsonb_build_object('timeLimitSeconds', 45);
+        end if;
 
-      -- Bösen Mitspieler suchen, der diesem Menschen noch nicht aufgedeckt wurde
-      select * into v_evil_target
-      from public.players
-      where status = 'lebendig'
-        and pending_death_at is null
-        and (role in ('Vampir', 'Werwolf', 'Geist') or team = 'Böse')
-        and id != v_human_id
-        and id not in (
-          select reward_player_id from public.special_tasks
-          where player_id = v_human_id and reward_player_id is not null
-        )
-      order by random()
-      limit 1;
+        insert into public.special_tasks (
+          player_id, type, title, description, points, task_data, status, created_at, expires_at
+        ) values (
+          v_human_id, v_special_type, v_special_title, v_special_desc, 20, v_special_data, 'pending', v_now, v_now + interval '10 minutes'
+        );
 
-      if v_evil_target.id is null then
-        select * into v_evil_target
-        from public.players
-        where status = 'lebendig' and pending_death_at is null and id != v_human_id
-        order by random()
-        limit 1;
+        v_created_special_tasks := v_created_special_tasks + 1;
       end if;
-
-      if v_special_type_int = 1 then
-        v_special_type := 'math';
-        v_special_title := 'Kopfrechnen-Challenge';
-        v_special_desc := 'Löse 3 Rechenaufgaben in 60 Sekunden!';
-        v_special_data := jsonb_build_object('type', 'math', 'timeLimitSeconds', 60);
-      elsif v_special_type_int = 2 then
-        v_special_type := 'anagram';
-        v_special_title := 'Halloween-Anagramm';
-        v_special_desc := 'Entschlüssele das Gruselwort in 30 Sekunden!';
-        v_special_data := jsonb_build_object('type', 'anagram', 'timeLimitSeconds', 30);
-      elsif v_special_type_int = 3 then
-        v_special_type := 'sequence';
-        v_special_title := 'Merk-Sequenz';
-        v_special_desc := 'Merke dir die Reihenfolge der 5 Grusel-Symbole!';
-        v_special_data := jsonb_build_object('type', 'sequence', 'timeLimitSeconds', 40);
-      elsif v_special_type_int = 4 then
-        v_special_type := 'quiz';
-        v_special_title := 'Halloween-Quizfrage';
-        v_special_desc := 'Beantworte die Gruselfrage in 20 Sekunden!';
-        v_special_data := jsonb_build_object('type', 'quiz', 'timeLimitSeconds', 20);
-      else
-        v_special_type := 'code';
-        v_special_title := 'Geheimcode knacken';
-        v_special_desc := 'Finde den 4-stelligen Zahlencode in 45 Sekunden heraus!';
-        v_special_data := jsonb_build_object('type', 'code', 'timeLimitSeconds', 45);
-      end if;
-
-      insert into public.special_tasks (
-        player_id, type, title, description, points, task_data, attempts,
-        reward_player_id, reward_player_name, reward_role,
-        status, created_at, expires_at
-      ) values (
-        v_human_id, v_special_type, v_special_title, v_special_desc, 20, v_special_data, 0,
-        v_evil_target.id, v_evil_target.name, coalesce(v_evil_target.role, 'Vampir'),
-        'pending', v_now, v_now + interval '10 minutes'
-      );
-
-      v_created_special_tasks := v_created_special_tasks + 1;
     end loop;
 
     update public.game_state
@@ -1437,52 +1517,213 @@ begin
     where id = 'main';
   end if;
 
-  -- Zeitstempel aktualisieren
   update public.game_state
-  set last_tick_at = v_now
+  set last_tick_at = v_now,
+      updated_at = v_now
   where id = 'main';
 
   v_result := jsonb_build_object(
-    'status', 'ok',
+    'status', 'success',
     'tick_at', v_now,
-    'elapsed_minutes', v_elapsed_minutes,
     'moon_action', v_moon_action,
-    'expired_pending_deaths', v_expired_count,
+    'expired_pending_count', v_expired_count,
     'created_photo_tasks', v_created_photo_tasks,
     'created_special_tasks', v_created_special_tasks
   );
 
-  -- Protokoll in tick_log schreiben
-  insert into public.tick_log (tick_at, status, details)
-  values (v_now, 'success', v_result);
+  insert into public.tick_log (status, details)
+  values ('success', v_result);
 
   return v_result;
-
 exception when others then
-  insert into public.tick_log (tick_at, status, error_message)
-  values (now(), 'error', SQLERRM);
+  insert into public.tick_log (status, error_message)
+  values ('error', SQLERRM);
   return jsonb_build_object('status', 'error', 'error', SQLERRM);
 end;
 $$;
-
 grant execute on function public.tick_game() to anon, authenticated, service_role;
 
 -- ==============================================================================
--- 23. CRON SCHEDULER: pg_cron minütlicher Job
+-- 25. RPC: admin_confirm_kill, admin_revive_player, admin_restart_game
+-- ==============================================================================
+create or replace function public.admin_confirm_kill(
+  p_admin_code text,
+  p_victim_id text,
+  p_killer_id text default null
+)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_victim record;
+  v_killer record;
+  v_now timestamptz := now();
+  v_kill_id text := gen_random_uuid()::text;
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  select * into v_victim from public.players where id = p_victim_id for update;
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'Opfer nicht gefunden');
+  end if;
+
+  update public.players
+  set status = 'tot',
+      pending_death_at = null,
+      updated_at = v_now
+  where id = p_victim_id;
+
+  if p_killer_id is not null then
+    select * into v_killer from public.players where id = p_killer_id;
+  end if;
+
+  insert into public.kills (
+    id, killer_id, victim_id, killer_name, victim_name,
+    killer_role, victim_role, reason, confirmed, confirmed_at, created_at
+  ) values (
+    v_kill_id,
+    case when v_killer.id is not null then v_killer.id else null end,
+    v_victim.id,
+    case when v_killer.name is not null then v_killer.name else 'Admin-Bestätigung' end,
+    v_victim.name,
+    case when v_killer.role is not null then v_killer.role else 'Unbekannt' end,
+    v_victim.role,
+    'admin_confirmed',
+    true,
+    v_now,
+    v_now
+  );
+
+  return jsonb_build_object('success', true, 'message', 'Kill vom Admin bestätigt.');
+end;
+$$;
+grant execute on function public.admin_confirm_kill(text, text, text) to anon, authenticated, service_role;
+
+create or replace function public.admin_revive_player(
+  p_admin_code text,
+  p_player_id text
+)
+returns jsonb
+language plpgsql
+security definer
+as $$
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  update public.players
+  set status = 'lebendig',
+      pending_death_at = null,
+      updated_at = now()
+  where id = p_player_id;
+
+  return jsonb_build_object('success', true, 'message', 'Spieler erfolgreich wiederbelebt.');
+end;
+$$;
+grant execute on function public.admin_revive_player(text, text) to anon, authenticated, service_role;
+
+create or replace function public.admin_restart_game(
+  p_admin_code text,
+  p_keep_players boolean default true,
+  p_keep_photos boolean default true
+)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_now timestamptz := now();
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  delete from public.points_log;
+  delete from public.kills;
+  delete from public.player_photo_tasks;
+  delete from public.special_tasks;
+  delete from public.task_completions;
+
+  if not p_keep_photos then
+    delete from public.photos;
+  end if;
+
+  if not p_keep_players then
+    delete from public.player_roles;
+    delete from public.players;
+  else
+    update public.players
+    set status = 'lebendig',
+        points = 0,
+        kills_count = 0,
+        tasks_completed_count = 0,
+        cooldown_until = null,
+        last_kill_at = null,
+        pending_death_at = null,
+        role = 'unassigned',
+        team = 'Gut',
+        updated_at = v_now;
+
+    delete from public.player_roles;
+  end if;
+
+  update public.game_state
+  set status = 'Lobby',
+      started_at = null,
+      ended_at = null,
+      active_full_moon = null,
+      next_full_moon_at = null,
+      winner_team = null,
+      last_special_task_at = null,
+      last_tick_at = null,
+      updated_at = v_now
+  where id = 'main';
+
+  return jsonb_build_object('success', true, 'message', 'Spiel erfolgreich neugestartet!');
+end;
+$$;
+grant execute on function public.admin_restart_game(text, boolean, boolean) to anon, authenticated, service_role;
+
+-- ==============================================================================
+-- 26. CRON JOB: tick_game() jede Minute
 -- ==============================================================================
 do $$
 begin
-  perform cron.unschedule('halloween-tick-game');
+  if exists (select 1 from pg_extension where extname = 'pg_cron') then
+    begin
+      perform cron.unschedule('halloween_tick_job');
+    exception when others then null;
+    end;
+
+    perform cron.schedule(
+      'halloween_tick_job',
+      '* * * * *',
+      'select public.tick_game();'
+    );
+  end if;
 exception when others then null;
 end;
 $$;
 
+-- ==============================================================================
+-- 27. REALTIME PUBLICATION & SCHEMA CACHE RELOAD
+-- ==============================================================================
 do $$
 begin
-  perform cron.schedule('halloween-tick-game', '* * * * *', 'select public.tick_game()');
+  alter publication supabase_realtime add table public.game_state;
+  alter publication supabase_realtime add table public.players;
+  alter publication supabase_realtime add table public.kills;
+  alter publication supabase_realtime add table public.player_photo_tasks;
+  alter publication supabase_realtime add table public.photos;
+  alter publication supabase_realtime add table public.special_tasks;
+  alter publication supabase_realtime add table public.points_log;
 exception when others then null;
 end;
 $$;
 
--- Schema-Cache von Supabase PostgREST sofort aktualisieren
+-- PostgREST Schema-Cache sofort neu laden
 notify pgrst, 'reload schema';

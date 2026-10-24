@@ -72,6 +72,7 @@ interface PlayerAreaProps {
   onDeletePhoto: (photoId: string) => Promise<void>;
   onRequestAdminUnlock?: () => void;
   isAdminUnlocked?: boolean;
+  onToast?: (message: string, type?: 'success' | 'error' | 'info') => void;
 }
 
 export const PlayerArea: React.FC<PlayerAreaProps> = ({
@@ -93,6 +94,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   onDeletePhoto,
   onRequestAdminUnlock,
   isAdminUnlocked,
+  onToast,
 }) => {
   // Secret Role reveal toggle
   const [isRoleSecretRevealed, setIsRoleSecretRevealed] = useState(false);
@@ -257,19 +259,68 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   }, [gameState.status, gameState.startedAt, photoIntervalMin, liveNow]);
 
-  // Open photo tasks for current player (max 3, non-expired)
-  const openPhotoTasks = useMemo(() => {
-    const list = photoTasks.filter(
-      (t) => t.status === 'open' && new Date(t.expiresAt).getTime() > liveNow
-    );
-    if (list.length > 0) return list.slice(0, 3);
+  // Sub-tabs in Aufgaben view: 'open' | 'completed' | 'expired'
+  const [taskSubTab, setTaskSubTab] = useState<'open' | 'completed' | 'expired'>('open');
+  const [localPhotoTasks, setLocalPhotoTasks] = useState<PlayerPhotoTask[]>(photoTasks);
+  const [localPointsDelta, setLocalPointsDelta] = useState<number>(0);
+  const [localCompletedDelta, setLocalCompletedDelta] = useState<number>(0);
 
-    // Fallback: Wenn noch keine Aufgaben in der DB existieren, generiere die erste Slot-Aufgabe
-    const otherLiving = players.filter((p) => p.id !== player.id && p.status === 'lebendig');
-    const randomTarget = otherLiving.length > 0 ? otherLiving[0] : null;
+  useEffect(() => {
+    setLocalPhotoTasks(photoTasks);
+    setLocalPointsDelta(0);
+    setLocalCompletedDelta(0);
+  }, [photoTasks, player.points]);
 
-    return [
-      {
+  // Aufteilung der Aufgaben in Offen, Erledigt, Abgelaufen
+  const { openPhotoTasks, completedPhotoTasksHistory, expiredPhotoTasks } = useMemo(() => {
+    const open: PlayerPhotoTask[] = [];
+    const completed: PlayerPhotoTask[] = [];
+    const expired: PlayerPhotoTask[] = [];
+    const seenTaskIds = new Set<string>();
+
+    localPhotoTasks.forEach((t) => {
+      seenTaskIds.add(t.id);
+      const statusLower = (t.status || 'open').toLowerCase();
+      const isPastExpiry = t.expiresAt ? new Date(t.expiresAt).getTime() <= liveNow : false;
+
+      if (statusLower === 'completed') {
+        completed.push(t);
+      } else if (statusLower === 'expired' || (statusLower === 'open' && isPastExpiry)) {
+        expired.push(t);
+      } else {
+        open.push(t);
+      }
+    });
+
+    // Auch eventuelle Einträge aus taskCompletions einbinden
+    taskCompletions
+      .filter((c) => c.playerId === player.id)
+      .forEach((c) => {
+        if (!seenTaskIds.has(c.taskId)) {
+          seenTaskIds.add(c.taskId);
+          completed.push({
+            id: c.taskId,
+            playerId: c.playerId,
+            slotNumber: 0,
+            title: c.taskTitle || 'Foto-Aufgabe',
+            description: c.taskTitle || 'Foto-Aufgabe',
+            taskType: 'group',
+            points: c.pointsAwarded || 10,
+            status: 'completed',
+            createdAt: c.completedAt,
+            expiresAt: c.completedAt,
+            completedAt: c.completedAt,
+            photoUrl: c.photoUrl,
+          });
+        }
+      });
+
+    // Fallback: Wenn Spiel läuft und noch überhaupt keine Aufgaben existieren
+    if (gameState.status === 'Läuft' && open.length === 0 && completed.length === 0 && expired.length === 0) {
+      const otherLiving = players.filter((p) => p.id !== player.id && p.status === 'lebendig');
+      const randomTarget = otherLiving.length > 0 ? otherLiving[0] : null;
+
+      open.push({
         id: `initial_slot_0_${player.id}`,
         playerId: player.id,
         slotNumber: 0,
@@ -285,15 +336,19 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
         status: 'open' as const,
         createdAt: new Date().toISOString(),
         expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
-      },
-    ];
-  }, [photoTasks, liveNow, players, player.id, gameState.settings.pointsPhotoTask]);
+      });
+    }
 
-  // Completed photo tasks history for current player
-  const completedPhotoTasksHistory = useMemo(() => {
-    const fromCompletions = taskCompletions.filter((c) => c.playerId === player.id);
-    return fromCompletions;
-  }, [taskCompletions, player.id]);
+    return {
+      openPhotoTasks: open.slice(0, 3),
+      completedPhotoTasksHistory: completed.sort(
+        (a, b) => new Date(b.completedAt || b.createdAt).getTime() - new Date(a.completedAt || a.createdAt).getTime()
+      ),
+      expiredPhotoTasks: expired.sort(
+        (a, b) => new Date(b.expiresAt).getTime() - new Date(a.expiresAt).getTime()
+      ),
+    };
+  }, [localPhotoTasks, taskCompletions, player.id, liveNow, players, gameState.status, gameState.settings.pointsPhotoTask]);
 
   // Handlers
   const handleConfirmKill = async (victimId: string, ghostSoloConfirmed?: boolean) => {
@@ -315,14 +370,53 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
 
   const handleCompletePhotoTask = async (photoBlobOrUrl: Blob | File | string) => {
     if (!activeTaskModal) return;
-    await gameApi.completePhotoTask({
-      playerId: player.id,
-      taskId: activeTaskModal.id,
-      taskTitle: activeTaskModal.title,
-      photoBlobOrUrl,
-    });
+    const completedTaskId = activeTaskModal.id;
+    const completedTaskTitle = activeTaskModal.title;
     setActiveTaskModal(null);
-    await onRefreshState();
+
+    // 1. Optimistisches Update sofort im React State:
+    setLocalPhotoTasks((prev) =>
+      prev.map((t) =>
+        t.id === completedTaskId
+          ? {
+              ...t,
+              status: 'completed' as const,
+              completedAt: new Date().toISOString(),
+            }
+          : t
+      )
+    );
+    setLocalPointsDelta((prev) => prev + 10);
+    setLocalCompletedDelta((prev) => prev + 1);
+    setTaskSubTab('completed'); // Sofort in den Reiter "Erledigt" wechseln!
+
+    try {
+      const res = await gameApi.completePhotoTask({
+        playerId: player.id,
+        taskId: completedTaskId,
+        taskTitle: completedTaskTitle,
+        photoBlobOrUrl,
+      });
+
+      if (onToast) {
+        onToast(`Aufgabe erledigt! +${res.pointsAwarded || 10} Punkte erhalten.`, 'success');
+      }
+
+      await onRefreshState();
+    } catch (err: any) {
+      console.error('Fehler beim Abschließen der Aufgabe:', err);
+      // Revert optimistic update
+      setLocalPhotoTasks(photoTasks);
+      setLocalPointsDelta(0);
+      setLocalCompletedDelta(0);
+
+      const msg = err?.message || 'Fehler beim Abschließen der Aufgabe';
+      if (onToast) {
+        onToast(msg, 'error');
+      } else {
+        alert(msg);
+      }
+    }
   };
 
   const handleSolveSpecialTask = async (params: any) => {
@@ -605,7 +699,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
             </div>
 
             <div className="text-right">
-              <span className="text-xs font-mono font-bold text-[#ff6b00] block">{player.points} Pkt</span>
+              <span className="text-xs font-mono font-bold text-[#ff6b00] block">{(player.points || 0) + localPointsDelta} Pkt</span>
               <span
                 className={`text-[10px] font-bold ${
                   player.status === 'lebendig' ? 'text-emerald-400' : 'text-rose-400'
@@ -797,7 +891,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                 Foto-Aufgaben (alle {photoIntervalMin} Min)
               </span>
               <h3 className="font-bold text-white text-sm">
-                Offene Aufgaben ({openPhotoTasks.length}/3)
+                Aufgaben-Übersicht
               </h3>
             </div>
             <div className="text-right">
@@ -808,103 +902,231 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
             </div>
           </div>
 
-          {/* LISTE DER OFFENEN FOTO-AUFGABEN */}
-          <div className="space-y-3">
-            {openPhotoTasks.map((t, idx) => {
-              const diffSec = Math.max(0, Math.floor((new Date(t.expiresAt).getTime() - liveNow) / 1000));
-              const expMin = Math.floor(diffSec / 60);
-              const expSec = diffSec % 60;
-              const formattedExp = `${expMin}:${expSec.toString().padStart(2, '0')}`;
+          {/* SUB-TABS: OFFEN / ERLEDIGT / ABGELAUFEN */}
+          <div className="flex rounded-2xl bg-zinc-900 p-1 border border-zinc-800 text-xs font-bold gap-1">
+            <button
+              type="button"
+              onClick={() => setTaskSubTab('open')}
+              className={`flex-1 py-2 rounded-xl transition cursor-pointer text-center flex items-center justify-center gap-1.5 ${
+                taskSubTab === 'open'
+                  ? 'bg-[#ff6b00] text-zinc-950 font-black shadow-sm'
+                  : 'text-zinc-400 hover:text-white'
+              }`}
+            >
+              <span>Offen</span>
+              <span className={`px-1.5 py-0.2 rounded-full text-[10px] ${
+                taskSubTab === 'open' ? 'bg-zinc-950/20 text-zinc-950 font-black' : 'bg-zinc-800 text-zinc-300'
+              }`}>
+                {openPhotoTasks.length}
+              </span>
+            </button>
 
-              return (
-                <div
-                  key={t.id}
-                  className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3 hover:border-zinc-700 transition"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="px-2.5 py-0.5 rounded-full bg-[#ff6b00]/15 text-[#ff6b00] text-[10px] font-bold uppercase tracking-wider">
-                      Aufgabe #{idx + 1}
-                    </span>
-                    <div className="flex items-center gap-2">
-                      <span className="text-[11px] font-mono text-zinc-400 flex items-center gap-1">
-                        <Clock className="w-3 h-3 text-amber-400" />
-                        noch {formattedExp}
-                      </span>
-                      <span className="text-xs font-mono font-bold text-[#ff6b00]">
-                        +{t.points} Pkt
-                      </span>
-                    </div>
+            <button
+              type="button"
+              onClick={() => setTaskSubTab('completed')}
+              className={`flex-1 py-2 rounded-xl transition cursor-pointer text-center flex items-center justify-center gap-1.5 ${
+                taskSubTab === 'completed'
+                  ? 'bg-emerald-600 text-white font-black shadow-sm'
+                  : 'text-zinc-400 hover:text-white'
+              }`}
+            >
+              <CheckCircle2 className="w-3.5 h-3.5" />
+              <span>Erledigt</span>
+              <span className={`px-1.5 py-0.2 rounded-full text-[10px] ${
+                taskSubTab === 'completed' ? 'bg-white/20 text-white font-black' : 'bg-zinc-800 text-zinc-300'
+              }`}>
+                {completedPhotoTasksHistory.length}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setTaskSubTab('expired')}
+              className={`flex-1 py-2 rounded-xl transition cursor-pointer text-center flex items-center justify-center gap-1.5 ${
+                taskSubTab === 'expired'
+                  ? 'bg-zinc-700 text-white font-black shadow-sm'
+                  : 'text-zinc-400 hover:text-white'
+              }`}
+            >
+              <span>Abgelaufen</span>
+              <span className={`px-1.5 py-0.2 rounded-full text-[10px] ${
+                taskSubTab === 'expired' ? 'bg-white/20 text-white font-black' : 'bg-zinc-800 text-zinc-300'
+              }`}>
+                {expiredPhotoTasks.length}
+              </span>
+            </button>
+          </div>
+
+          {/* TAB CONTENT: OFFEN */}
+          {taskSubTab === 'open' && (
+            <div className="space-y-3">
+              {openPhotoTasks.length === 0 ? (
+                <div className="p-8 rounded-3xl bg-zinc-900/60 border border-zinc-800 text-center space-y-2">
+                  <div className="w-12 h-12 mx-auto rounded-2xl bg-zinc-800 flex items-center justify-center text-zinc-500">
+                    <Clock className="w-6 h-6" />
                   </div>
+                  <h4 className="font-bold text-white text-sm">Aktuell keine offenen Aufgaben</h4>
+                  <p className="text-xs text-zinc-400 max-w-xs mx-auto">
+                    Neue Foto-Aufgaben erscheinen automatisch alle {photoIntervalMin} Minuten.
+                  </p>
+                </div>
+              ) : (
+                openPhotoTasks.map((t, idx) => {
+                  const diffSec = Math.max(0, Math.floor((new Date(t.expiresAt).getTime() - liveNow) / 1000));
+                  const expMin = Math.floor(diffSec / 60);
+                  const expSec = diffSec % 60;
+                  const formattedExp = `${expMin}:${expSec.toString().padStart(2, '0')}`;
 
-                  <div>
-                    <h4 className="font-bold text-white text-sm">{t.title}</h4>
-                    <p className="text-xs text-zinc-300 mt-0.5 leading-relaxed">{t.description}</p>
-                  </div>
+                  return (
+                    <div
+                      key={t.id}
+                      className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3 hover:border-zinc-700 transition"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="px-2.5 py-0.5 rounded-full bg-[#ff6b00]/15 text-[#ff6b00] text-[10px] font-bold uppercase tracking-wider">
+                          Aufgabe #{idx + 1}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[11px] font-mono text-zinc-400 flex items-center gap-1">
+                            <Clock className="w-3 h-3 text-amber-400" />
+                            noch {formattedExp}
+                          </span>
+                          <span className="text-xs font-mono font-bold text-[#ff6b00]">
+                            +{t.points} Pkt
+                          </span>
+                        </div>
+                      </div>
 
-                  {/* Target Preview (showing costume photo & costume name, NO roles) */}
-                  {(t.targetPlayerPhoto || t.targetPlayerName) && (
-                    <div className="flex items-center gap-2.5 p-2 rounded-2xl bg-zinc-950 border border-zinc-800">
-                      {t.targetPlayerPhoto && (
-                        <img
-                          src={t.targetPlayerPhoto}
-                          alt={t.targetPlayerName || 'Ziel'}
-                          className="w-10 h-10 rounded-xl object-cover border border-zinc-700 shrink-0"
-                        />
-                      )}
                       <div>
-                        <span className="text-[10px] text-zinc-400 block">Zielperson / Kostüm:</span>
-                        <span className="text-xs font-bold text-white block">
-                          {t.targetPlayerName} {t.targetPlayerCostume ? `als "${t.targetPlayerCostume}"` : ''}
+                        <h4 className="font-bold text-white text-sm">{t.title}</h4>
+                        <p className="text-xs text-zinc-300 mt-0.5 leading-relaxed">{t.description}</p>
+                      </div>
+
+                      {/* Target Preview */}
+                      {(t.targetPlayerPhoto || t.targetPlayerName) && (
+                        <div className="flex items-center gap-2.5 p-2 rounded-2xl bg-zinc-950 border border-zinc-800">
+                          {t.targetPlayerPhoto && (
+                            <img
+                              src={t.targetPlayerPhoto}
+                              alt={t.targetPlayerName || 'Ziel'}
+                              className="w-10 h-10 rounded-xl object-cover border border-zinc-700 shrink-0"
+                            />
+                          )}
+                          <div>
+                            <span className="text-[10px] text-zinc-400 block">Zielperson / Kostüm:</span>
+                            <span className="text-xs font-bold text-white block">
+                              {t.targetPlayerName} {t.targetPlayerCostume ? `als "${t.targetPlayerCostume}"` : ''}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setActiveTaskModal({
+                            id: t.id,
+                            title: t.title,
+                            desc: t.description,
+                          })
+                        }
+                        className="w-full py-2.5 rounded-2xl bg-gradient-to-r from-[#ff6b00] to-orange-600 hover:from-[#ff7c1f] hover:to-orange-500 text-zinc-950 font-black text-xs shadow-md shadow-orange-950 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95"
+                      >
+                        <Camera className="w-4 h-4" />
+                        Foto aufnehmen & lösen (+{t.points} Pkt)
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
+
+          {/* TAB CONTENT: ERLEDIGT */}
+          {taskSubTab === 'completed' && (
+            <div className="space-y-2">
+              {completedPhotoTasksHistory.length === 0 ? (
+                <div className="p-8 rounded-3xl bg-zinc-900/60 border border-zinc-800 text-center space-y-2">
+                  <div className="w-12 h-12 mx-auto rounded-2xl bg-zinc-800 flex items-center justify-center text-zinc-500">
+                    <CheckCircle2 className="w-6 h-6" />
+                  </div>
+                  <h4 className="font-bold text-white text-sm">Noch keine gelösten Aufgaben</h4>
+                  <p className="text-xs text-zinc-400 max-w-xs mx-auto">
+                    Mache Fotos für deine offenen Aufgaben, um Punkte zu sammeln!
+                  </p>
+                </div>
+              ) : (
+                completedPhotoTasksHistory.map((ch) => (
+                  <div
+                    key={ch.id}
+                    className="p-3 rounded-2xl bg-zinc-900/80 border border-zinc-800 text-xs flex items-center justify-between gap-3"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      {ch.photoUrl ? (
+                        <img
+                          src={ch.photoUrl}
+                          alt={ch.title}
+                          className="w-10 h-10 rounded-xl object-cover border border-emerald-500/40 shrink-0"
+                        />
+                      ) : (
+                        <div className="w-10 h-10 rounded-xl bg-emerald-950/60 border border-emerald-500/40 flex items-center justify-center text-emerald-400 shrink-0">
+                          <CheckCircle2 className="w-5 h-5" />
+                        </div>
+                      )}
+                      <div className="min-w-0">
+                        <span className="text-zinc-100 font-bold block truncate">{ch.title || 'Foto-Aufgabe'}</span>
+                        <span className="text-[10px] text-zinc-400 block">
+                          {ch.completedAt
+                            ? `Gelöst um ${new Date(ch.completedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                            : 'Erfolgreich abgeschlossen'}
                         </span>
                       </div>
                     </div>
-                  )}
-
-                  <button
-                    onClick={() =>
-                      setActiveTaskModal({
-                        id: t.id,
-                        title: t.title,
-                        desc: t.description,
-                      })
-                    }
-                    className="w-full py-2.5 rounded-2xl bg-gradient-to-r from-[#ff6b00] to-orange-600 hover:from-[#ff7c1f] hover:to-orange-500 text-zinc-950 font-black text-xs shadow-md shadow-orange-950 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95"
-                  >
-                    <Camera className="w-4 h-4" />
-                    Foto aufnehmen & lösen
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* VERLAUF ERLEDIGTER AUFGABEN */}
-          <div className="pt-3 border-t border-zinc-800 space-y-2">
-            <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">
-              Erledigte Aufgaben ({completedPhotoTasksHistory.length})
-            </h4>
-
-            {completedPhotoTasksHistory.length === 0 ? (
-              <p className="text-xs text-zinc-500 italic py-2">Noch keine Aufgaben gelöst.</p>
-            ) : (
-              <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
-                {completedPhotoTasksHistory.map((ch) => (
-                  <div
-                    key={ch.id}
-                    className="p-2.5 rounded-2xl bg-zinc-900/60 border border-zinc-800 text-xs flex items-center justify-between"
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                      <span className="text-zinc-200 truncate">{ch.taskTitle || 'Foto-Aufgabe'}</span>
-                    </div>
-                    <span className="text-xs font-mono font-bold text-emerald-400 shrink-0 ml-2">
-                      +{ch.pointsAwarded || 10} Pkt
+                    <span className="px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-400 font-mono font-black text-xs shrink-0">
+                      +{ch.points || 10} Pkt
                     </span>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {/* TAB CONTENT: ABGELAUFEN */}
+          {taskSubTab === 'expired' && (
+            <div className="space-y-2">
+              {expiredPhotoTasks.length === 0 ? (
+                <div className="p-8 rounded-3xl bg-zinc-900/60 border border-zinc-800 text-center space-y-2">
+                  <div className="w-12 h-12 mx-auto rounded-2xl bg-zinc-800 flex items-center justify-center text-zinc-500">
+                    <Check className="w-6 h-6 text-emerald-400" />
+                  </div>
+                  <h4 className="font-bold text-white text-sm">Keine Aufgaben abgelaufen</h4>
+                  <p className="text-xs text-zinc-400 max-w-xs mx-auto">
+                    Du hast alle bisherigen Aufgaben rechtzeitig erledigt oder keine ist abgelaufen.
+                  </p>
+                </div>
+              ) : (
+                expiredPhotoTasks.map((ex) => (
+                  <div
+                    key={ex.id}
+                    className="p-3 rounded-2xl bg-zinc-900/50 border border-zinc-800/80 text-xs flex items-center justify-between gap-3 opacity-75"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <Clock className="w-4 h-4 text-zinc-500 shrink-0" />
+                      <div className="min-w-0">
+                        <span className="text-zinc-300 font-medium block truncate">{ex.title}</span>
+                        <span className="text-[10px] text-zinc-500 block">
+                          Abgelaufen um {new Date(ex.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      </div>
+                    </div>
+                    <span className="px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-500 font-mono text-[10px] shrink-0">
+                      0 Pkt
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -928,7 +1150,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                 Punkte
               </span>
               <span className="font-mono font-black text-2xl text-white">
-                {player.points}
+                {(player.points || 0) + localPointsDelta}
               </span>
             </div>
           </div>

@@ -531,6 +531,18 @@ export default function App() {
                   onDeletePhoto={handlePlayerDeletePhoto}
                   onRequestAdminUnlock={() => setIsAdminModalOpen(true)}
                   isAdminUnlocked={isAdminUnlocked}
+                  onToast={(msg, type) => {
+                    if (type === 'error') {
+                      setErrorMessage({
+                        title: 'Fehler',
+                        detail: msg,
+                        timestamp: Date.now(),
+                      });
+                    } else {
+                      setSuccessToast(msg);
+                      setTimeout(() => setSuccessToast(null), 4000);
+                    }
+                  }}
                 />
               ) : (
                 <AdminArea
