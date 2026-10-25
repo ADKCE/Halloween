@@ -63,6 +63,7 @@ interface AdminAreaProps {
   onReassignRoles: () => Promise<void>;
   onAbortGame: () => Promise<void>;
   onEndGame: () => Promise<void>;
+  onReopenGame?: () => Promise<void>;
   onRestartGame: (keepPlayers: boolean) => Promise<void>;
   onPlayerAction: (playerId: string, action: 'entfernen' | 'wiederbeleben' | 'toeten' | 'pausieren') => Promise<void>;
   onUpdateSettings: (newSettings: Partial<GameSettings>) => Promise<void>;
@@ -91,6 +92,7 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   onReassignRoles,
   onAbortGame,
   onEndGame,
+  onReopenGame,
   onRestartGame,
   onPlayerAction,
   onUpdateSettings,
@@ -997,52 +999,100 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
             )}
 
             <div className="space-y-2.5 pt-1">
-              <button
-                onClick={onStartGame}
-                disabled={gameStatus === 'Läuft' || players.length === 0}
-                className={`w-full py-3.5 rounded-2xl font-black text-xs uppercase tracking-wider flex items-center justify-center gap-2 shadow-lg transition active:scale-95 cursor-pointer ${
-                  gameStatus === 'Läuft' || players.length === 0
-                    ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed opacity-50'
-                    : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-950'
-                }`}
-              >
-                <Play className="w-4 h-4 fill-current" />
-                Spiel starten (Rollen zuteilen)
-              </button>
+              {gameStatus === 'Beendet' ? (
+                <>
+                  <div className="p-4 rounded-2xl bg-gradient-to-r from-purple-950/80 to-zinc-950 border border-purple-500/60 text-center space-y-1.5 shadow-lg">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-purple-300 block">
+                      Status: Spiel beendet
+                    </span>
+                    <p className="text-xs text-zinc-300">
+                      Das Spiel befindet sich im Endzustand. Alle Daten (Punkte, Kills, Aufgaben) bleiben erhalten.
+                    </p>
+                  </div>
 
-              <button
-                onClick={handleConfirmEndGame}
-                disabled={gameStatus !== 'Läuft'}
-                className={`w-full py-3 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition cursor-pointer ${
-                  gameStatus !== 'Läuft'
-                    ? 'bg-zinc-800 text-zinc-500 opacity-50 cursor-not-allowed'
-                    : 'bg-amber-600 hover:bg-amber-500 text-zinc-950 font-black shadow-lg shadow-amber-950'
-                }`}
-              >
-                <Award className="w-4 h-4" />
-                Spiel regulär beenden (Auswertung)
-              </button>
+                  {onReopenGame && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (confirm('Möchtest du das Spiel wieder öffnen? Der Status wechselt zurück auf "Läuft", alle bestehenden Punkte, Rollen und Kills bleiben unverändert erhalten.')) {
+                          await onReopenGame();
+                        }
+                      }}
+                      className="w-full py-3.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs uppercase tracking-wider shadow-lg shadow-emerald-950 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95"
+                    >
+                      <Play className="w-4 h-4 fill-current" />
+                      <span>Spiel wieder öffnen (Status: Läuft)</span>
+                    </button>
+                  )}
 
-              <button
-                onClick={handleConfirmAbortGame}
-                disabled={gameStatus !== 'Läuft'}
-                className={`w-full py-3 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition cursor-pointer ${
-                  gameStatus !== 'Läuft'
-                    ? 'bg-zinc-800 text-zinc-500 opacity-50 cursor-not-allowed'
-                    : 'bg-rose-700 hover:bg-rose-600 text-white'
-                }`}
-              >
-                <Square className="w-4 h-4 fill-current" />
-                Spiel abbrechen (Zurück zur Lobby)
-              </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsRestartModalOpen(true)}
+                    className="w-full py-3 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200 transition cursor-pointer"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                    <span>Neustart...</span>
+                  </button>
 
-              <button
-                onClick={() => setIsRestartModalOpen(true)}
-                className="w-full py-3 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200 transition cursor-pointer"
-              >
-                <RotateCcw className="w-4 h-4" />
-                Neustart...
-              </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('emergency')}
+                    className="w-full py-2.5 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 bg-rose-950/60 hover:bg-rose-900/80 border border-rose-600/50 text-rose-300 transition cursor-pointer"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    <span>Alles zurücksetzen (Notfall-Panel)</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={onStartGame}
+                    disabled={gameStatus === 'Läuft' || players.length === 0}
+                    className={`w-full py-3.5 rounded-2xl font-black text-xs uppercase tracking-wider flex items-center justify-center gap-2 shadow-lg transition active:scale-95 cursor-pointer ${
+                      gameStatus === 'Läuft' || players.length === 0
+                        ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed opacity-50'
+                        : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-950'
+                    }`}
+                  >
+                    <Play className="w-4 h-4 fill-current" />
+                    Spiel starten (Rollen zuteilen)
+                  </button>
+
+                  <button
+                    onClick={handleConfirmEndGame}
+                    disabled={gameStatus !== 'Läuft'}
+                    className={`w-full py-3 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition cursor-pointer ${
+                      gameStatus !== 'Läuft'
+                        ? 'bg-zinc-800 text-zinc-500 opacity-50 cursor-not-allowed'
+                        : 'bg-amber-600 hover:bg-amber-500 text-zinc-950 font-black shadow-lg shadow-amber-950'
+                    }`}
+                  >
+                    <Award className="w-4 h-4" />
+                    Spiel regulär beenden (Auswertung)
+                  </button>
+
+                  <button
+                    onClick={handleConfirmAbortGame}
+                    disabled={gameStatus !== 'Läuft'}
+                    className={`w-full py-3 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition cursor-pointer ${
+                      gameStatus !== 'Läuft'
+                        ? 'bg-zinc-800 text-zinc-500 opacity-50 cursor-not-allowed'
+                        : 'bg-rose-700 hover:bg-rose-600 text-white'
+                    }`}
+                  >
+                    <Square className="w-4 h-4 fill-current" />
+                    Spiel abbrechen (Zurück zur Lobby)
+                  </button>
+
+                  <button
+                    onClick={() => setIsRestartModalOpen(true)}
+                    className="w-full py-3 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200 transition cursor-pointer"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                    Neustart...
+                  </button>
+                </>
+              )}
             </div>
           </div>
 

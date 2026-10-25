@@ -51,6 +51,7 @@ import { GameEndView } from './GameEndView';
 import { GalleryView } from './GalleryView';
 import { PendingDeathScreen } from './PendingDeathScreen';
 import { SpecialTaskModal } from './SpecialTaskModal';
+import { EndResultModal } from './EndResultModal';
 import { gameApi } from '../../utils/api';
 
 interface PlayerAreaProps {
@@ -113,9 +114,37 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   const [gracePeriodSeconds, setGracePeriodSeconds] = useState<number>(0);
   const [liveNow, setLiveNow] = useState<number>(Date.now());
 
-  // Filter/Search in Ranking
-  const [rankingFilter, setRankingFilter] = useState<'all' | 'dead' | 'kills'>('all');
+  // Filter/Search in Ranking ('all' | 'dead' | 'kills' | 'roles')
+  const [rankingFilter, setRankingFilter] = useState<'all' | 'dead' | 'kills' | 'roles'>('all');
   const [playerSearchTerm, setPlayerSearchTerm] = useState('');
+
+  // End-Game Dismissable Popup State
+  const isGameEnded = gameState.status === 'Beendet';
+  const [isEndModalOpen, setIsEndModalOpen] = useState(false);
+  const endDismissKey = `halloween_end_popup_${gameState.resetEpoch || 1}_${gameState.endedAt || 'ended'}`;
+
+  // Automatically trigger end popup once when game ends, but keep it closed once dismissed
+  useEffect(() => {
+    if (isGameEnded) {
+      try {
+        const dismissed = localStorage.getItem(endDismissKey);
+        if (!dismissed) {
+          setIsEndModalOpen(true);
+        }
+      } catch {
+        setIsEndModalOpen(true);
+      }
+    } else {
+      setIsEndModalOpen(false);
+    }
+  }, [isGameEnded, endDismissKey]);
+
+  const handleCloseEndModal = () => {
+    try {
+      localStorage.setItem(endDismissKey, 'true');
+    } catch {}
+    setIsEndModalOpen(false);
+  };
 
   // 1-second live ticker
   useEffect(() => {
@@ -428,7 +457,10 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   // ----------------------------------------------------------------------------
   // IF PLAYER IS IN 'PENDING_DEATH' STATUS -> SHOW DEDICATED BLOCKING SCREEN
   // ----------------------------------------------------------------------------
-  if (isPendingDeath) {
+  // WENN STATUS "TOD AUSSTEHEND" (pending_death) -> WARTE-SCREEN
+  // Nur anzeigen, wenn das Spiel noch läuft (nicht beendet ist)
+  // ----------------------------------------------------------------------------
+  if (gameState.status !== 'Beendet' && isPendingDeath) {
     return (
       <PendingDeathScreen
         player={player}
@@ -440,17 +472,8 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
     );
   }
 
-  // IF GAME IS OVER (Beendet), SHOW END VIEW
-  if (gameState.status === 'Beendet') {
-    return (
-      <GameEndView
-        gameState={gameState}
-        players={players}
-        kills={kills}
-        photos={photos}
-      />
-    );
-  }
+  // NOTE: gameState.status === 'Beendet' will NOT block the tabs anymore.
+  // Instead, the tabs remain fully browsable in read-only mode, and EndResultModal pops up.
 
   // IF STILL IN LOBBY, HANDLE TABS OR SHOW LOBBY VIEW
   if (gameState.status === 'Lobby') {
@@ -663,6 +686,18 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
       {/* ======================================================== */}
       {activeTab === 'actions' && (
         <div className="space-y-4">
+          {/* BANNER SPIEL BEENDET */}
+          {isGameEnded && (
+            <div className="p-3.5 rounded-2xl bg-purple-950/70 border border-purple-500/60 text-center space-y-1 shadow-lg">
+              <span className="text-[10px] font-mono font-black uppercase tracking-wider text-purple-300 block">
+                Spiel beendet
+              </span>
+              <p className="text-xs text-zinc-200">
+                Das Spiel ist beendet. Alle Mächte ruhen.
+              </p>
+            </div>
+          )}
+
           {/* Quick Role Status Header */}
           <div className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -805,12 +840,16 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                 {/* KILLER BUTTON: ICH HABE JEMANDEN GETÖTET */}
                 <button
                   onClick={() => setIsKillModalOpen(true)}
-                  disabled={cooldownRemainingSeconds > 0 || (isWerewolf && !isFullMoon) || gracePeriodSeconds > 0}
-                  className="w-full py-4 rounded-2xl bg-gradient-to-r from-rose-600 to-red-700 hover:from-rose-500 hover:to-red-600 text-white font-black text-sm shadow-xl shadow-rose-950/80 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 disabled:opacity-50"
+                  disabled={isGameEnded || cooldownRemainingSeconds > 0 || (isWerewolf && !isFullMoon) || gracePeriodSeconds > 0}
+                  className={`w-full py-4 rounded-2xl font-black text-sm shadow-xl flex items-center justify-center gap-2 transition active:scale-95 ${
+                    isGameEnded
+                      ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed border border-zinc-700 opacity-60'
+                      : 'bg-gradient-to-r from-rose-600 to-red-700 hover:from-rose-500 hover:to-red-600 text-white shadow-rose-950/80 cursor-pointer disabled:opacity-50'
+                  }`}
                 >
                   <Skull className="w-5 h-5" />
-                  <span>Ich habe jemanden getötet</span>
-                  {pendingVictims.length > 0 && (
+                  <span>{isGameEnded ? 'Das Spiel ist beendet' : 'Ich habe jemanden getötet'}</span>
+                  {!isGameEnded && pendingVictims.length > 0 && (
                     <span className="ml-1 px-2 py-0.5 rounded-full bg-white text-rose-700 text-xs font-black animate-pulse">
                       {pendingVictims.length} offen
                     </span>
@@ -842,11 +881,15 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
 
                 <button
                   onClick={() => setIsKillModalOpen(true)}
-                  disabled={cooldownRemainingSeconds > 0 || gracePeriodSeconds > 0}
-                  className="w-full py-4 rounded-2xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-black text-sm shadow-xl shadow-blue-950/80 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 disabled:opacity-50"
+                  disabled={isGameEnded || cooldownRemainingSeconds > 0 || gracePeriodSeconds > 0}
+                  className={`w-full py-4 rounded-2xl font-black text-sm shadow-xl flex items-center justify-center gap-2 transition active:scale-95 ${
+                    isGameEnded
+                      ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed border border-zinc-700 opacity-60'
+                      : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white shadow-blue-950/80 cursor-pointer disabled:opacity-50'
+                  }`}
                 >
                   <ShieldAlert className="w-5 h-5" />
-                  <span>Exorzismus durchführen</span>
+                  <span>{isGameEnded ? 'Das Spiel ist beendet' : 'Exorzismus durchführen'}</span>
                 </button>
               </div>
             ) : (
@@ -867,14 +910,24 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
               <div className="pt-3 border-t border-zinc-800 space-y-1.5">
                 <button
                   type="button"
-                  onClick={() => setIsSelfDeathModalOpen(true)}
-                  className="w-full py-3.5 rounded-2xl bg-zinc-950 hover:bg-rose-950/40 border border-zinc-700 hover:border-rose-500/70 text-zinc-200 hover:text-rose-200 font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 shadow-sm"
+                  disabled={isGameEnded}
+                  onClick={() => {
+                    if (isGameEnded) return;
+                    setIsSelfDeathModalOpen(true);
+                  }}
+                  className={`w-full py-3.5 rounded-2xl border font-bold text-xs flex items-center justify-center gap-2 transition shadow-sm ${
+                    isGameEnded
+                      ? 'bg-zinc-900 border-zinc-800 text-zinc-500 cursor-not-allowed opacity-60'
+                      : 'bg-zinc-950 hover:bg-rose-950/40 border-zinc-700 hover:border-rose-500/70 text-zinc-200 hover:text-rose-200 cursor-pointer active:scale-95'
+                  }`}
                 >
-                  <Skull className="w-4 h-4 text-rose-500" />
-                  <span>Ich wurde getötet</span>
+                  <Skull className={`w-4 h-4 ${isGameEnded ? 'text-zinc-500' : 'text-rose-500'}`} />
+                  <span>{isGameEnded ? 'Das Spiel ist beendet' : 'Ich wurde getötet'}</span>
                 </button>
                 <p className="text-[10px] text-zinc-500 text-center">
-                  Tippe hier, wenn dich jemand berührt und angeflüstert hat.
+                  {isGameEnded
+                    ? 'Das Spiel ist vorüber — keine weiteren Tode möglich.'
+                    : 'Tippe hier, wenn dich jemand berührt und angeflüstert hat.'}
                 </p>
               </div>
             )}
@@ -887,23 +940,36 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
       {/* ======================================================== */}
       {activeTab === 'tasks' && (
         <div className="space-y-4">
-          {/* Header with next task countdown */}
+          {/* Header with next task countdown or game ended state */}
           <div className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 flex items-center justify-between">
             <div>
               <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
-                Foto-Aufgaben (alle {photoIntervalMin} Min)
+                {isGameEnded ? 'Aufgaben-Archiv' : `Foto-Aufgaben (alle ${photoIntervalMin} Min)`}
               </span>
               <h3 className="font-bold text-white text-sm">
                 Aufgaben-Übersicht
               </h3>
             </div>
             <div className="text-right">
-              <span className="text-[10px] text-zinc-400 block">Nächste Aufgabe in:</span>
-              <span className="text-sm font-mono font-black text-[#ff6b00]">
-                {nextTaskCountdown}
+              <span className="text-[10px] text-zinc-400 block">
+                {isGameEnded ? 'Status:' : 'Nächste Aufgabe in:'}
+              </span>
+              <span className={`text-sm font-mono font-black ${isGameEnded ? 'text-purple-400' : 'text-[#ff6b00]'}`}>
+                {isGameEnded ? 'Spiel beendet' : nextTaskCountdown}
               </span>
             </div>
           </div>
+
+          {/* BANNER SPIEL BEENDET */}
+          {isGameEnded && (
+            <div className="p-3.5 rounded-2xl bg-zinc-950/80 border border-zinc-800 text-xs text-zinc-300 flex items-center justify-between shadow-lg">
+              <div className="flex items-center gap-2">
+                <Clock className="w-4 h-4 text-purple-400" />
+                <span>Spiel beendet — Aufgaben-Einreichung geschlossen.</span>
+              </div>
+              <span className="text-[10px] font-mono text-zinc-500 uppercase font-bold">Nur Ansicht</span>
+            </div>
+          )}
 
           {/* SUB-TABS: OFFEN / ERLEDIGT / ABGELAUFEN */}
           <div className="flex rounded-2xl bg-zinc-900 p-1 border border-zinc-800 text-xs font-bold gap-1">
@@ -1026,17 +1092,23 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
 
                       <button
                         type="button"
-                        onClick={() =>
+                        disabled={isGameEnded}
+                        onClick={() => {
+                          if (isGameEnded) return;
                           setActiveTaskModal({
                             id: t.id,
                             title: t.title,
                             desc: t.description,
-                          })
-                        }
-                        className="w-full py-2.5 rounded-2xl bg-gradient-to-r from-[#ff6b00] to-orange-600 hover:from-[#ff7c1f] hover:to-orange-500 text-zinc-950 font-black text-xs shadow-md shadow-orange-950 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95"
+                          });
+                        }}
+                        className={`w-full py-2.5 rounded-2xl font-black text-xs flex items-center justify-center gap-2 transition ${
+                          isGameEnded
+                            ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed border border-zinc-700 opacity-60'
+                            : 'bg-gradient-to-r from-[#ff6b00] to-orange-600 hover:from-[#ff7c1f] hover:to-orange-500 text-zinc-950 shadow-md shadow-orange-950 cursor-pointer active:scale-95'
+                        }`}
                       >
                         <Camera className="w-4 h-4" />
-                        Foto aufnehmen & lösen (+{t.points} Pkt)
+                        <span>{isGameEnded ? 'Das Spiel ist beendet' : `Foto aufnehmen & lösen (+${t.points} Pkt)`}</span>
                       </button>
                     </div>
                   );
@@ -1138,6 +1210,31 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
       {/* ======================================================== */}
       {activeTab === 'ranking' && (
         <div className="space-y-4">
+          {/* GAME ENDED BANNER WITH ENDERGEBNIS ANZEIGEN BUTTON */}
+          {isGameEnded && (
+            <div className="p-4 rounded-3xl bg-gradient-to-r from-purple-950/80 via-zinc-900 to-zinc-900 border-2 border-purple-500/60 shadow-xl flex flex-col sm:flex-row items-center justify-between gap-3 text-center sm:text-left">
+              <div>
+                <span className="inline-block px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 text-[10px] font-black uppercase tracking-wider mb-1">
+                  Spiel beendet
+                </span>
+                <h4 className="text-base font-serif font-black text-white">
+                  Team {((gameState as any).winner_team || 'Gut').toUpperCase()} gewinnt!
+                </h4>
+                <p className="text-[11px] text-zinc-400">
+                  Alle Rollen sind aufgedeckt und das Endergebnis steht fest.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsEndModalOpen(true)}
+                className="px-4 py-2.5 rounded-2xl bg-amber-400 hover:bg-amber-300 text-zinc-950 text-xs font-black flex items-center justify-center gap-1.5 cursor-pointer transition shadow-lg shadow-amber-400/20 shrink-0 active:scale-95"
+              >
+                <Trophy className="w-4 h-4 fill-current" />
+                <span>Endergebnis anzeigen</span>
+              </button>
+            </div>
+          )}
+
           {/* My Rank Summary */}
           <div className="p-4 rounded-3xl bg-gradient-to-r from-amber-950/40 via-zinc-900 to-zinc-900 border border-amber-500/30 flex items-center justify-between">
             <div>
@@ -1158,7 +1255,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
             </div>
           </div>
 
-          {/* Ranking Sub-Filter: All, Totenreich or Kill-Log */}
+          {/* Ranking Sub-Filter: All, Totenreich, Kill-Log or Rollen */}
           <div className="flex rounded-2xl bg-zinc-900 p-1 border border-zinc-800 text-xs font-bold gap-1">
             <button
               onClick={() => setRankingFilter('all')}
@@ -1190,6 +1287,18 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
             >
               Kill-Log
             </button>
+            {isGameEnded && (
+              <button
+                onClick={() => setRankingFilter('roles')}
+                className={`flex-1 py-1.5 rounded-xl transition cursor-pointer text-center ${
+                  rankingFilter === 'roles'
+                    ? 'bg-indigo-600 text-white font-black'
+                    : 'text-zinc-400 hover:text-white'
+                }`}
+              >
+                Rollen
+              </button>
+            )}
           </div>
 
           {/* Search bar */}
@@ -1237,13 +1346,24 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
             </div>
           ) : (
             <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
-              {(rankingFilter === 'dead' ? deadRanking : overallRanking)
+              {(rankingFilter === 'roles'
+                ? [...activePlayers].sort(
+                    (a, b) =>
+                      (a.team || '').localeCompare(b.team || '') ||
+                      (a.role || '').localeCompare(b.role || '') ||
+                      (b.points || 0) - (a.points || 0)
+                  )
+                : rankingFilter === 'dead'
+                ? deadRanking
+                : overallRanking
+              )
                 .filter(
                   (p) =>
                     p.name.toLowerCase().includes(playerSearchTerm.toLowerCase()) ||
-                    p.costumeName.toLowerCase().includes(playerSearchTerm.toLowerCase())
+                    p.costumeName.toLowerCase().includes(playerSearchTerm.toLowerCase()) ||
+                    (p.role && p.role.toLowerCase().includes(playerSearchTerm.toLowerCase()))
                 )
-                .slice(0, 20)
+                .slice(0, 30)
                 .map((p, idx) => {
                   const isMe = p.id === player.id;
                   return (
@@ -1257,9 +1377,9 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                           : 'bg-zinc-900/70 border-zinc-800'
                       }`}
                     >
-                      <div className="flex items-center gap-3">
+                      <div className="flex items-center gap-3 min-w-0">
                         <span
-                          className={`w-6 text-center font-mono font-black text-sm ${
+                          className={`w-6 text-center font-mono font-black text-sm shrink-0 ${
                             idx === 0
                               ? 'text-amber-400'
                               : idx === 1
@@ -1274,22 +1394,33 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                         <img
                           src={p.photoUrl || '/placeholder.png'}
                           alt={p.name}
-                          className="w-10 h-10 rounded-xl object-cover border border-zinc-700"
+                          className="w-10 h-10 rounded-xl object-cover border border-zinc-700 shrink-0"
                         />
-                        <div>
-                          <div className="text-xs font-bold text-white flex items-center gap-1.5">
-                            <span>{p.name}</span>
+                        <div className="min-w-0">
+                          <div className="text-xs font-bold text-white flex items-center gap-1.5 flex-wrap">
+                            <span className="truncate">{p.name}</span>
                             {isMe && (
                               <span className="px-1.5 py-0.2 rounded bg-[#ff6b00] text-zinc-950 text-[9px] font-black uppercase">
                                 Du
                               </span>
                             )}
+                            {(isGameEnded || rankingFilter === 'roles') && p.role && p.role !== 'unassigned' && (
+                              <span
+                                className={`px-1.5 py-0.2 rounded text-[9px] font-bold ${
+                                  p.team === 'Böse'
+                                    ? 'bg-rose-950/80 text-rose-300 border border-rose-600/40'
+                                    : 'bg-emerald-950/80 text-emerald-300 border border-emerald-600/40'
+                                }`}
+                              >
+                                {p.role}
+                              </span>
+                            )}
                           </div>
-                          <div className="text-[10px] text-zinc-400">{p.costumeName}</div>
+                          <div className="text-[10px] text-zinc-400 truncate">{p.costumeName}</div>
                         </div>
                       </div>
 
-                      <div className="text-right">
+                      <div className="text-right shrink-0">
                         <div className="text-xs font-mono font-black text-[#ff6b00]">
                           {p.points} Pkt
                         </div>
@@ -1317,7 +1448,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
           photos={photos}
           currentPlayerId={player.id}
           currentPlayerName={player.name}
-          isGameEnded={false}
+          isGameEnded={isGameEnded}
           downloadSetting={gameState.settings?.photoDownloadUnlocked || 'ended'}
           isAdmin={Boolean(isAdminUnlocked)}
           onDeletePhoto={onDeletePhoto}
@@ -1485,6 +1616,17 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
           onSolve={handleSolveSpecialTask}
         />
       )}
+
+      {/* END RESULT POPUP MODAL (Endergebnis-Popup nach Spielende) */}
+      <EndResultModal
+        isOpen={isEndModalOpen}
+        onClose={handleCloseEndModal}
+        gameState={gameState}
+        players={players}
+        kills={kills}
+        onRequestAdminUnlock={onRequestAdminUnlock}
+        isAdminUnlocked={isAdminUnlocked}
+      />
     </div>
   );
 };

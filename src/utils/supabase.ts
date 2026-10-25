@@ -955,6 +955,37 @@ class SupabaseService {
       .eq('id', 'main');
   }
 
+  public async reopenGame(adminCode: string): Promise<void> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    // 1. Try server-side RPC admin_reopen_game
+    try {
+      const { data: rpcRes, error: rpcErr } = await client.rpc('admin_reopen_game', {
+        p_admin_code: adminCode.trim(),
+      });
+      if (!rpcErr && rpcRes && rpcRes.success) {
+        return;
+      }
+    } catch {}
+
+    // 2. Direct DB fallback
+    const { error } = await client
+      .from('game_state')
+      .update({
+        status: 'Läuft',
+        ended_at: null,
+        winner_team: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', 'main');
+
+    if (error) throw new Error(error.message);
+  }
+
   public async restartGame(adminCode: string, keepPlayers: boolean): Promise<void> {
     const isValid = await this.verifyAdminCode(adminCode);
     if (!isValid) throw new Error('Ungültiger Admin-Code');
@@ -1412,6 +1443,11 @@ class SupabaseService {
     } catch {}
 
     // 2. Client-seitiger Fallback
+    const { data: stateData } = await client.from('game_state').select('status').eq('id', 'main').single();
+    if (stateData?.status !== 'Läuft') {
+      throw new Error('Das Spiel läuft derzeit nicht oder ist beendet!');
+    }
+
     const { data: player, error: fetchErr } = await client.from('players').select('id, status').eq('id', playerId).single();
     if (fetchErr || !player) throw new Error('Spieler nicht gefunden');
     if (player.status !== 'lebendig') {

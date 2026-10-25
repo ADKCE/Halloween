@@ -38,6 +38,10 @@ class GameApiClient {
     return supabaseService.endGame(adminCode);
   }
 
+  async reopenGame(adminCode: string): Promise<void> {
+    return supabaseService.reopenGame(adminCode);
+  }
+
   async restartGame(adminCode: string, keepPlayers: boolean): Promise<void> {
     return supabaseService.restartGame(adminCode, keepPlayers);
   }

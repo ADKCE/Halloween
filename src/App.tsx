@@ -266,6 +266,17 @@ export default function App() {
     }
   };
 
+  const handleAdminReopenGame = async () => {
+    try {
+      await gameApi.reopenGame(adminCode);
+      await fetchGameState();
+      setSuccessToast('Das Spiel wurde wieder geöffnet (Status: Läuft)!');
+      setTimeout(() => setSuccessToast(null), 4000);
+    } catch (err: any) {
+      alert(err?.message || 'Fehler beim Wiedereröffnen des Spiels');
+    }
+  };
+
   const handleAdminRestart = async (keepPlayers: boolean) => {
     try {
       await gameApi.restartGame(adminCode, keepPlayers);
@@ -540,6 +551,7 @@ export default function App() {
                     onReassignRoles={handleAdminReassignRoles}
                     onAbortGame={handleAdminAbortGame}
                     onEndGame={handleAdminEndGame}
+                    onReopenGame={handleAdminReopenGame}
                     onRestartGame={handleAdminRestart}
                     onPlayerAction={handleAdminPlayerAction}
                     onUpdateSettings={handleAdminUpdateSettings}
@@ -632,6 +644,7 @@ export default function App() {
                     onReassignRoles={handleAdminReassignRoles}
                     onAbortGame={handleAdminAbortGame}
                     onEndGame={handleAdminEndGame}
+                    onReopenGame={handleAdminReopenGame}
                     onRestartGame={handleAdminRestart}
                     onPlayerAction={handleAdminPlayerAction}
                     onUpdateSettings={handleAdminUpdateSettings}

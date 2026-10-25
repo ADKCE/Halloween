@@ -1986,6 +1986,36 @@ end;
 $$;
 grant execute on function public.reset_game_full(text) to anon, authenticated, service_role;
 
+-- 25b. RPC: admin_reopen_game (Status zurück auf 'Läuft', ohne Daten zu löschen)
+create or replace function public.admin_reopen_game(p_admin_code text)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_game_state record;
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  select * into v_game_state from public.game_state where id = 'main';
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'Spielstatus nicht gefunden');
+  end if;
+
+  update public.game_state
+  set status = 'Läuft',
+      ended_at = null,
+      winner_team = null,
+      updated_at = now()
+  where id = 'main';
+
+  return jsonb_build_object('success', true, 'message', 'Spiel wurde erfolgreich wieder geöffnet (Status: Läuft)!');
+end;
+$$;
+grant execute on function public.admin_reopen_game(text) to anon, authenticated, service_role;
+
 -- ==============================================================================
 -- 26. CRON JOB: tick_game() jede Minute
 -- ==============================================================================
