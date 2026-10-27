@@ -183,8 +183,8 @@ export default function App() {
 
     const unsubscribeRealtime = gameApi.subscribeToRealtime(fetchGameState);
     
-    // Check status: If connected, poll every 20s. If disconnected/error, poll every 5s.
-    const pollIntervalMs = gameApi.getStatus().realtimeStatus === 'CONNECTED' ? 20000 : 5000;
+    // 5-second polling interval + Realtime subscription + focus refresh
+    const pollIntervalMs = 5000;
     const interval = setInterval(fetchGameState, pollIntervalMs);
 
     return () => {

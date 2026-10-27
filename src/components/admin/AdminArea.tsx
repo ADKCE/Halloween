@@ -434,6 +434,49 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
     setTimeout(() => setSettingsNotice(''), 3000);
   };
 
+  // Win condition metrics
+  const winMetrics = useMemo(() => {
+    const active = players.filter((p) => p.status !== 'entfernt' && !p.isTest);
+    const good = active.filter((p) => p.team === 'Gut');
+    const evil = active.filter((p) => p.team === 'Böse');
+    const hunters = active.filter((p) => p.role === 'Geisterjäger');
+
+    const livingGood = good.filter((p) => p.status === 'lebendig' || p.status === 'pending_death' || p.status === 'tod_ausstehend').length;
+    const livingEvil = evil.filter((p) => p.status === 'lebendig' || p.status === 'pending_death' || p.status === 'tod_ausstehend').length;
+    const livingHunters = hunters.filter((p) => p.status === 'lebendig' || p.status === 'pending_death' || p.status === 'tod_ausstehend').length;
+
+    const deadGoodPct = good.length > 0 ? Math.round(((good.length - livingGood) / good.length) * 100) : 0;
+
+    return {
+      totalActive: active.length,
+      livingGood,
+      totalGood: good.length,
+      livingEvil,
+      totalEvil: evil.length,
+      livingHunters,
+      totalHunters: hunters.length,
+      deadGoodPct,
+    };
+  }, [players]);
+
+  const [isCheckingWin, setIsCheckingWin] = useState(false);
+  const handleManualCheckWin = async () => {
+    setIsCheckingWin(true);
+    try {
+      const res = await gameApi.checkWin('admin_manual');
+      if (res?.winner) {
+        if (onToast) onToast(`Siegbedingung erfüllt! Team ${res.winner} gewinnt (${res.end_reason})`, 'success');
+      } else {
+        if (onToast) onToast('Siegbedingungen geprüft: Spiel läuft weiter, noch kein Sieger.', 'success');
+      }
+      if (onRefreshState) await onRefreshState();
+    } catch (err: any) {
+      if (onToast) onToast(err?.message || 'Fehler beim Prüfen der Siegbedingungen', 'error');
+    } finally {
+      setIsCheckingWin(false);
+    }
+  };
+
   return (
     <div className="space-y-4 max-w-md mx-auto pb-16">
       {/* Top Header Card */}
@@ -669,9 +712,21 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
                 <Users className="w-5 h-5 text-[#ff6b00]" />
                 <div>
                   <h3 className="font-serif font-bold text-base text-white">Rollenverteilung (Soll / Ist)</h3>
-                  <p className="text-[10px] text-zinc-400">
-                    {activePlayers.length} aktive Spieler im Spiel
-                  </p>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-[10px] text-zinc-400">
+                      {activePlayers.length} aktive Spieler
+                    </span>
+                    <span className="text-zinc-600">•</span>
+                    <span
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                        actualRoleCounts.unassigned > 0
+                          ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse'
+                          : 'bg-emerald-500/20 text-emerald-400'
+                      }`}
+                    >
+                      Spieler ohne Rolle: {actualRoleCounts.unassigned}
+                    </span>
+                  </div>
                 </div>
               </div>
               <button
@@ -860,8 +915,27 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
               </table>
             </div>
 
-            {/* Reassign Button */}
-            <div className="pt-2 border-t border-zinc-800 flex gap-2">
+            {/* Reassign & Missing Roles Buttons */}
+            <div className="pt-2 border-t border-zinc-800 flex flex-col sm:flex-row gap-2">
+              {actualRoleCounts.unassigned > 0 && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const res = await gameApi.assignMissingRoles(adminCode);
+                      if (onToast) onToast(res.message, 'success');
+                      if (onRefreshState) await onRefreshState();
+                    } catch (e: any) {
+                      if (onToast) onToast(e.message || 'Fehler beim Zuweisen', 'error');
+                    }
+                  }}
+                  className="flex-1 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 font-black text-xs uppercase tracking-wider flex items-center justify-center gap-1.5 cursor-pointer shadow-md transition active:scale-95"
+                >
+                  <Users className="w-3.5 h-3.5" />
+                  <span>Fehlende Rollen vergeben ({actualRoleCounts.unassigned})</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => {
@@ -874,14 +948,16 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
                   }
                 }}
                 disabled={activePlayers.length === 0}
-                className={`w-full py-2.5 rounded-xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer transition ${
+                className={`py-2.5 px-3 rounded-xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer transition ${
+                  actualRoleCounts.unassigned > 0 ? 'sm:w-auto' : 'w-full'
+                } ${
                   gameStatus === 'Läuft'
                     ? 'bg-rose-950/80 hover:bg-rose-900 border border-rose-600 text-rose-200'
                     : 'bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200'
                 }`}
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                Rollen neu verteilen
+                <span>Rollen neu würfeln</span>
                 {gameStatus === 'Läuft' && <span className="text-[10px] text-rose-400 font-normal">(Warnung)</span>}
               </button>
             </div>
@@ -963,6 +1039,64 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
                 })}
               </div>
             )}
+          </div>
+
+          {/* SIEGBEDINGUNGEN & METRIKEN (LIVE) */}
+          <div className="p-5 rounded-3xl bg-zinc-900 border-2 border-purple-500/40 space-y-3 shadow-xl">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="p-2 rounded-xl bg-purple-500/20 text-purple-300">
+                  <Award className="w-5 h-5" />
+                </span>
+                <div>
+                  <h4 className="font-bold text-white text-sm">Siegbedingungen (Live-Monitor)</h4>
+                  <p className="text-[11px] text-zinc-400">Automatische Prüfung nach jedem Kill & Ticker</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleManualCheckWin}
+                disabled={isCheckingWin || gameStatus !== 'Läuft'}
+                className="px-3 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white font-bold text-xs flex items-center gap-1.5 cursor-pointer shadow transition active:scale-95"
+              >
+                <CheckCircle2 className={`w-3.5 h-3.5 ${isCheckingWin ? 'animate-spin' : ''}`} />
+                <span>{isCheckingWin ? 'Prüft...' : 'Jetzt prüfen'}</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 text-center">
+              <div className="p-2.5 rounded-2xl bg-zinc-950 border border-zinc-800">
+                <span className="text-[10px] text-zinc-400 block uppercase font-bold">Böse lebend</span>
+                <span className={`font-mono font-black text-base ${winMetrics.livingEvil === 0 && winMetrics.totalEvil > 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {winMetrics.livingEvil} / {winMetrics.totalEvil}
+                </span>
+                <span className="text-[9px] text-zinc-500 block">Sieg Gut bei 0</span>
+              </div>
+
+              <div className="p-2.5 rounded-2xl bg-zinc-950 border border-zinc-800">
+                <span className="text-[10px] text-blue-400 block uppercase font-bold">Jäger lebend</span>
+                <span className={`font-mono font-black text-base ${winMetrics.livingHunters === 0 && winMetrics.totalHunters > 0 ? 'text-rose-400' : 'text-blue-300'}`}>
+                  {winMetrics.livingHunters} / {winMetrics.totalHunters}
+                </span>
+                <span className="text-[9px] text-zinc-500 block">Sieg Böse bei 0</span>
+              </div>
+
+              <div className="p-2.5 rounded-2xl bg-zinc-950 border border-zinc-800">
+                <span className="text-[10px] text-emerald-400 block uppercase font-bold">Gute lebend</span>
+                <span className="font-mono font-black text-base text-emerald-300">
+                  {winMetrics.livingGood} / {winMetrics.totalGood}
+                </span>
+                <span className="text-[9px] text-zinc-500 block">Unschuldige</span>
+              </div>
+
+              <div className="p-2.5 rounded-2xl bg-zinc-950 border border-zinc-800">
+                <span className="text-[10px] text-amber-400 block uppercase font-bold">Tote Gute %</span>
+                <span className={`font-mono font-black text-base ${winMetrics.deadGoodPct >= 75 ? 'text-rose-400 font-black animate-pulse' : 'text-amber-300'}`}>
+                  {winMetrics.deadGoodPct}%
+                </span>
+                <span className="text-[9px] text-zinc-500 block">Sieg Böse ab &gt;75%</span>
+              </div>
+            </div>
           </div>
 
           <div className="p-5 rounded-3xl bg-zinc-900 border border-zinc-800 space-y-3">

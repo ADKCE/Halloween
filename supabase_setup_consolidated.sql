@@ -58,6 +58,10 @@ create table if not exists public.game_state (
   active_full_moon jsonb default null,
   next_full_moon_at timestamptz default null,
   winner_team text default null,
+  end_reason text default null,
+  initial_good_count integer not null default 0,
+  initial_evil_count integer not null default 0,
+  initial_hunter_count integer not null default 0,
   last_special_task_at timestamptz default null,
   next_special_task_interval_minutes integer default 15,
   last_tick_at timestamptz default null,
@@ -265,6 +269,27 @@ create table if not exists public.client_errors (
 );
 
 create index if not exists idx_client_errors_created_at on public.client_errors (created_at desc);
+
+-- 2.15 win_check_log (Historie der automatischen Siegbedingungsprüfungen)
+create table if not exists public.win_check_log (
+  id text primary key default gen_random_uuid()::text,
+  checked_at timestamptz not null default timezone('utc'::text, now()),
+  trigger_action text not null,
+  living_good integer not null default 0,
+  dead_good integer not null default 0,
+  living_evil integer not null default 0,
+  dead_evil integer not null default 0,
+  living_hunters integer not null default 0,
+  dead_hunters integer not null default 0,
+  initial_good integer not null default 0,
+  initial_evil integer not null default 0,
+  initial_hunters integer not null default 0,
+  good_death_pct numeric(5,2) not null default 0,
+  winner_team text default null,
+  end_reason text default null
+);
+
+create index if not exists idx_win_check_log_checked_at on public.win_check_log (checked_at desc);
 
 -- 2.15 task_pool (Vorlagen-Pool für Foto-Aufgaben)
 create table if not exists public.task_pool (
@@ -1156,27 +1181,266 @@ end;
 $$;
 grant execute on function public.assign_roles() to anon, authenticated, service_role;
 
--- 3.14 start_game
+-- 3.14 check_win (Zentrale Siegbedingungs-Prüfung)
+create or replace function public.check_win(p_trigger text default 'manual')
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_game_state record;
+  v_living_good integer := 0;
+  v_dead_good integer := 0;
+  v_living_evil integer := 0;
+  v_dead_evil integer := 0;
+  v_living_hunters integer := 0;
+  v_dead_hunters integer := 0;
+  v_initial_good integer := 0;
+  v_initial_evil integer := 0;
+  v_initial_hunters integer := 0;
+  v_good_death_pct numeric(5,2) := 0;
+  v_winner text := null;
+  v_reason text := null;
+  v_now timestamptz := now();
+  v_log_id text := gen_random_uuid()::text;
+begin
+  select * into v_game_state from public.game_state where id = 'main';
+  if not found or v_game_state.status != 'Läuft' then
+    return jsonb_build_object(
+      'checked', false,
+      'reason', 'game_not_running',
+      'current_status', coalesce(v_game_state.status, 'unknown')
+    );
+  end if;
+
+  select
+    coalesce(count(*) filter (where coalesce(pr.team, p.team) = 'Gut' and p.status in ('lebendig', 'pending_death', 'tod_ausstehend')), 0),
+    coalesce(count(*) filter (where coalesce(pr.team, p.team) = 'Gut' and p.status = 'tot'), 0),
+    coalesce(count(*) filter (where coalesce(pr.team, p.team) = 'Böse' and p.status in ('lebendig', 'pending_death', 'tod_ausstehend')), 0),
+    coalesce(count(*) filter (where coalesce(pr.team, p.team) = 'Böse' and p.status = 'tot'), 0),
+    coalesce(count(*) filter (where coalesce(pr.role, p.role) = 'Geisterjäger' and p.status in ('lebendig', 'pending_death', 'tod_ausstehend')), 0),
+    coalesce(count(*) filter (where coalesce(pr.role, p.role) = 'Geisterjäger' and p.status = 'tot'), 0)
+  into
+    v_living_good,
+    v_dead_good,
+    v_living_evil,
+    v_dead_evil,
+    v_living_hunters,
+    v_dead_hunters
+  from public.players p
+  left join public.player_roles pr on pr.player_id = p.id
+  where p.status != 'entfernt' and p.is_test = false;
+
+  v_initial_good := coalesce(nullif(v_game_state.initial_good_count, 0), v_living_good + v_dead_good);
+  v_initial_evil := coalesce(nullif(v_game_state.initial_evil_count, 0), v_living_evil + v_dead_evil);
+  v_initial_hunters := coalesce(nullif(v_game_state.initial_hunter_count, 0), v_living_hunters + v_dead_hunters);
+
+  if v_initial_good > 0 then
+    v_good_death_pct := round(((v_initial_good - v_living_good)::numeric / v_initial_good::numeric) * 100.0, 2);
+  else
+    v_good_death_pct := 0;
+  end if;
+
+  if v_initial_evil > 0 and v_living_evil = 0 then
+    v_winner := 'Gut';
+    v_reason := 'all_evil_dead';
+  elsif v_initial_hunters > 0 and v_living_hunters = 0 then
+    v_winner := 'Böse';
+    v_reason := 'all_hunters_dead';
+  elsif v_initial_good > 0 and v_good_death_pct > 75.0 then
+    v_winner := 'Böse';
+    v_reason := 'good_75_percent_dead';
+  end if;
+
+  if v_winner is not null then
+    update public.game_state
+    set status = 'Beendet',
+        winner_team = v_winner,
+        end_reason = v_reason,
+        ended_at = v_now,
+        updated_at = v_now
+    where id = 'main';
+
+    insert into public.notifications (player_id, title, message, type, created_at)
+    select id,
+           'Spiel beendet! Team ' || v_winner || ' gewinnt!',
+           case
+             when v_reason = 'all_evil_dead' then 'Alle Kreaturen der Nacht (Vampire, Werwölfe, Geister) wurden vernichtet! Das Gute triumphiert.'
+             when v_reason = 'all_hunters_dead' then 'Alle Geisterjäger wurden eliminiert. Die Mächte der Finsternis haben die Party übernommen!'
+             when v_reason = 'good_75_percent_dead' then 'Mehr als 75% der Unschuldigen sind gefallen. Das Böse hat die absolute Mehrheit!'
+             else 'Das Spiel wurde beendet! Team ' || v_winner || ' siegt.'
+           end,
+           'game_ended',
+           v_now
+    from public.players
+    where status != 'entfernt' and is_test = false;
+  end if;
+
+  insert into public.win_check_log (
+    id, checked_at, trigger_action,
+    living_good, dead_good,
+    living_evil, dead_evil,
+    living_hunters, dead_hunters,
+    initial_good, initial_evil, initial_hunters,
+    good_death_pct, winner_team, end_reason
+  ) values (
+    v_log_id, v_now, p_trigger,
+    v_living_good, v_dead_good,
+    v_living_evil, v_dead_evil,
+    v_living_hunters, v_dead_hunters,
+    v_initial_good, v_initial_evil, v_initial_hunters,
+    v_good_death_pct, v_winner, v_reason
+  );
+
+  return jsonb_build_object(
+    'checked', true,
+    'trigger', p_trigger,
+    'winner', v_winner,
+    'end_reason', v_reason,
+    'living_good', v_living_good,
+    'dead_good', v_dead_good,
+    'living_evil', v_living_evil,
+    'dead_evil', v_dead_evil,
+    'living_hunters', v_living_hunters,
+    'dead_hunters', v_dead_hunters,
+    'initial_good', v_initial_good,
+    'initial_evil', v_initial_evil,
+    'initial_hunters', v_initial_hunters,
+    'good_death_pct', v_good_death_pct
+  );
+end;
+$$;
+grant execute on function public.check_win(text) to anon, authenticated, service_role;
+
+-- 3.15 start_game (Atomar mit Transaktion, Anfangszahlen & Idempotenz)
 create or replace function public.start_game(p_admin_code text)
 returns jsonb
 language plpgsql
 security definer
 as $$
 declare
-  v_res jsonb;
+  v_game_state record;
+  v_player_ids text[];
+  v_total integer := 0;
+  v_vampires integer := 0;
+  v_werewolves integer := 0;
+  v_ghosts integer := 0;
+  v_hunters integer := 0;
+  v_humans integer := 0;
+  v_deck text[] := array[]::text[];
+  v_i integer;
+  v_assigned_role text;
+  v_assigned_team text;
+  v_settings jsonb;
+  v_vampire_pct numeric := 6;
+  v_werewolf_pct numeric := 4;
+  v_ghost_pct numeric := 4;
+  v_hunter_pct numeric := 10;
   v_now timestamptz := now();
+  v_initial_good integer := 0;
+  v_initial_evil integer := 0;
+  v_initial_hunter integer := 0;
 begin
   if not public.check_admin_code(p_admin_code) then
     return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
   end if;
 
-  v_res := public.assign_roles();
+  select * into v_game_state from public.game_state where id = 'main' for update;
+  if v_game_state.status = 'Läuft' then
+    return jsonb_build_object(
+      'success', true,
+      'already_started', true,
+      'message', 'Das Spiel läuft bereits.'
+    );
+  end if;
+
+  v_settings := coalesce(v_game_state.settings, '{}'::jsonb);
+  if (v_settings->>'vampirePercent') is not null then v_vampire_pct := (v_settings->>'vampirePercent')::numeric; end if;
+  if (v_settings->>'werewolfPercent') is not null then v_werewolf_pct := (v_settings->>'werewolfPercent')::numeric; end if;
+  if (v_settings->>'ghostPercent') is not null then v_ghost_pct := (v_settings->>'ghostPercent')::numeric; end if;
+  if (v_settings->>'hunterPercent') is not null then v_hunter_pct := (v_settings->>'hunterPercent')::numeric; end if;
+
+  select array_agg(id order by random()) into v_player_ids
+  from public.players
+  where status != 'entfernt';
+
+  v_total := coalesce(array_length(v_player_ids, 1), 0);
+  if v_total = 0 then
+    return jsonb_build_object('success', false, 'error', 'Keine registrierten Spieler in der Lobby vorhanden');
+  end if;
+
+  if v_total < 4 then
+    v_vampires := 1;
+    v_werewolves := 0;
+    v_ghosts := 0;
+    v_hunters := 1;
+    v_humans := greatest(0, v_total - 2);
+  else
+    v_vampires := greatest(1, round(v_total * (v_vampire_pct / 100.0)));
+    v_werewolves := greatest(1, round(v_total * (v_werewolf_pct / 100.0)));
+    v_ghosts := greatest(1, round(v_total * (v_ghost_pct / 100.0)));
+    v_hunters := greatest(1, round(v_total * (v_hunter_pct / 100.0)));
+
+    while (v_vampires + v_werewolves + v_ghosts + v_hunters) > (v_total - 1) and (v_vampires + v_werewolves + v_ghosts + v_hunters) > 0 loop
+      if v_hunters > 1 then v_hunters := v_hunters - 1;
+      elsif v_ghosts > 1 then v_ghosts := v_ghosts - 1;
+      elsif v_werewolves > 1 then v_werewolves := v_werewolves - 1;
+      elsif v_vampires > 1 then v_vampires := v_vampires - 1;
+      else exit;
+      end if;
+    end loop;
+
+    v_humans := greatest(0, v_total - (v_vampires + v_werewolves + v_ghosts + v_hunters));
+  end if;
+
+  for v_i in 1..v_vampires loop v_deck := array_append(v_deck, 'Vampir'); end loop;
+  for v_i in 1..v_werewolves loop v_deck := array_append(v_deck, 'Werwolf'); end loop;
+  for v_i in 1..v_ghosts loop v_deck := array_append(v_deck, 'Geist'); end loop;
+  for v_i in 1..v_hunters loop v_deck := array_append(v_deck, 'Geisterjäger'); end loop;
+  for v_i in 1..v_humans loop v_deck := array_append(v_deck, 'Mensch'); end loop;
+
+  while array_length(v_deck, 1) < v_total loop
+    v_deck := array_append(v_deck, 'Mensch');
+  end loop;
+
+  for v_i in 1..v_total loop
+    v_assigned_role := v_deck[v_i];
+    v_assigned_team := case when v_assigned_role in ('Vampir', 'Werwolf', 'Geist') then 'Böse' else 'Gut' end;
+
+    insert into public.player_roles (player_id, role, team, updated_at)
+    values (v_player_ids[v_i], v_assigned_role, v_assigned_team, v_now)
+    on conflict (player_id) do update set
+      role = excluded.role,
+      team = excluded.team,
+      updated_at = excluded.updated_at;
+
+    update public.players
+    set role = 'unassigned',
+        team = v_assigned_team,
+        status = 'lebendig',
+        points = 0,
+        kills_count = 0,
+        tasks_completed_count = 0,
+        cooldown_until = null,
+        pending_death_at = null,
+        last_kill_at = null,
+        updated_at = v_now
+    where id = v_player_ids[v_i];
+  end loop;
+
+  v_initial_good := v_hunters + v_humans;
+  v_initial_evil := v_vampires + v_werewolves + v_ghosts;
+  v_initial_hunter := v_hunters;
 
   update public.game_state
   set status = 'Läuft',
       started_at = v_now,
       ended_at = null,
       winner_team = null,
+      end_reason = null,
+      initial_good_count = v_initial_good,
+      initial_evil_count = v_initial_evil,
+      initial_hunter_count = v_initial_hunter,
       active_full_moon = null,
       next_full_moon_at = v_now + ((floor(random() * 21) + 20) * interval '1 minute'),
       last_special_task_at = v_now,
@@ -1185,12 +1449,199 @@ begin
       updated_at = v_now
   where id = 'main';
 
-  perform public.tick_game();
+  insert into public.notifications (player_id, title, message, type, created_at)
+  select id,
+         'Das Spiel hat begonnen!',
+         'Deine geheime Rolle wurde dir zugeteilt. Finde heraus, wer du bist und erfülle deine Mission!',
+         'game_started',
+         v_now
+  from public.players
+  where status != 'entfernt';
 
-  return jsonb_build_object('success', true, 'message', 'Spiel erfolgreich gestartet!');
+  perform public.check_win('game_start');
+
+  return jsonb_build_object(
+    'success', true,
+    'message', 'Spiel erfolgreich gestartet! Alle Rollen wurden atomar zugeteilt.',
+    'total', v_total,
+    'vampires', v_vampires,
+    'werewolves', v_werewolves,
+    'ghosts', v_ghosts,
+    'hunters', v_hunters,
+    'humans', v_humans,
+    'initial_good', v_initial_good,
+    'initial_evil', v_initial_evil
+  );
 end;
 $$;
 grant execute on function public.start_game(text) to anon, authenticated, service_role;
+
+-- 3.16 ensure_my_role(p_player_id text)
+create or replace function public.ensure_my_role(p_player_id text)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_game_state record;
+  v_player record;
+  v_existing_role record;
+  v_role text;
+  v_team text;
+  v_settings jsonb;
+  v_good_count integer := 0;
+  v_evil_count integer := 0;
+  v_hunter_count integer := 0;
+  v_total_count integer := 0;
+  v_vampire_pct numeric := 6;
+  v_werewolf_pct numeric := 4;
+  v_ghost_pct numeric := 4;
+  v_hunter_pct numeric := 10;
+  v_now timestamptz := now();
+begin
+  select * into v_game_state from public.game_state where id = 'main';
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'Spielzustand nicht gefunden');
+  end if;
+
+  select * into v_player from public.players where id = p_player_id;
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'Spieler nicht gefunden');
+  end if;
+
+  if v_game_state.status = 'Lobby' then
+    return jsonb_build_object(
+      'success', true,
+      'role', 'unassigned',
+      'team', 'Gut',
+      'assigned', false,
+      'status', 'Lobby'
+    );
+  end if;
+
+  select * into v_existing_role from public.player_roles where player_id = p_player_id;
+  if found and v_existing_role.role is not null and v_existing_role.role not in ('unassigned', 'Unbekannt') then
+    return jsonb_build_object(
+      'success', true,
+      'role', v_existing_role.role,
+      'team', v_existing_role.team,
+      'assigned', false
+    );
+  end if;
+
+  v_settings := coalesce(v_game_state.settings, '{}'::jsonb);
+  if (v_settings->>'vampirePercent') is not null then v_vampire_pct := (v_settings->>'vampirePercent')::numeric; end if;
+  if (v_settings->>'werewolfPercent') is not null then v_werewolf_pct := (v_settings->>'werewolfPercent')::numeric; end if;
+  if (v_settings->>'ghostPercent') is not null then v_ghost_pct := (v_settings->>'ghostPercent')::numeric; end if;
+  if (v_settings->>'hunterPercent') is not null then v_hunter_pct := (v_settings->>'hunterPercent')::numeric; end if;
+
+  select
+    coalesce(count(*) filter (where coalesce(pr.team, p.team) = 'Gut'), 0),
+    coalesce(count(*) filter (where coalesce(pr.team, p.team) = 'Böse'), 0),
+    coalesce(count(*) filter (where coalesce(pr.role, p.role) = 'Geisterjäger'), 0),
+    coalesce(count(*), 0)
+  into
+    v_good_count,
+    v_evil_count,
+    v_hunter_count,
+    v_total_count
+  from public.players p
+  left join public.player_roles pr on pr.player_id = p.id
+  where p.status != 'entfernt';
+
+  if v_evil_count = 0 or (v_total_count > 0 and (v_evil_count::numeric / v_total_count::numeric) < ((v_vampire_pct + v_werewolf_pct + v_ghost_pct) / 100.0)) then
+    if not exists (select 1 from public.player_roles pr join public.players p on p.id = pr.player_id where pr.role = 'Vampir' and p.status != 'entfernt') then
+      v_role := 'Vampir';
+    elsif not exists (select 1 from public.player_roles pr join public.players p on p.id = pr.player_id where pr.role = 'Werwolf' and p.status != 'entfernt') then
+      v_role := 'Werwolf';
+    elsif not exists (select 1 from public.player_roles pr join public.players p on p.id = pr.player_id where pr.role = 'Geist' and p.status != 'entfernt') then
+      v_role := 'Geist';
+    else
+      v_role := (array['Vampir', 'Werwolf', 'Geist'])[floor(random() * 3 + 1)];
+    end if;
+    v_team := 'Böse';
+  elsif v_hunter_count = 0 or (v_total_count > 0 and (v_hunter_count::numeric / v_total_count::numeric) < (v_hunter_pct / 100.0)) then
+    v_role := 'Geisterjäger';
+    v_team := 'Gut';
+  else
+    v_role := 'Mensch';
+    v_team := 'Gut';
+  end if;
+
+  insert into public.player_roles (player_id, role, team, updated_at)
+  values (p_player_id, v_role, v_team, v_now)
+  on conflict (player_id) do update set
+    role = excluded.role,
+    team = excluded.team,
+    updated_at = excluded.updated_at;
+
+  update public.players
+  set team = v_team,
+      role = 'unassigned',
+      updated_at = v_now
+  where id = p_player_id;
+
+  if v_team = 'Gut' then
+    update public.game_state set initial_good_count = initial_good_count + 1 where id = 'main';
+    if v_role = 'Geisterjäger' then
+      update public.game_state set initial_hunter_count = initial_hunter_count + 1 where id = 'main';
+    end if;
+  else
+    update public.game_state set initial_evil_count = initial_evil_count + 1 where id = 'main';
+  end if;
+
+  perform public.check_win('ensure_role');
+
+  return jsonb_build_object(
+    'success', true,
+    'role', v_role,
+    'team', v_team,
+    'assigned', true,
+    'message', 'Rolle erfolgreich nachverteilt'
+  );
+end;
+$$;
+grant execute on function public.ensure_my_role(text) to anon, authenticated, service_role;
+
+-- 3.17 assign_missing_roles(p_admin_code text)
+create or replace function public.assign_missing_roles(p_admin_code text)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_unassigned record;
+  v_count integer := 0;
+  v_res jsonb;
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  for v_unassigned in
+    select p.id
+    from public.players p
+    left join public.player_roles pr on pr.player_id = p.id
+    where p.status != 'entfernt'
+      and (pr.role is null or pr.role in ('unassigned', 'Unbekannt'))
+  loop
+    v_res := public.ensure_my_role(v_unassigned.id);
+    if (v_res->>'success')::boolean then
+      v_count := v_count + 1;
+    end if;
+  end loop;
+
+  perform public.check_win('assign_missing_roles');
+
+  return jsonb_build_object(
+    'success', true,
+    'message', v_count || ' fehlende Rolle(n) erfolgreich zugewiesen.',
+    'assigned_count', v_count
+  );
+end;
+$$;
+grant execute on function public.assign_missing_roles(text) to anon, authenticated, service_role;
+
 
 -- 3.15 expire_pending_deaths (Timeout nach 4 Minuten, idempotent & sicher)
 create or replace function public.expire_pending_deaths()

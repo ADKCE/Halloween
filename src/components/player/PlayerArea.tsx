@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   Sparkles,
   Users,
@@ -15,6 +15,7 @@ import {
   Camera,
   CheckCircle2,
   AlertCircle,
+  AlertTriangle,
   Clock,
   Flame,
   Search,
@@ -26,7 +27,9 @@ import {
   ChevronRight,
   ShieldAlert,
   HelpCircle,
-  Check
+  Check,
+  Loader2,
+  RotateCcw
 } from 'lucide-react';
 import {
   Player,
@@ -145,6 +148,53 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
     } catch {}
     setIsEndModalOpen(false);
   };
+
+  // --- AUTOMATISCHE ROLLENVERGABE & RETRY LOGIK ---
+  const isRoleMissing = gameState.status === 'Läuft' && (!player.role || player.role === 'unassigned' || player.role === 'Unbekannt');
+  const [roleAssignAttempts, setRoleAssignAttempts] = useState<number>(0);
+  const [isAssigningRole, setIsAssigningRole] = useState<boolean>(false);
+  const [roleAssignError, setRoleAssignError] = useState<string | null>(null);
+
+  const triggerEnsureRole = useCallback(async () => {
+    if (!player.id || gameState.status !== 'Läuft' || isAssigningRole) return;
+    setIsAssigningRole(true);
+    setRoleAssignError(null);
+    try {
+      const res = await gameApi.ensureMyRole(player.id);
+      if (res && res.success && res.role && res.role !== 'unassigned' && res.role !== 'Unbekannt') {
+        await onRefreshState();
+        setIsAssigningRole(false);
+        return;
+      }
+      throw new Error(res?.message || 'Keine Rolle erhalten');
+    } catch (err: any) {
+      console.warn('ensureMyRole attempt error:', err);
+      setRoleAssignAttempts((prev) => {
+        const next = prev + 1;
+        if (next >= 3) {
+          setRoleAssignError('Die Rolle konnte nicht automatisch bezogen werden. Bitte tippe auf "Erneut versuchen".');
+        }
+        return next;
+      });
+    } finally {
+      setIsAssigningRole(false);
+    }
+  }, [player.id, gameState.status, isAssigningRole, onRefreshState]);
+
+  useEffect(() => {
+    if (isRoleMissing && roleAssignAttempts < 3 && !isAssigningRole && !roleAssignError) {
+      const timer = setTimeout(() => {
+        triggerEnsureRole();
+      }, roleAssignAttempts === 0 ? 100 : 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [isRoleMissing, roleAssignAttempts, isAssigningRole, roleAssignError, triggerEnsureRole]);
+
+  // Reset retry attempts when player changes or game restarts
+  useEffect(() => {
+    setRoleAssignAttempts(0);
+    setRoleAssignError(null);
+  }, [player.id, gameState.status]);
 
   // 1-second live ticker
   useEffect(() => {
@@ -699,54 +749,112 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
           )}
 
           {/* Quick Role Status Header */}
-          <div className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div
-                className={`w-12 h-12 rounded-2xl flex items-center justify-center text-white ${
-                  player.role === 'Vampir'
-                    ? 'bg-rose-950 border border-rose-600'
-                    : player.role === 'Werwolf'
-                    ? 'bg-amber-950 border border-amber-600'
-                    : player.role === 'Geist'
-                    ? 'bg-purple-950 border border-purple-600'
-                    : player.role === 'Geisterjäger'
-                    ? 'bg-blue-950 border border-blue-600'
-                    : player.role === 'Mensch'
-                    ? 'bg-emerald-950 border border-emerald-600'
-                    : 'bg-zinc-800 border border-zinc-600'
-                }`}
-              >
-                {player.role === 'Vampir' && <Skull className="w-6 h-6 text-rose-500" />}
-                {player.role === 'Werwolf' && <Moon className="w-6 h-6 text-amber-400" />}
-                {player.role === 'Geist' && <Ghost className="w-6 h-6 text-purple-400" />}
-                {player.role === 'Geisterjäger' && <ShieldAlert className="w-6 h-6 text-blue-400" />}
-                {player.role === 'Mensch' && <Users className="w-6 h-6 text-emerald-400" />}
-                {(player.role === 'unassigned' || !player.role) && <HelpCircle className="w-6 h-6 text-zinc-400" />}
+          {isRoleMissing ? (
+            roleAssignError && roleAssignAttempts >= 3 ? (
+              <div className="p-4 rounded-3xl bg-amber-950/40 border-2 border-amber-500/60 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-xl">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-2xl bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
+                    <AlertTriangle className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-amber-300 font-bold uppercase tracking-wider block">
+                      Rolle verzögert
+                    </span>
+                    <span className="font-serif font-bold text-base text-white block">
+                      Rolle noch nicht geladen
+                    </span>
+                    <p className="text-xs text-amber-200/80 max-w-xs">
+                      {roleAssignError}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRoleAssignAttempts(0);
+                    setRoleAssignError(null);
+                    triggerEnsureRole();
+                  }}
+                  className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-md transition active:scale-95"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Erneut versuchen</span>
+                </button>
               </div>
-              <div>
-                <span className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider block">
-                  Deine Rolle
-                </span>
-                <span className="font-serif font-black text-xl text-white block">
-                  {player.role === 'unassigned' || !player.role ? 'Noch nicht zugelost' : player.role}
-                </span>
-                <span className="text-xs text-zinc-400">
-                  {player.role === 'unassigned' || !player.role ? 'Rolle folgt bei Spielstart' : `Team ${player.team}`}
-                </span>
+            ) : (
+              <div className="p-4 rounded-3xl bg-zinc-900 border border-purple-500/50 flex items-center justify-between shadow-xl animate-pulse">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-2xl bg-purple-500/20 text-purple-400 flex items-center justify-center shrink-0">
+                    <Loader2 className="w-6 h-6 animate-spin text-purple-400" />
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-purple-300 font-bold uppercase tracking-wider block">
+                      Geheime Zuteilung
+                    </span>
+                    <span className="font-serif font-black text-lg text-white block">
+                      Rolle wird zugewiesen …
+                    </span>
+                    <span className="text-xs text-zinc-400">
+                      Server berechnet Rollenverteilung...
+                    </span>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <span className="text-xs font-mono font-bold text-[#ff6b00] block">{(player.points || 0) + localPointsDelta} Pkt</span>
+                  <span className="text-[10px] font-bold text-emerald-400">LEBENDIG</span>
+                </div>
               </div>
-            </div>
+            )
+          ) : (
+            <div className="p-4 rounded-3xl bg-zinc-900 border border-zinc-800 flex items-center justify-between shadow-xl">
+              <div className="flex items-center gap-3">
+                <div
+                  className={`w-12 h-12 rounded-2xl flex items-center justify-center text-white ${
+                    player.role === 'Vampir'
+                      ? 'bg-rose-950 border border-rose-600'
+                      : player.role === 'Werwolf'
+                      ? 'bg-amber-950 border border-amber-600'
+                      : player.role === 'Geist'
+                      ? 'bg-purple-950 border border-purple-600'
+                      : player.role === 'Geisterjäger'
+                      ? 'bg-blue-950 border border-blue-600'
+                      : player.role === 'Mensch'
+                      ? 'bg-emerald-950 border border-emerald-600'
+                      : 'bg-zinc-800 border border-zinc-600'
+                  }`}
+                >
+                  {player.role === 'Vampir' && <Skull className="w-6 h-6 text-rose-500" />}
+                  {player.role === 'Werwolf' && <Moon className="w-6 h-6 text-amber-400" />}
+                  {player.role === 'Geist' && <Ghost className="w-6 h-6 text-purple-400" />}
+                  {player.role === 'Geisterjäger' && <ShieldAlert className="w-6 h-6 text-blue-400" />}
+                  {player.role === 'Mensch' && <Users className="w-6 h-6 text-emerald-400" />}
+                  {(player.role === 'unassigned' || !player.role) && <HelpCircle className="w-6 h-6 text-zinc-400" />}
+                </div>
+                <div>
+                  <span className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider block">
+                    Deine Rolle
+                  </span>
+                  <span className="font-serif font-black text-xl text-white block">
+                    {player.role}
+                  </span>
+                  <span className="text-xs text-zinc-400">
+                    Team {player.team}
+                  </span>
+                </div>
+              </div>
 
-            <div className="text-right">
-              <span className="text-xs font-mono font-bold text-[#ff6b00] block">{(player.points || 0) + localPointsDelta} Pkt</span>
-              <span
-                className={`text-[10px] font-bold ${
-                  player.status === 'lebendig' ? 'text-emerald-400' : 'text-rose-400'
-                }`}
-              >
-                {player.status.toUpperCase()}
-              </span>
+              <div className="text-right">
+                <span className="text-xs font-mono font-bold text-[#ff6b00] block">{(player.points || 0) + localPointsDelta} Pkt</span>
+                <span
+                  className={`text-[10px] font-bold ${
+                    player.status === 'lebendig' ? 'text-emerald-400' : 'text-rose-400'
+                  }`}
+                >
+                  {player.status.toUpperCase()}
+                </span>
+              </div>
             </div>
-          </div>
+          )}
 
           {/* HUNTER SPECIAL: FELLOW HUNTERS LIST */}
           {isHunter && fellowHunters.length > 0 && (

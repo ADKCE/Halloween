@@ -300,6 +300,10 @@ class SupabaseService {
         activeFullMoon: stateData?.active_full_moon || null,
         lastTickAt: stateData?.last_tick_at || null,
         winnerTeam: stateData?.winner_team || null,
+        endReason: stateData?.end_reason || null,
+        initialGoodCount: stateData?.initial_good_count ?? 0,
+        initialEvilCount: stateData?.initial_evil_count ?? 0,
+        initialHunterCount: stateData?.initial_hunter_count ?? 0,
         resetEpoch: stateData?.reset_epoch ?? 1,
         updatedAt: stateData?.updated_at || undefined,
       };
@@ -579,29 +583,43 @@ class SupabaseService {
     const client = this.getClient();
     if (!client) return;
 
-    const active = allDbPlayers.filter((p) => p.status !== 'entfernt');
+    try {
+      const { data, error } = await client.rpc('check_win', { p_trigger: 'sync_eval' });
+      if (!error && data?.checked) {
+        return;
+      }
+    } catch {}
+
+    const active = allDbPlayers.filter((p) => p.status !== 'entfernt' && !p.is_test);
     if (active.length === 0) return;
 
     const evilPlayers = active.filter((p) => p.team === 'Böse');
     const goodPlayers = active.filter((p) => p.team === 'Gut');
-    const livingEvil = evilPlayers.filter((p) => p.status === 'lebendig');
-    const livingGood = goodPlayers.filter((p) => p.status === 'lebendig');
-    const livingHunters = active.filter((p) => p.role === 'Geisterjäger' && p.status === 'lebendig');
+    const livingEvil = evilPlayers.filter((p) => p.status === 'lebendig' || p.status === 'pending_death' || p.status === 'tod_ausstehend');
+    const livingGood = goodPlayers.filter((p) => p.status === 'lebendig' || p.status === 'pending_death' || p.status === 'tod_ausstehend');
+    const livingHunters = active.filter((p) => p.role === 'Geisterjäger' && (p.status === 'lebendig' || p.status === 'pending_death' || p.status === 'tod_ausstehend'));
 
     let wonTeam: TeamType | null = null;
+    let wonReason: string | null = null;
 
-    // 1. GUT gewinnt, wenn alle Bösen tot sind
-    if (evilPlayers.length > 0 && livingEvil.length === 0) {
+    // 1. GUT gewinnt, wenn alle Bösen tot sind (und es anfangs Böse gab)
+    const initialEvil = gameState.initialEvilCount || evilPlayers.length;
+    const initialGood = gameState.initialGoodCount || goodPlayers.length;
+    const initialHunters = gameState.initialHunterCount || active.filter((p) => p.role === 'Geisterjäger').length;
+
+    if (initialEvil > 0 && livingEvil.length === 0) {
       wonTeam = 'Gut';
+      wonReason = 'all_evil_dead';
     }
     // 2. BÖSE gewinnt, wenn alle Geisterjäger tot sind oder mehr als 75% des guten Teams tot sind
-    else if (goodPlayers.length > 0) {
-      const allHuntersCount = active.filter((p) => p.role === 'Geisterjäger').length;
-      const allHuntersDead = allHuntersCount > 0 && livingHunters.length === 0;
-      const deadGoodPercent = ((goodPlayers.length - livingGood.length) / goodPlayers.length) * 100;
-
-      if (allHuntersDead || deadGoodPercent >= 75) {
+    else if (initialHunters > 0 && livingHunters.length === 0) {
+      wonTeam = 'Böse';
+      wonReason = 'all_hunters_dead';
+    } else if (initialGood > 0) {
+      const deadGoodPercent = ((initialGood - livingGood.length) / initialGood) * 100;
+      if (deadGoodPercent > 75) {
         wonTeam = 'Böse';
+        wonReason = 'good_75_percent_dead';
       }
     }
 
@@ -612,6 +630,7 @@ class SupabaseService {
           status: 'Beendet',
           ended_at: new Date().toISOString(),
           winner_team: wonTeam,
+          end_reason: wonReason,
           updated_at: new Date().toISOString(),
         })
         .eq('id', 'main');
@@ -2668,6 +2687,162 @@ class SupabaseService {
         .from('tick_log')
         .select('*')
         .order('tick_at', { ascending: false })
+        .limit(limit);
+      if (!error && data) return data;
+    } catch {}
+    return [];
+  }
+
+  // --- ROLE RESOLUTION & RETRY (RPC ensure_my_role) ---
+  public async ensureMyRole(playerId: string): Promise<{
+    success: boolean;
+    role: RoleType;
+    team: TeamType;
+    assigned: boolean;
+    message?: string;
+  }> {
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    try {
+      const { data, error } = await client.rpc('ensure_my_role', { p_player_id: playerId });
+      if (!error && data && data.success) {
+        return {
+          success: true,
+          role: (data.role || 'unassigned') as RoleType,
+          team: (data.team || 'Gut') as TeamType,
+          assigned: Boolean(data.assigned),
+          message: data.message,
+        };
+      }
+    } catch (e) {
+      console.warn('RPC ensure_my_role failed, trying direct lookup:', e);
+    }
+
+    // Direct DB lookup fallback
+    try {
+      const { data: pr } = await client.from('player_roles').select('role, team').eq('player_id', playerId).maybeSingle();
+      if (pr && pr.role && pr.role !== 'unassigned' && pr.role !== 'Unbekannt') {
+        return {
+          success: true,
+          role: pr.role as RoleType,
+          team: (pr.team || 'Gut') as TeamType,
+          assigned: false,
+        };
+      }
+
+      // If game is Läuft, allocate role based on deficit
+      const { data: st } = await client.from('game_state').select('status, settings').eq('id', 'main').single();
+      if (st?.status === 'Läuft') {
+        const { data: existing } = await client.from('players').select('role, status').neq('status', 'entfernt');
+        const settings = { ...DEFAULT_GAME_SETTINGS, ...(st.settings || {}) };
+        const late = determineLateJoinerRole(existing || [], settings);
+        await client.from('player_roles').upsert([
+          { player_id: playerId, role: late.role, team: late.team, updated_at: new Date().toISOString() },
+        ]);
+        await this.safeUpdatePlayer(playerId, { role: 'unassigned', team: late.team }, ['team']);
+        return {
+          success: true,
+          role: late.role,
+          team: late.team,
+          assigned: true,
+        };
+      }
+    } catch {}
+
+    return {
+      success: false,
+      role: 'unassigned',
+      team: 'Gut',
+      assigned: false,
+      message: 'Rolle konnte nicht zugewiesen werden',
+    };
+  }
+
+  // --- VICTORY CONDITIONS: CHECK WIN ---
+  public async checkWin(trigger: string = 'manual_check'): Promise<any> {
+    const client = this.getClient();
+    if (!client) return { checked: false, reason: 'no_client' };
+
+    try {
+      const { data, error } = await client.rpc('check_win', { p_trigger: trigger });
+      if (!error && data) {
+        return data;
+      }
+    } catch (e) {
+      console.warn('RPC check_win error, evaluating fallback:', e);
+    }
+
+    // Fallback: evaluate client-side
+    const { data: st } = await client.from('game_state').select('*').eq('id', 'main').single();
+    if (st?.status !== 'Läuft') return { checked: false, reason: 'not_running' };
+
+    const { data: players } = await client.from('players').select('*').neq('status', 'entfernt');
+    if (!players || players.length === 0) return { checked: false };
+
+    const settings = { ...DEFAULT_GAME_SETTINGS, ...(st.settings || {}) };
+    await this.evaluateWinConditions(st, players, settings);
+    return { checked: true, fallback: true };
+  }
+
+  // --- ADMIN: ASSIGN MISSING ROLES ---
+  public async assignMissingRoles(adminCode: string): Promise<{ success: boolean; message: string; assignedCount?: number }> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    try {
+      const { data, error } = await client.rpc('assign_missing_roles', { p_admin_code: adminCode.trim() });
+      if (!error && data) {
+        return data;
+      }
+    } catch {}
+
+    // Fallback
+    const { data: unassignedPlayers } = await client
+      .from('players')
+      .select('id, name, status, role')
+      .neq('status', 'entfernt');
+
+    const { data: existingRoles } = await client.from('player_roles').select('player_id, role');
+    const roleMap = new Map((existingRoles || []).map((r) => [r.player_id, r.role]));
+
+    const missing = (unassignedPlayers || []).filter((p) => {
+      const r = roleMap.get(p.id) || p.role;
+      return !r || r === 'unassigned' || r === 'Unbekannt';
+    });
+
+    if (missing.length === 0) {
+      return { success: true, message: 'Alle Spieler haben bereits eine zugewiesene Rolle.', assignedCount: 0 };
+    }
+
+    const { data: st } = await client.from('game_state').select('settings').eq('id', 'main').single();
+    const settings = { ...DEFAULT_GAME_SETTINGS, ...(st?.settings || {}) };
+
+    let count = 0;
+    for (const p of missing) {
+      const { data: currentPlayers } = await client.from('players').select('role, status').neq('status', 'entfernt');
+      const late = determineLateJoinerRole(currentPlayers || [], settings);
+      await client.from('player_roles').upsert([
+        { player_id: p.id, role: late.role, team: late.team, updated_at: new Date().toISOString() },
+      ]);
+      count++;
+    }
+
+    return { success: true, message: `${count} fehlende Rolle(n) erfolgreich zugewiesen.`, assignedCount: count };
+  }
+
+  // --- WIN CHECK LOGS ---
+  public async getWinCheckLogs(limit = 20): Promise<any[]> {
+    const client = this.getClient();
+    if (!client) return [];
+    try {
+      const { data, error } = await client
+        .from('win_check_log')
+        .select('*')
+        .order('checked_at', { ascending: false })
         .limit(limit);
       if (!error && data) return data;
     } catch {}

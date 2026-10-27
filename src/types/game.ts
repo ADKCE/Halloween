@@ -94,6 +94,10 @@ export interface GameState {
   nextSpecialTaskIntervalMinutes?: number;
   lastTickAt?: string | null;
   winnerTeam?: TeamType | null;
+  endReason?: string | null;
+  initialGoodCount?: number;
+  initialEvilCount?: number;
+  initialHunterCount?: number;
   resetEpoch?: number;
   updatedAt?: string;
 }
@@ -289,5 +293,23 @@ export interface TickLogEntry {
   status: 'success' | 'error' | string;
   details?: any;
   errorMessage?: string | null;
+}
+
+export interface WinCheckLogEntry {
+  id: string;
+  checkedAt: string;
+  triggerAction: string;
+  livingGood: number;
+  deadGood: number;
+  livingEvil: number;
+  deadEvil: number;
+  livingHunters: number;
+  deadHunters: number;
+  initialGood: number;
+  initialEvil: number;
+  initialHunters: number;
+  goodDeathPct: number;
+  winnerTeam?: TeamType | null;
+  endReason?: string | null;
 }
 

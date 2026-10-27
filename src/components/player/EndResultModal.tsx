@@ -81,40 +81,69 @@ export const EndResultModal: React.FC<EndResultModalProps> = ({
         </div>
 
         {/* WINNER BANNER */}
-        <div
-          className={`p-4 rounded-2xl border text-center space-y-1.5 ${
-            winnerTeam === 'Gut'
-              ? 'bg-gradient-to-b from-emerald-950/70 to-zinc-900 border-emerald-500/50 text-emerald-200'
-              : 'bg-gradient-to-b from-rose-950/70 to-zinc-900 border-rose-500/50 text-rose-200'
-          }`}
-        >
-          <span className="text-[11px] font-mono font-bold tracking-wider uppercase block">
-            Triumph der Nacht
-          </span>
-          <h4 className="text-2xl font-serif font-black text-white">
-            Team {winnerTeam.toUpperCase()} gewinnt!
-          </h4>
-          <p className="text-xs text-zinc-300 leading-relaxed max-w-xs mx-auto">
-            {winnerTeam === 'Gut'
+        {(() => {
+          const endReason = gameState.endReason || (gameState as any).end_reason;
+          let reasonText = '';
+          if (endReason === 'all_evil_dead') {
+            reasonText = 'Alle Kreaturen der Nacht (Vampire, Werwölfe, Geister) wurden vernichtet!';
+          } else if (endReason === 'all_hunters_dead') {
+            reasonText = 'Alle Geisterjäger wurden eliminiert. Die Mächte der Finsternis triumphieren!';
+          } else if (endReason === 'good_75_percent_dead') {
+            reasonText = 'Mehr als 75% der Unschuldigen wurden getötet. Das Böse hat die absolute Mehrheit!';
+          } else if (endReason === 'time_expired') {
+            reasonText = 'Die Geisterstunde ist vorüber! Nach Ablauf der Zeit siegt das Team mit der höheren Überlebensrate.';
+          } else {
+            reasonText = winnerTeam === 'Gut'
               ? 'Alle Monster wurden besiegt oder exorziert. Die Sterblichen haben überlebt!'
-              : 'Die Kreaturen der Nacht haben die Herrschaft über die Halloween-Party errungen!'}
-          </p>
+              : 'Die Kreaturen der Nacht haben die Herrschaft über die Halloween-Party errungen!';
+          }
 
-          <div className="grid grid-cols-2 gap-2 pt-2 text-left">
-            <div className="p-2 rounded-xl bg-zinc-950/80 border border-zinc-800 text-[11px]">
-              <span className="text-zinc-400 block text-[9px] uppercase font-bold">Team GUT</span>
-              <span className="font-mono font-black text-emerald-400 text-xs">
-                {goodAlive} / {good.length} am Leben
+          const livingHunters = activePlayers.filter((p) => p.role === 'Geisterjäger' && (p.status === 'lebendig' || p.status === 'pending_death' || p.status === 'tod_ausstehend')).length;
+          const totalHunters = activePlayers.filter((p) => p.role === 'Geisterjäger').length;
+
+          return (
+            <div
+              className={`p-4 rounded-2xl border text-center space-y-2 ${
+                winnerTeam === 'Gut'
+                  ? 'bg-gradient-to-b from-emerald-950/70 to-zinc-900 border-emerald-500/50 text-emerald-200'
+                  : 'bg-gradient-to-b from-rose-950/70 to-zinc-900 border-rose-500/50 text-rose-200'
+              }`}
+            >
+              <span className="text-[11px] font-mono font-bold tracking-wider uppercase block">
+                Triumph der Nacht
               </span>
+              <h4 className="text-2xl font-serif font-black text-white">
+                Team {winnerTeam.toUpperCase()} gewinnt!
+              </h4>
+              <p className="text-xs text-zinc-300 leading-relaxed max-w-xs mx-auto">
+                {reasonText}
+              </p>
+
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1 text-left">
+                <div className="p-2 rounded-xl bg-zinc-950/80 border border-zinc-800 text-[11px]">
+                  <span className="text-zinc-400 block text-[9px] uppercase font-bold">Team GUT</span>
+                  <span className="font-mono font-black text-emerald-400 text-xs">
+                    {goodAlive} / {good.length} am Leben
+                  </span>
+                </div>
+                <div className="p-2 rounded-xl bg-zinc-950/80 border border-zinc-800 text-[11px]">
+                  <span className="text-zinc-400 block text-[9px] uppercase font-bold">Team BÖSE</span>
+                  <span className="font-mono font-black text-rose-400 text-xs">
+                    {evilAlive} / {evil.length} am Leben
+                  </span>
+                </div>
+                {totalHunters > 0 && (
+                  <div className="col-span-2 sm:col-span-1 p-2 rounded-xl bg-zinc-950/80 border border-zinc-800 text-[11px]">
+                    <span className="text-zinc-400 block text-[9px] uppercase font-bold">Jäger</span>
+                    <span className="font-mono font-black text-blue-400 text-xs">
+                      {livingHunters} / {totalHunters} aktiv
+                    </span>
+                  </div>
+                )}
+              </div>
             </div>
-            <div className="p-2 rounded-xl bg-zinc-950/80 border border-zinc-800 text-[11px]">
-              <span className="text-zinc-400 block text-[9px] uppercase font-bold">Team BÖSE</span>
-              <span className="font-mono font-black text-rose-400 text-xs">
-                {evilAlive} / {evil.length} am Leben
-              </span>
-            </div>
-          </div>
-        </div>
+          );
+        })()}
 
         {/* TOP 3 RANKING */}
         <div className="space-y-2">

@@ -201,6 +201,28 @@ class GameApiClient {
     return supabaseService.resetGameFull(adminCode);
   }
 
+  async ensureMyRole(playerId: string): Promise<{
+    success: boolean;
+    role: RoleType;
+    team: any;
+    assigned: boolean;
+    message?: string;
+  }> {
+    return supabaseService.ensureMyRole(playerId);
+  }
+
+  async checkWin(trigger: string = 'manual_check'): Promise<any> {
+    return supabaseService.checkWin(trigger);
+  }
+
+  async assignMissingRoles(adminCode: string): Promise<{ success: boolean; message: string; assignedCount?: number }> {
+    return supabaseService.assignMissingRoles(adminCode);
+  }
+
+  async getWinCheckLogs(limit?: number): Promise<any[]> {
+    return supabaseService.getWinCheckLogs(limit);
+  }
+
   public subscribeToRealtime(callback: () => void): () => void {
     return supabaseService.subscribeToRealtime(callback);
   }
