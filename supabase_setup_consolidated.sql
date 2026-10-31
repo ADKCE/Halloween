@@ -894,6 +894,7 @@ declare
   v_points_exorcism integer := 25;
   v_new_points integer;
   v_kill_id text := gen_random_uuid()::text;
+  v_grace_minutes integer := 15;
 begin
   if p_hunter_id = p_target_id then
     return jsonb_build_object('success', false, 'error', 'Du kannst dich nicht selbst bannen!');
@@ -904,6 +905,11 @@ begin
     return jsonb_build_object('success', false, 'error', 'Das Spiel läuft derzeit nicht');
   end if;
   v_settings := coalesce(v_game_state.settings, '{}'::jsonb);
+
+  v_grace_minutes := coalesce((v_settings->>'gracePeriodMinutes')::integer, 15);
+  if v_game_state.started_at is not null and (v_now < v_game_state.started_at + (v_grace_minutes * interval '1 minute')) then
+    return jsonb_build_object('success', false, 'error', 'Schonfrist ist noch aktiv! Exorzismus noch nicht erlaubt.');
+  end if;
 
   select * into v_hunter from public.players where id = p_hunter_id;
   if not found then
@@ -938,6 +944,10 @@ begin
   if v_target_role is null then
     v_target_role := v_target.role;
     v_target_team := v_target.team;
+  end if;
+
+  if v_target_role = 'Geisterjäger' then
+    return jsonb_build_object('success', false, 'error', 'Du kannst keinen Mit-Jäger bannen!');
   end if;
 
   if v_target_role in ('Vampir', 'Werwolf', 'Geist') then
@@ -1260,6 +1270,14 @@ begin
         ended_at = v_now,
         updated_at = v_now
     where id = 'main';
+
+    -- ROLLENAUFLÖSUNG: Rollen aller Spieler aus player_roles in players aufdecken, damit alle sie im Ranking sehen
+    update public.players p
+    set role = coalesce(pr.role, p.role, 'Mensch'),
+        team = coalesce(pr.team, p.team, 'Gut'),
+        updated_at = v_now
+    from public.player_roles pr
+    where p.id = pr.player_id;
 
     insert into public.notifications (player_id, title, message, type, created_at)
     select id,
@@ -2169,6 +2187,104 @@ begin
 end;
 $$;
 grant execute on function public.admin_set_player_status(text, text, text) to anon, authenticated, service_role;
+
+-- 3.20b admin_set_player_role
+create or replace function public.admin_set_player_role(
+  p_admin_code text,
+  p_player_id text,
+  p_new_role text
+)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_new_team text;
+  v_game_state record;
+  v_now timestamptz := now();
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  if p_new_role not in ('Mensch', 'Geisterjäger', 'Vampir', 'Werwolf', 'Geist') then
+    return jsonb_build_object('success', false, 'error', 'Ungültige Rolle: ' || coalesce(p_new_role, 'null'));
+  end if;
+
+  v_new_team := case when p_new_role in ('Vampir', 'Werwolf', 'Geist') then 'Böse' else 'Gut' end;
+
+  select * into v_game_state from public.game_state where id = 'main';
+
+  -- In player_roles speichern
+  insert into public.player_roles (player_id, role, team, updated_at)
+  values (p_player_id, p_new_role, v_new_team, v_now)
+  on conflict (player_id) do update set
+    role = excluded.role,
+    team = excluded.team,
+    updated_at = excluded.updated_at;
+
+  -- In players aktualisieren (wenn Spiel beendet oder Rolle tot ist, offen; sonst unassigned wenn laufend)
+  update public.players
+  set role = case when v_game_state.status = 'Beendet' or status = 'tot' then p_new_role else 'unassigned' end,
+      team = v_new_team,
+      updated_at = v_now
+  where id = p_player_id;
+
+  perform public.check_win('admin_set_role');
+
+  return jsonb_build_object(
+    'success', true,
+    'message', 'Rolle erfolgreich auf ' || p_new_role || ' (' || v_new_team || ') geändert.',
+    'role', p_new_role,
+    'team', v_new_team
+  );
+end;
+$$;
+grant execute on function public.admin_set_player_role(text, text, text) to anon, authenticated, service_role;
+
+-- 3.20c admin_adjust_player_points
+create or replace function public.admin_adjust_player_points(
+  p_admin_code text,
+  p_player_id text,
+  p_points_delta integer,
+  p_reason text default 'admin_adjustment'
+)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_now timestamptz := now();
+  v_new_total integer := 0;
+begin
+  if not public.check_admin_code(p_admin_code) then
+    return jsonb_build_object('success', false, 'error', 'Ungültiger Admin-Code');
+  end if;
+
+  if not exists (select 1 from public.players where id = p_player_id) then
+    return jsonb_build_object('success', false, 'error', 'Spieler nicht gefunden');
+  end if;
+
+  insert into public.points_log (player_id, reason, amount, ref_id, created_at)
+  values (p_player_id, coalesce(p_reason, 'admin_adjustment'), p_points_delta, 'admin_' || gen_random_uuid()::text, v_now);
+
+  select coalesce(sum(amount), 0) into v_new_total
+  from public.points_log where player_id = p_player_id;
+
+  update public.players
+  set points = v_new_total,
+      updated_at = v_now
+  where id = p_player_id;
+
+  return jsonb_build_object(
+    'success', true,
+    'message', 'Punkte erfolgreich angepasst. Neuer Punktestand: ' || v_new_total,
+    'points_delta', p_points_delta,
+    'new_total_points', v_new_total
+  );
+end;
+$$;
+grant execute on function public.admin_adjust_player_points(text, text, integer, text) to anon, authenticated, service_role;
 
 -- 3.21 admin_repair_game_state
 create or replace function public.admin_repair_game_state(p_admin_code text)

@@ -61,6 +61,7 @@ export const KillModal: React.FC<KillModalProps> = ({
   if (!isOpen) return null;
 
   const isHunter = killer.role === 'Geisterjäger';
+  const isVampire = killer.role === 'Vampir';
   const isGhost = killer.role === 'Geist';
   const isWerewolf = killer.role === 'Werwolf';
 
@@ -89,8 +90,8 @@ export const KillModal: React.FC<KillModalProps> = ({
   const handleSubmit = async () => {
     if (!selectedTargetId) return;
 
-    if (isGhost && !ghostSoloConfirmed) {
-      setFeedback({ type: 'error', msg: 'Als Geist musst du bestätigen, dass du mit dem Opfer allein im Raum warst!' });
+    if (isVampire && !ghostSoloConfirmed) {
+      setFeedback({ type: 'error', msg: 'Als Vampir musst du bestätigen, dass der Kill unbemerkt war (allein / keine Zeugen)!' });
       return;
     }
 
@@ -290,18 +291,18 @@ export const KillModal: React.FC<KillModalProps> = ({
           </div>
         )}
 
-        {/* Geist solo check rule */}
-        {isGhost && selectedTargetId && (
-          <label className="flex items-start gap-2.5 p-3 rounded-2xl bg-zinc-900/90 border border-purple-500/40 cursor-pointer">
+        {/* Vampir solo check rule */}
+        {isVampire && selectedTargetId && (
+          <label className="flex items-start gap-2.5 p-3 rounded-2xl bg-zinc-900/90 border border-rose-500/40 cursor-pointer">
             <input
               type="checkbox"
               checked={ghostSoloConfirmed}
               onChange={(e) => setGhostSoloConfirmed(e.target.checked)}
-              className="mt-0.5 rounded border-zinc-700 text-purple-600 focus:ring-purple-500"
+              className="mt-0.5 rounded border-zinc-700 text-rose-600 focus:ring-rose-500"
             />
             <div className="text-xs text-zinc-300">
-              <span className="font-bold text-white block">Pflicht-Regel für Geister:</span>
-              <span>Ich war mit dem Opfer allein im Raum.</span>
+              <span className="font-bold text-white block">Pflicht-Regel für Vampire:</span>
+              <span>Unbemerkter Kill: Ich war mit dem Opfer allein im Raum bzw. ohne direkte Zeugen.</span>
             </div>
           </label>
         )}

@@ -54,6 +54,23 @@ class GameApiClient {
     return supabaseService.playerAction(adminCode, playerId, action);
   }
 
+  async adminSetPlayerRole(
+    adminCode: string,
+    playerId: string,
+    newRole: RoleType
+  ): Promise<{ success: boolean; message: string }> {
+    return supabaseService.adminSetPlayerRole(adminCode, playerId, newRole);
+  }
+
+  async adminAdjustPlayerPoints(
+    adminCode: string,
+    playerId: string,
+    pointsDelta: number,
+    reason?: string
+  ): Promise<{ success: boolean; message: string; newTotalPoints: number }> {
+    return supabaseService.adminAdjustPlayerPoints(adminCode, playerId, pointsDelta, reason);
+  }
+
   async updateSettings(adminCode: string, newSettings: Partial<GameSettings>): Promise<void> {
     return supabaseService.updateSettings(adminCode, newSettings);
   }

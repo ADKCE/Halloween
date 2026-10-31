@@ -286,12 +286,20 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
     );
   }, [players, player.id]);
 
-  // Alive players excluding self and excluding pending_death (for Geisterjäger exorcism)
+  // Hunters teammate list (Geisterjäger sehen sich gegenseitig)
+  const fellowHunters = useMemo(() => {
+    if (!isHunter) return [];
+    return players.filter((p) => p.role === 'Geisterjäger' && p.id !== player.id && p.status !== 'entfernt');
+  }, [players, isHunter, player.id]);
+
+  const fellowHunterIds = useMemo(() => new Set(fellowHunters.map((h) => h.id)), [fellowHunters]);
+
+  // Alive players excluding self, excluding pending_death, and excluding fellow hunters (for Geisterjäger exorcism)
   const potentialVictims = useMemo(() => {
     return players.filter(
-      (p) => p.id !== player.id && p.status === 'lebendig'
+      (p) => p.id !== player.id && p.status === 'lebendig' && !fellowHunterIds.has(p.id)
     );
-  }, [players, player.id]);
+  }, [players, player.id, fellowHunterIds]);
 
   // Check if full moon is active
   const isFullMoon = useMemo(() => {
@@ -301,12 +309,6 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
   const nextFullMoonInfo = useMemo(() => {
     return gameApi.getNextFullMoon(gameState);
   }, [gameState]);
-
-  // Hunters teammate list (Geisterjäger sehen sich gegenseitig)
-  const fellowHunters = useMemo(() => {
-    if (!isHunter) return [];
-    return players.filter((p) => p.role === 'Geisterjäger' && p.id !== player.id && p.status !== 'entfernt');
-  }, [players, isHunter, player.id]);
 
   // Top rankings
   const activePlayers = useMemo(() => players.filter((p) => p.status !== 'entfernt'), [players]);
@@ -900,8 +902,7 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                 <div className="text-xs text-zinc-300 space-y-1 leading-relaxed">
                   {player.role === 'Vampir' && (
                     <p>
-                      🧛 <strong>Vampir:</strong> Berühre das Opfer an Schulter/Arm und flüstere:{" "}
-                      <em>"Du wurdest von einem Vampir getötet."</em> Wenn das Opfer seinen Tod meldet, wähle es unten aus und bestätige den Kill. Cooldown: 6 Minuten.
+                      🧛 <strong>Vampir:</strong> Unbemerkter Kill – du darfst nur zuschlagen, wenn du mit dem Opfer <strong>allein im Raum</strong> warst (Pflicht-Häkchen beim Bestätigen). Berühre das Opfer an Schulter/Arm und flüstere: <em>"Du wurdest von einem Vampir getötet."</em> Cooldown: 6 Minuten.
                     </p>
                   )}
                   {player.role === 'Werwolf' && (
@@ -912,7 +913,8 @@ export const PlayerArea: React.FC<PlayerAreaProps> = ({
                   )}
                   {player.role === 'Geist' && (
                     <p>
-                      👻 <strong>Geist:</strong> Du kannst nur zuschlagen, wenn du mit dem Opfer <strong>allein im Raum</strong> warst (Pflicht-Häkchen). Cooldown: 6 Minuten.
+                      👻 <strong>Geist:</strong> Du kannst <strong>durch Wände töten</strong> – kein Solo-Zeugen-Check nötig!
+                      Berühre das Opfer und flüstere: <em>"Du wurdest von einem Geist getötet."</em> Cooldown: 6 Minuten.
                     </p>
                   )}
                 </div>

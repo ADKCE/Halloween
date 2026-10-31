@@ -691,6 +691,7 @@ class SupabaseService {
     // If Läuft -> Nachzügler! Role allocated based on deficit
     let assignedRole: RoleType = 'unassigned';
     let assignedTeam: TeamType = 'Gut';
+    let gameStatus = 'Lobby';
 
     try {
       const { data: stateData } = await client
@@ -699,7 +700,7 @@ class SupabaseService {
         .eq('id', 'main')
         .maybeSingle();
 
-      const gameStatus = stateData?.status || 'Lobby';
+      gameStatus = stateData?.status || 'Lobby';
       const rawSettings = stateData?.settings || {};
       const settings: GameSettings = { ...DEFAULT_GAME_SETTINGS, ...rawSettings };
 
@@ -748,13 +749,23 @@ class SupabaseService {
       data = insertedData;
     }
 
+    if (gameStatus === 'Läuft') {
+      try {
+        const { data: roleRes } = await client.rpc('ensure_my_role', { p_player_id: id });
+        if (roleRes && roleRes.role) {
+          assignedRole = roleRes.role as RoleType;
+          assignedTeam = (roleRes.team || assignedTeam) as TeamType;
+        }
+      } catch {}
+    }
+
     return {
       id: data.id,
       name: data.name,
       costumeName: data.costume_name,
       photoUrl: data.photo_url,
-      role: (data.role || assignedRole) as RoleType,
-      team: (data.team || assignedTeam) as TeamType,
+      role: (assignedRole !== 'unassigned' ? assignedRole : (data.role || assignedRole)) as RoleType,
+      team: (assignedTeam || data.team) as TeamType,
       status: data.status || 'lebendig',
       points: data.points || 0,
       killsCount: data.kills_count || 0,
@@ -1116,6 +1127,75 @@ class SupabaseService {
     }
   }
 
+  public async adminSetPlayerRole(
+    adminCode: string,
+    playerId: string,
+    newRole: RoleType
+  ): Promise<{ success: boolean; message: string }> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    try {
+      const { data, error } = await client.rpc('admin_set_player_role', {
+        p_admin_code: adminCode.trim(),
+        p_player_id: playerId,
+        p_new_role: newRole,
+      });
+      if (!error && data?.success) {
+        return data;
+      }
+    } catch {}
+
+    const newTeam: TeamType = ['Vampir', 'Werwolf', 'Geist'].includes(newRole) ? 'Böse' : 'Gut';
+    await client
+      .from('players')
+      .update({ role: newRole, team: newTeam, updated_at: new Date().toISOString() })
+      .eq('id', playerId);
+
+    return { success: true, message: `Rolle erfolgreich auf ${newRole} (${newTeam}) geändert.` };
+  }
+
+  public async adminAdjustPlayerPoints(
+    adminCode: string,
+    playerId: string,
+    pointsDelta: number,
+    reason = 'admin_adjustment'
+  ): Promise<{ success: boolean; message: string; newTotalPoints: number }> {
+    const isValid = await this.verifyAdminCode(adminCode);
+    if (!isValid) throw new Error('Ungültiger Admin-Code');
+
+    const client = this.getClient();
+    if (!client) throw new Error('Supabase nicht verfügbar');
+
+    try {
+      const { data, error } = await client.rpc('admin_adjust_player_points', {
+        p_admin_code: adminCode.trim(),
+        p_player_id: playerId,
+        p_points_delta: pointsDelta,
+        p_reason: reason,
+      });
+      if (!error && data?.success) {
+        return {
+          success: true,
+          message: data.message,
+          newTotalPoints: data.new_total_points,
+        };
+      }
+    } catch {}
+
+    const { data: player } = await client.from('players').select('points').eq('id', playerId).single();
+    const newTotal = (player?.points || 0) + pointsDelta;
+    await client
+      .from('players')
+      .update({ points: newTotal, updated_at: new Date().toISOString() })
+      .eq('id', playerId);
+
+    return { success: true, message: `Punkte angepasst. Neuer Punktestand: ${newTotal}`, newTotalPoints: newTotal };
+  }
+
   public async updateSettings(adminCode: string, newSettings: Partial<GameSettings>): Promise<void> {
     const isValid = await this.verifyAdminCode(adminCode);
     if (!isValid) throw new Error('Ungültiger Admin-Code');
@@ -1343,6 +1423,7 @@ class SupabaseService {
 
     if (!hunter || !target) throw new Error('Spieler nicht gefunden');
     if (hunter.role !== 'Geisterjäger') throw new Error('Nur Geisterjäger können exorzieren!');
+    if (target.role === 'Geisterjäger') throw new Error('Du kannst keinen Mit-Jäger bannen!');
     if (target.status === 'tot') throw new Error('Dieses Ziel ist bereits tot!');
 
     // Cooldown check
@@ -1584,9 +1665,9 @@ class SupabaseService {
       throw new Error('Werwölfe können nur bei aktivem Vollmond töten!');
     }
 
-    // Geist Allein-im-Raum Checkbox
-    if (killer.role === 'Geist' && !ghostSoloConfirmed) {
-      throw new Error('Als Geist musst du bestätigen, dass du mit dem Opfer allein im Raum warst!');
+    // Vampir Allein-im-Raum Checkbox (unbemerkter Kill)
+    if (killer.role === 'Vampir' && !ghostSoloConfirmed) {
+      throw new Error('Als Vampir musst du bestätigen, dass du mit dem Opfer allein im Raum warst (unbemerkter Kill)!');
     }
 
     // Opfer-Status prüfen

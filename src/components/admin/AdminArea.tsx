@@ -200,6 +200,51 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
   const [pointsLogPlayer, setPointsLogPlayer] = useState<Player | null>(null);
   const [isPointsLogOpen, setIsPointsLogOpen] = useState(false);
 
+  // Edit player role & points modals
+  const [editingRolePlayer, setEditingRolePlayer] = useState<Player | null>(null);
+  const [selectedNewRole, setSelectedNewRole] = useState<RoleType>('Mensch');
+  const [isUpdatingRole, setIsUpdatingRole] = useState(false);
+
+  const [editingPointsPlayer, setEditingPointsPlayer] = useState<Player | null>(null);
+  const [pointsDeltaInput, setPointsDeltaInput] = useState<string>('10');
+  const [pointsReasonInput, setPointsReasonInput] = useState<string>('Spielleiter-Korrektur');
+  const [isUpdatingPoints, setIsUpdatingPoints] = useState(false);
+
+  const handleSaveRole = async () => {
+    if (!editingRolePlayer) return;
+    setIsUpdatingRole(true);
+    try {
+      await gameApi.adminSetPlayerRole(adminCode, editingRolePlayer.id, selectedNewRole);
+      if (onToast) onToast(`Rolle für ${editingRolePlayer.name} auf ${selectedNewRole} geändert!`, 'success');
+      if (onRefreshState) await onRefreshState();
+      setEditingRolePlayer(null);
+    } catch (err: any) {
+      if (onToast) onToast(err?.message || 'Fehler beim Ändern der Rolle', 'error');
+    } finally {
+      setIsUpdatingRole(false);
+    }
+  };
+
+  const handleSavePoints = async () => {
+    if (!editingPointsPlayer) return;
+    const delta = parseInt(pointsDeltaInput, 10);
+    if (isNaN(delta) || delta === 0) {
+      if (onToast) onToast('Bitte gib eine gültige Punktezahl ein (z.B. 10 oder -5)', 'error');
+      return;
+    }
+    setIsUpdatingPoints(true);
+    try {
+      await gameApi.adminAdjustPlayerPoints(adminCode, editingPointsPlayer.id, delta, pointsReasonInput);
+      if (onToast) onToast(`Punkte für ${editingPointsPlayer.name} angepasst (${delta > 0 ? '+' : ''}${delta})!`, 'success');
+      if (onRefreshState) await onRefreshState();
+      setEditingPointsPlayer(null);
+    } catch (err: any) {
+      if (onToast) onToast(err?.message || 'Fehler beim Anpassen der Punkte', 'error');
+    } finally {
+      setIsUpdatingPoints(false);
+    }
+  };
+
   // Diashow State for Beamer
   const [isDiashowRunning, setIsDiashowRunning] = useState(false);
   const [isDiashowFullscreen, setIsDiashowFullscreen] = useState(false);
@@ -1323,9 +1368,9 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
                       <span className="text-[10px] text-zinc-400">({p.role})</span>
                     </div>
                     <div className="text-[11px] text-[#ff6b00]">{p.costumeName}</div>
-                    <div className="flex items-center gap-2 pt-0.5">
-                      <span className="text-[10px] text-zinc-500 font-mono">
-                        {p.points} Pkt • Status: {p.status}
+                    <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                      <span className="text-[10px] text-zinc-400 font-mono font-bold">
+                        {p.points} Pkt • {p.status}
                       </span>
                       <button
                         type="button"
@@ -1337,7 +1382,30 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
                         title="Detaillierte Punkte-Historie anzeigen"
                       >
                         <Award className="w-2.5 h-2.5 text-amber-400" />
-                        Punkte-Log
+                        Log
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingRolePlayer(p);
+                          setSelectedNewRole(p.role && p.role !== 'unassigned' && p.role !== 'Unbekannt' ? p.role : 'Mensch');
+                        }}
+                        className="px-2 py-0.5 rounded-md bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-300 text-[10px] font-bold cursor-pointer transition"
+                        title="Rolle manuell anpassen"
+                      >
+                        Rolle ändern
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingPointsPlayer(p);
+                          setPointsDeltaInput('10');
+                          setPointsReasonInput('Spielleiter-Korrektur');
+                        }}
+                        className="px-2 py-0.5 rounded-md bg-amber-950/80 hover:bg-amber-900 border border-amber-500/40 text-amber-300 text-[10px] font-bold cursor-pointer transition"
+                        title="Punkte manuell anpassen (+/-)"
+                      >
+                        +/- Pkt
                       </button>
                     </div>
                   </div>
@@ -2218,6 +2286,134 @@ export const AdminArea: React.FC<AdminAreaProps> = ({
         }}
         player={pointsLogPlayer}
       />
+
+      {/* EDIT PLAYER ROLE MODAL */}
+      {editingRolePlayer && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in">
+          <div className="w-full max-w-sm rounded-3xl bg-zinc-950 border border-zinc-800 p-5 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-serif font-bold text-white text-base">Rolle manuell ändern</h3>
+              <button
+                type="button"
+                onClick={() => setEditingRolePlayer(null)}
+                className="p-1 rounded-xl bg-zinc-900 text-zinc-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs text-zinc-300">
+              Spieler: <strong className="text-white">{editingRolePlayer.name}</strong> ({editingRolePlayer.costumeName})
+            </p>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
+                Neue Rolle auswählen:
+              </label>
+              <select
+                value={selectedNewRole}
+                onChange={(e) => setSelectedNewRole(e.target.value as RoleType)}
+                className="w-full px-3 py-2.5 rounded-xl bg-zinc-900 border border-zinc-700 text-white font-bold text-xs"
+              >
+                <option value="Mensch">Mensch (Team Gut)</option>
+                <option value="Geisterjäger">Geisterjäger (Team Gut)</option>
+                <option value="Vampir">Vampir (Team Böse)</option>
+                <option value="Werwolf">Werwolf (Team Böse)</option>
+                <option value="Geist">Geist (Team Böse)</option>
+              </select>
+            </div>
+
+            <div className="flex gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setEditingRolePlayer(null)}
+                className="flex-1 py-2.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-300 font-bold text-xs cursor-pointer"
+              >
+                Abbrechen
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveRole}
+                disabled={isUpdatingRole}
+                className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-md"
+              >
+                {isUpdatingRole && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>Speichern</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* EDIT PLAYER POINTS MODAL */}
+      {editingPointsPlayer && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in">
+          <div className="w-full max-w-sm rounded-3xl bg-zinc-950 border border-zinc-800 p-5 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-serif font-bold text-white text-base">Punkte anpassen</h3>
+              <button
+                type="button"
+                onClick={() => setEditingPointsPlayer(null)}
+                className="p-1 rounded-xl bg-zinc-900 text-zinc-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs text-zinc-300">
+              Spieler: <strong className="text-white">{editingPointsPlayer.name}</strong> • Aktuell: <strong className="text-[#ff6b00]">{editingPointsPlayer.points} Pkt</strong>
+            </p>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
+                Punkte-Änderung (+/-):
+              </label>
+              <input
+                type="number"
+                value={pointsDeltaInput}
+                onChange={(e) => setPointsDeltaInput(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl bg-zinc-900 border border-zinc-700 text-white font-mono font-bold text-sm"
+                placeholder="z.B. 10 oder -5"
+              />
+              <span className="text-[10px] text-zinc-500 block">
+                Tipp: Positive Zahl für Gutschrift (z.B. 10), negative Zahl für Abzug (z.B. -10).
+              </span>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
+                Grund / Notiz:
+              </label>
+              <input
+                type="text"
+                value={pointsReasonInput}
+                onChange={(e) => setPointsReasonInput(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl bg-zinc-900 border border-zinc-700 text-white text-xs"
+                placeholder="z.B. Bonus-Kostüm oder Regelverstoß"
+              />
+            </div>
+
+            <div className="flex gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setEditingPointsPlayer(null)}
+                className="flex-1 py-2.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-300 font-bold text-xs cursor-pointer"
+              >
+                Abbrechen
+              </button>
+              <button
+                type="button"
+                onClick={handleSavePoints}
+                disabled={isUpdatingPoints}
+                className="flex-1 py-2.5 rounded-xl bg-[#ff6b00] hover:bg-[#ff7b1a] text-zinc-950 font-black text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-md"
+              >
+                {isUpdatingPoints && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>Punkte buchen</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
